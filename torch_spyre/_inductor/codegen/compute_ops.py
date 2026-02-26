@@ -124,7 +124,7 @@ class DimInfos:
     #
     # The list returned is
     #   - length == # operation dimensions (not # tensor dimensions)
-    #   - Values are host dimensions in the tensor that represents the tensor (op_dims_tensor)
+    #   - Values are host dimensions in the tensor that represents the operation (op_dims_tensor)
     #   - Order is the order of the dimensions as they appear in the device tensor,  followed
     #     by any remaining dimensions not in the tensor
     def get_tensor_op_index_order(self, tensor):
