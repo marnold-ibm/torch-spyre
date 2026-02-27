@@ -635,7 +635,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
                                             + core_idx_to_slice_offset(
-                                                dim_infos.get_tensor_op_infos(tensor, op),
+                                                dim_infos.get_tensor_op_infos(
+                                                    tensor, op
+                                                ),
                                                 core_id_to_wk_slice[str(c)],
                                                 tensor["device_layout"].device_size,
                                             )
