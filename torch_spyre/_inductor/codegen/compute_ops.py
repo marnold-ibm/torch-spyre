@@ -160,20 +160,23 @@ class DimInfos:
         )
         return result
 
-    # Get labels corresponding to tensor layout
-    # Rank of returned list == num tensor dimensions
+    # Get dimension labels, for the dimensions of the tensor,
+    # in the tensor's device layout order.
+    # Length of returned list == num tensor dimensions
     def get_tensor_layout_order(self, tensor):
         dl = tensor["device_layout"]
         scale = tensor["scale"]
         dev_dim_order = dl.dim_map[::-1][1:]
         return [self.rows["label"][scale.index(dmv)] for dmv in dev_dim_order]
 
-    # Returns infos for dimensions of the tensor
-    # Note, these are currently returned in operation order, not 
-    # tensor order. If this becomes problematic, leverage get_tensor_layout_order
+    # Returns dim infos for dimensions of the tensor,
+    # in the tensor's device layout order.
+    # Length of returned list == num tensor dimensions
     def get_tensor_infos(self, tensor, op):
-        tensor_op_infos = self.get_tensor_op_infos(tensor, op)
-        return [di for di in tensor_op_infos if di.scale >= 0]
+        layout_order = self.get_tensor_layout_order(tensor)
+        op_infos = self.get_tensor_op_infos(tensor, op)
+        info_dict = {di.label: di for di in op_infos}
+        return [info_dict[label] for label in layout_order]
 
     def get_tensor_stick_dim_labels(self, tensor):
         dl = tensor["device_layout"]
