@@ -169,8 +169,8 @@ class DimInfos:
         return [self.rows["label"][scale.index(dmv)] for dmv in dev_dim_order]
 
     # Returns infos for dimensions of the tensor
-    # Note, these are not returned in tensor order.
-    # If this becomes necessary, leverage get_tensor_layout_order
+    # Note, these are currently returned in operation order, not 
+    # tensor order. If this becomes problematic, leverage get_tensor_layout_order
     def get_tensor_infos(self, tensor, op):
         tensor_op_infos = self.get_tensor_op_infos(tensor, op)
         return [di for di in tensor_op_infos if di.scale >= 0]
