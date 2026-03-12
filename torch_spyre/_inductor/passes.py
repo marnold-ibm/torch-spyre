@@ -31,6 +31,7 @@ from .temp_passes import (
     replace_scalar_with_tensor,
 )
 from .stickify import propagate_spyre_tensor_layouts
+from .insert_nodes import insert_permutes
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .constants import DEVICE_NAME
@@ -116,7 +117,8 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     The returned list of nodes must also be in topological order.
     """
 
-    nodes = propagate_spyre_tensor_layouts(nodes)
+    nodes, permute_needed = propagate_spyre_tensor_layouts(nodes)
+    nodes = insert_permutes(nodes, permute_needed)
     nodes = core_division_planning(nodes)
     if os.environ.get("LX_PLANNING", "0") == "1":
         nodes = scratchpad_planning(nodes)
