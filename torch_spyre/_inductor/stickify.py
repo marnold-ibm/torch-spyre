@@ -127,7 +127,7 @@ def derive_dim_order(template: SpyreTensorLayout, rank: int) -> list[int]:
     return list(range(rank))
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
+def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     origin_node = next(iter(pw.origins))
@@ -214,10 +214,17 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 if not is_wildcard(sv):
                     stick_vars.add(arg_dim_map[stick_dim])
         if len(stick_vars) > 1:
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            raise Unsupported(
-                "Spyre limitation: pointwise op with multiple non-broadcasted stick dims"
+            # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+            # Choose arg[1] to determine the layout of the output 
+            # and record that arg 1 needs to be permuted.
+            # Hardcoded for now as a sample, will do something smarter 
+            # once moving to new OpSpec
+            stl = device_layout_like(args[0].layout, output.dtype)
+            layout = FixedTiledLayout(
+                output.device, output.dtype, output.size, [64,1], stl
             )
+            permute_needed[n] = {"arg_index": 1, "target_layout": layout}
+            return layout
 
         # Case 1: There exists a non-broadcasting input.
         # Propagate its device_layout to the output.
@@ -345,7 +352,10 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
 
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
+) -> tuple[list[BaseSchedulerNode], dict]:
+    
+    permute_needed = {}
+
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
@@ -383,7 +393,7 @@ def propagate_spyre_tensor_layouts(
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, get_mem_deps(n))
+                output_layout = pointwise_layout(n, get_mem_deps(n), permute_needed)
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
                 output_layout = reduction_layout(n, get_mem_deps(n))
@@ -408,5 +418,5 @@ def propagate_spyre_tensor_layouts(
             n.node.layout = output_layout
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
+    return nodes, permute_needed
 
-    return nodes
