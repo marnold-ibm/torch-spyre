@@ -132,13 +132,14 @@ def dump_ir(nodes: list[BaseSchedulerNode]):
 def insert_permutes(
     nodes: list[BaseSchedulerNode], permute_needed: dict
 ) -> list[BaseSchedulerNode]:
+    
     if not permute_needed:
         return nodes
 
     graph = V.graph
-    scheduler = nodes[0].scheduler
-    new_nodes = []
-    for n in nodes:
+    scheduler = V.graph.scheduler
+    for n in list(nodes):  # copy because loop updates scheduler.nodes
+
         if n in permute_needed:
             permute_info = permute_needed[n]
 
@@ -192,7 +193,6 @@ def insert_permutes(
                 new_buff.name = registered_buff
 
             new_sn = scheduler.create_scheduler_node(new_buff)
-            new_nodes.append(new_sn)
 
             # ===================================================
             # Now update the original node to read this buffer instead of arg0
@@ -232,7 +232,6 @@ def insert_permutes(
                 scheduler.name_to_buf[buf.get_name()] = buf
             scheduler.nodes.append(new_sn)
 
-        new_nodes.append(n)
 
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
@@ -242,4 +241,6 @@ def insert_permutes(
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
 
-    return new_nodes
+    #dump_ir(scheduler.nodes)
+
+    return scheduler.nodes
