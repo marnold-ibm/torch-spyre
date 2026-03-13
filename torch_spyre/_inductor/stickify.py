@@ -43,7 +43,7 @@ from torch_spyre._C import (
 )
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
-from .ir import FixedTiledLayout
+from .ir import Any, FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps, map_dims_to_vars, is_wildcard
 
 logger = get_inductor_logger("stickify")
@@ -127,7 +127,9 @@ def derive_dim_order(template: SpyreTensorLayout, rank: int) -> list[int]:
     return list(range(rank))
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
+def pointwise_layout(
+    n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict
+) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     origin_node = next(iter(pw.origins))
@@ -215,13 +217,13 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     stick_vars.add(arg_dim_map[stick_dim])
         if len(stick_vars) > 1:
             # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            # Choose arg[1] to determine the layout of the output 
+            # Choose arg[1] to determine the layout of the output
             # and record that arg 1 needs to be permuted.
-            # Hardcoded for now as a sample, will do something smarter 
+            # Hardcoded for now as a sample, will do something smarter
             # once moving to new OpSpec
             stl = device_layout_like(args[0].layout, output.dtype)
             layout = FixedTiledLayout(
-                output.device, output.dtype, output.size, [64,1], stl
+                output.device, output.dtype, output.size, [64, 1], stl
             )
             permute_needed[n] = {"arg_index": 1, "target_layout": layout}
             return layout
@@ -353,8 +355,8 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> tuple[list[BaseSchedulerNode], dict]:
-    
-    permute_needed = {}
+    # Track nodes that require inputs to be permuted, with information about how
+    permute_needed: dict[BaseSchedulerNode, dict[str, Any]] = {}
 
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     if len(V.graph.graph_input_names) > 0:
@@ -419,4 +421,3 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
     return nodes, permute_needed
-
