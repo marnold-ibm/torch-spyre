@@ -29,37 +29,16 @@ logger = get_inductor_logger("insert_nodes")
 
 aten = torch.ops.aten
 
+from torch._inductor.ops_handler import WrapperHandler
 
-def swap_inner_fn(orig_fn, old_name: str, new_name: str):
-    """Return a function that overrides ops.load calls from old_name -> new_name."""
+class NameSwapHandler(WrapperHandler):
+    def __init__(self, inner, old_name: str, new_name: str):
+        super().__init__(inner)
+        self._old = old_name
+        self._new = new_name
 
-    # ops.load is usually accessible via the closure of orig_fn or as a global
-    # We'll wrap orig_fn directly
-    def wrapper(*args, **kwargs):
-        # save the original ops.load if accessible
-        if "ops" in orig_fn.__globals__:
-            original_load = orig_fn.__globals__["ops"].load
-            ops_ref = orig_fn.__globals__["ops"]
-        else:
-            # fallback: the function might use its closure; in that case we leave load as-is
-            original_load = None
-            ops_ref = None
-
-        def load_override(name, *a, **kw):
-            if name == old_name:
-                name = new_name
-            return original_load(name, *a, **kw)
-
-        if ops_ref:
-            ops_ref.load = load_override
-        try:
-            return orig_fn(*args, **kwargs)
-        finally:
-            if ops_ref:
-                ops_ref.load = original_load
-
-    return wrapper
-
+    def load(self, name, index):
+        return super().load(self._new if name == self._old else name, index)
 
 # Temporary debugging methods while developing
 def print_node(n):
@@ -195,12 +174,12 @@ def insert_permutes(
             new_sn = scheduler.create_scheduler_node(new_buff)
 
             # ===================================================
-            # Now update the original node to read this buffer instead of arg0
-            new_inner_fn2 = swap_inner_fn(
-                n.node.data.inner_fn, arg_buff.name, new_buff.name
-            )
-
-            object.__setattr__(n.node.data, "inner_fn", new_inner_fn2)
+            # Now create a wrapper that replaces reads of the modified arg with the new buffer
+            orig_inner = n.node.data.inner_fn
+            def new_inner_fn(index, _old=arg_buff.name, _new=new_buff.name, _orig=orig_inner):
+                with V.set_ops_handler(NameSwapHandler(V.ops, _old, _new)):
+                    return _orig(index)
+            object.__setattr__(n.node.data, "inner_fn", new_inner_fn)
 
             # Must create new ComputedBuffer to update internal Scheduler metadata
             # (Or figure out what it needs and update it)
