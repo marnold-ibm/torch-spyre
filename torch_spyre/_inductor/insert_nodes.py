@@ -16,6 +16,7 @@ import torch
 
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import ComputedBuffer, Pointwise, ops
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     SchedulerNode,
@@ -29,16 +30,15 @@ logger = get_inductor_logger("insert_nodes")
 
 aten = torch.ops.aten
 
-from torch._inductor.ops_handler import WrapperHandler
 
 class NameSwapHandler(WrapperHandler):
-    def __init__(self, inner, old_name: str, new_name: str):
+    def __init__(self, inner, name_map: dict[str, str]):
         super().__init__(inner)
-        self._old = old_name
-        self._new = new_name
+        self._name_map = name_map
 
     def load(self, name, index):
-        return super().load(self._new if name == self._old else name, index)
+        return super().load(self._name_map.get(name, name), index)
+
 
 # Temporary debugging methods while developing
 def print_node(n):
@@ -111,14 +111,12 @@ def dump_ir(nodes: list[BaseSchedulerNode]):
 def insert_permutes(
     nodes: list[BaseSchedulerNode], permute_needed: dict
 ) -> list[BaseSchedulerNode]:
-    
     if not permute_needed:
         return nodes
 
     graph = V.graph
     scheduler = V.graph.scheduler
     for n in list(nodes):  # copy because loop updates scheduler.nodes
-
         if n in permute_needed:
             permute_info = permute_needed[n]
 
@@ -174,15 +172,20 @@ def insert_permutes(
             new_sn = scheduler.create_scheduler_node(new_buff)
 
             # ===================================================
-            # Now create a wrapper that replaces reads of the modified arg with the new buffer
+            # Now create a wrapper that replaces reads of args that have new buffers
+
+            name_map = {
+                arg_buff.name: new_buff.name
+            }  # add more arg pairs to swap here if needed
             orig_inner = n.node.data.inner_fn
-            def new_inner_fn(index, _old=arg_buff.name, _new=new_buff.name, _orig=orig_inner):
-                with V.set_ops_handler(NameSwapHandler(V.ops, _old, _new)):
-                    return _orig(index)
+
+            def new_inner_fn(index, _map=name_map, _orig_inner=orig_inner):
+                with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+                    return _orig_inner(index)
+
             object.__setattr__(n.node.data, "inner_fn", new_inner_fn)
 
-            # Must create new ComputedBuffer to update internal Scheduler metadata
-            # (Or figure out what it needs and update it)
+            # Creating new buffer minimizes internal datastructures that need to be hacked
             new_computed_buffer = ComputedBuffer(
                 name=n.node.name,
                 layout=n.node.layout,
@@ -211,7 +214,6 @@ def insert_permutes(
                 scheduler.name_to_buf[buf.get_name()] = buf
             scheduler.nodes.append(new_sn)
 
-
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
     # Can skip sorting if new_sn was inserted in the correct spot to
@@ -220,6 +222,6 @@ def insert_permutes(
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
 
-    #dump_ir(scheduler.nodes)
+    # dump_ir(scheduler.nodes)
 
     return scheduler.nodes
