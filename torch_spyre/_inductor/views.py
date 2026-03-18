@@ -43,6 +43,11 @@ def compute_coordinates(
     """
     Derive an array of coordinate expressions into a tensor from an index
     """
+    # print ("----")
+    # print ("size:", size)
+    # print ("stride:", stride)
+    # print ("var_ranges:", var_ranges)
+    # print ("index:", index)
     coordinates = [sympy.S.Zero] * len(size)
     vars = index.free_symbols
     for var in vars:
@@ -77,8 +82,18 @@ def compute_device_coordinates(
     """
     Derive an array of coordinate expressions into a device tensor from an index
     """
+    # print ("<<<<<")
+    # print ("size", size)
+    # print ("stride", stride)
+    # print ("device_size", device_size)
+    # print ("dim_map", dim_map)
+    # print ("var_ranges", var_ranges)
+    # print ("index", index)
+
     rel_stride = compute_relative_stride(len(size), device_size, dim_map)
+    # print ("rel_stride", rel_stride)
     host_coordinates = compute_coordinates(size, stride, var_ranges, index)
+    # print ("host_coordinates", host_coordinates)
     coordinates = [sympy.S.Zero] * len(device_size)
     for dim in range(len(device_size)):
         if dim_map[dim] == -1:
@@ -91,4 +106,5 @@ def compute_device_coordinates(
             limit = term.subs(var, var_ranges[var])
             if limit > rel_stride[dim] and step < rel_stride[dim] * device_size[dim]:
                 coordinates[dim] += term // rel_stride[dim]
+    # print (">>>>>")
     return coordinates

@@ -112,6 +112,7 @@ def insert_permutes(
     nodes: list[BaseSchedulerNode], permute_needed: dict
 ) -> list[BaseSchedulerNode]:
     if not permute_needed:
+        # dump_ir(nodes)
         return nodes
 
     graph = V.graph
@@ -121,7 +122,7 @@ def insert_permutes(
             permute_info = permute_needed[n]
 
             # Get the arg info for the input we need to permute
-            mem_dep = list(n.read_writes.reads)[permute_info["arg_index"]]
+            mem_dep = list(n.read_writes.reads)[permute_info["arg_infos"][0]["arg_num"]]
             arg_name = mem_dep.name
             arg_buff = V.graph.get_buffer(arg_name).data.data
 
