@@ -89,13 +89,16 @@ std::optional<int32_t> SpyreTensorLayout::host_stick_dim() {
 }
 
 static std::vector<int64_t> compute_host_stride(
-    const std::vector<int64_t>& host_size) {
-  int n = host_size.size();
-  std::vector<int64_t> host_stride(n);
-  int64_t stride = 1;
-  for (int i = n - 1; i >= 0; --i) {
-    host_stride[i] = stride;
-    stride *= host_size[i];
+    const std::vector<int64_t>& host_size,
+    const std::vector<int32_t>& dim_order) {
+  std::vector<int64_t> host_stride(host_size.size(), 0);
+  int64_t s = 1;
+  for (int i = static_cast<int>(dim_order.size()) - 1; i >= 0; --i) {
+    int d = dim_order[i];
+    if (d != -1) {
+      host_stride[d] = s;
+      s *= host_size[d];
+    }
   }
   return host_stride;
 }
@@ -181,7 +184,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
   this->stride_map =
       dim_map_to_stride_map(this->dim_map, host_size,
-                            compute_host_stride(host_size), this->device_size);
+                            compute_host_stride(host_size, dim_order),
+                            this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {

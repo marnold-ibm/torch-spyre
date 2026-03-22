@@ -77,6 +77,34 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.dim_map, [1, -1, 0, -1])
         self.assertEqual(stl.host_stick_dim(), None)
 
+    def test_stride_map_row_major(self):
+        stl = SpyreTensorLayout([256, 128], torch.float16)
+        self.assertEqual(stl.stride_map, [64, 128, 1])
+
+    def test_stride_map_row_major_explicit(self):
+        stl = SpyreTensorLayout([256, 128], torch.float16, [0, 1])
+        self.assertEqual(stl.stride_map, [64, 128, 1])
+
+    def test_stride_map_col_major(self):
+        stl = SpyreTensorLayout([256, 128], torch.float16, [1, 0])
+        self.assertEqual(stl.stride_map, [64, 256, 1])
+
+    def test_stride_map_3d_non_default(self):
+        # dim_order=[2,1,0]: dim2 outermost, dim0 innermost (stick)
+        stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
+        self.assertEqual(stl.stride_map, [512, 64, 4096, 1])
+
+    def test_stride_map_3d_rotation(self):
+        # dim_order=[1,2,0]: non-monotone rotation, dim0 innermost (stick)
+        stl = SpyreTensorLayout([32, 64, 128], torch.float16, [1, 2, 0])
+        self.assertEqual(stl.stride_map, [32, 64, 4096, 1])
+
+    def test_stride_map_sparse_col_major(self):
+        # sparse col-major [1,0,-1]: host stride [1,256], stick on dim1
+        stl = SpyreTensorLayout([256, 128], torch.float16, [1, 0, -1])
+        self.assertEqual(stl.stride_map, [1, -1, 256, -1])
+
+
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
