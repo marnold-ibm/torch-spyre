@@ -553,3 +553,126 @@ def clone(x, *, memory_format=None):
         result.realize()
         result.freeze_layout_with_stride_order(stride_order)
     return result
+
+
+# def lower_restickify2(x):
+#     from torch._inductor.ir import ComputedBuffer, FixedLayout
+#     from torch._inductor.virtualized import V
+#     print ("MRA type(x):", type(x), "and x.get_stride():", x.get_stride())
+#     x_loader = x.make_loader()
+#     def inner_fn(index):
+#         return x_loader(index)
+    
+#     pw = Pointwise.create(
+#         device=x.get_device(),
+#         dtype=x.get_dtype(),
+#         inner_fn=inner_fn,
+#         ranges=x.get_size(),
+#         origin_node=None,
+#         traceback=x.get_traceback(),
+#     )
+    
+#     storage_box = pw.data
+#     pointwise_data = storage_box.data
+    
+#     size = list(x.get_size())
+#     view_stride = list(x.get_stride())
+    
+#     print(f"MRA: Input stride from x.get_stride(): {view_stride}")
+#     print(f"MRA: Size: {size}")
+    
+#     origin_node = pointwise_data.get_origin_node()
+#     traceback = pointwise_data.get_traceback()
+#     device = pointwise_data.get_device()
+    
+#     fixed_layout = FixedLayout(
+#         device=device,
+#         dtype=pointwise_data.get_dtype(),
+#         size=size,
+#         stride=view_stride,
+#         offset=0,
+#         is_pinned=False,
+#     )
+    
+#     print(f"MRA: FixedLayout.stride after creation: {fixed_layout.stride}")
+    
+#     # Test the indexer
+#     indexer = fixed_layout.make_indexer()
+#     import sympy
+#     c0, c1 = sympy.symbols('c0 c1')
+#     test_index = indexer([c0, c1])
+#     print(f"MRA: Indexer result for [c0, c1]: {test_index}")
+    
+#     computed_buffer = ComputedBuffer(
+#         name=None,
+#         layout=fixed_layout,
+#         data=pointwise_data,
+#     )
+#     computed_buffer.name = V.graph.register_buffer(computed_buffer)
+#     V.graph.register_operation(computed_buffer)
+#     computed_buffer.origins = storage_box.origins
+#     computed_buffer.origin_node = origin_node
+#     computed_buffer.traceback = traceback
+#     storage_box.data = computed_buffer
+    
+#     return pw
+# def lower_restickif_orig(x):
+#     # fn = lowering.ops_wrapper(torch.ops.spyre.restickify.__name__)
+
+#     # x = V.graph.get_buffer(x.realize())
+    
+#     x_loader = x.make_loader()
+#     def inner_fn(index):
+#         # return x_loader(index)
+#         i0, i1 = index
+#         return x_loader([i1, i0])
+
+#     pw = Pointwise.create(
+#         device=x.get_device(),
+#         dtype=x.get_dtype(),
+#         inner_fn=inner_fn,
+#         ranges=x.get_size(),
+#         origin_node=None,
+#         traceback=x.get_traceback(),
+#     )
+
+#     pw.realize()
+#     pw.freeze_layout_with_stride_order([1,0]) 
+#     print ("MRA: Restickify lowering output.stride and stl:", pw.get_stride(), pw.get_layout())
+
+
+#     return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.restickify)
+def lower_restickify(x):
+
+
+    # print ("MRA: Begin lowering restickify x size and stride:", x.get_size(), x.get_stride())
+    # x = V.graph.get_buffer(x.realize())
+    # print ("MRA: lowering after realize  x size and stride:", x.get_size(), x.get_stride())
+
+    loader = x.make_loader()
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.restickify.__name__)
+    def inner_fn(index):
+        return fn(loader(index))
+        # return loader(index)
+    
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=None,
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    pw.freeze_layout_with_stride_order([1,0]) 
+
+    print("MRA: Restickify node created with stride and layout:", pw.get_stride(), pw.get_layout())
+
+    return pw
+

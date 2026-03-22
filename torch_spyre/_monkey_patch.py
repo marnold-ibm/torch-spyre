@@ -95,7 +95,12 @@ def _patch_tensor_for_spyre():
             return empty_with_layout(
                 *args, device_layout, dtype, device, pin_memory, memory_format
             )
-
+        
+    def restickify(self: torch.Tensor) -> torch.Tensor:
+        import torch
+        return torch.ops.spyre.restickify(self)
+    
+    torch.Tensor.restickify = restickify
     torch.Tensor.__repr__ = spyre_aware_repr
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True

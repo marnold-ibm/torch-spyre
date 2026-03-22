@@ -76,6 +76,7 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
     return result
 
 
+
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
 

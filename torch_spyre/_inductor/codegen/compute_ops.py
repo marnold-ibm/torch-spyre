@@ -537,6 +537,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # Get operation dim map from the tensor that represents the operation space
     op_dims_tensor = inputs[0] if reduction else outputs[0]
+    
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]

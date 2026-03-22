@@ -248,3 +248,14 @@ def _ones_scalar_fake(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(1, dtype=dtype, device="spyre")
+
+
+
+@torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
+def restickify(x: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@restickify.register_fake
+def _(x: torch.Tensor):
+    return x.new_empty(x.size())

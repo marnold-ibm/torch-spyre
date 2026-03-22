@@ -179,9 +179,18 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] = host_size[dim];
     }
   }
+  std::vector<int64_t> host_stride(host_size.size(), 0);
+  int64_t s = 1;
+  for (int i = static_cast<int>(dim_order.size()) - 1; i >= 0; --i) {
+    int d = dim_order[i];
+    if (d != -1) {
+      host_stride[d] = s;
+      s *= host_size[d];
+    }
+  }
   this->stride_map =
-      dim_map_to_stride_map(this->dim_map, host_size,
-                            compute_host_stride(host_size), this->device_size);
+      dim_map_to_stride_map(this->dim_map, host_size, host_stride,
+                            this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {

@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import logging
+import os
 
-
+import sympy
 import torch
+from torch._inductor.dependencies import MemoryDep, ReadWrites
+from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -108,6 +111,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     origin_node = next(iter(pw.origins))
     op = origin_node.target
 
+    for arg in args:
+        print("MRA: input arg: ", arg)
+
     if len(args) == 1:
         x = args[0]
         x_stl = x.layout.device_layout
@@ -130,6 +136,22 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
+                )
+
+            case spyreop.restickify.default:
+                stl = SpyreTensorLayout(output.size, output.dtype)
+                output_stride = output.stride
+
+                # To reproduce [0,1,0] incompatibilty, uncomment this but also uncomment the 
+                # freeze_layout_with_stride_order in lowering.py
+                # stl = SpyreTensorLayout(
+                #     [256,128],          # device_size
+                #     torch.float16,
+                #     [1,0],
+                # )
+
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output_stride, stl
                 )
 
             case aten.clone.default:
@@ -194,9 +216,22 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
+        print ()
+        print ("MRA: ---------------- Calling host_coordinates for inputs ---------------")
         in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
+        print()
+        print ("MRA: ----------- Calling in_device_coords for inputs --------------- ")
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
+        print ()
+        print ("MRA: ---------- Calling host_coordinates for output -----------")
         out_coords = host_coordinates(output, output_dep)
+
+
+        print ("MRA: in_coords: ", in_coords)
+        print ("MRA: in_device_coords: ", in_device_coords)
+        print ("MRA: out_coords: ", out_coords)
+
+        
 
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
@@ -206,11 +241,18 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             if idc[-1] != 0:
                 stick_exprs.add(idc[-1])
 
+        print ("MRA: stick_exprs: ", stick_exprs)
+
         if len(stick_exprs) > 1:
             # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+
+            print ("ERROR: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}")
+            print_node(n)
+
             raise Unsupported(
                 f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
             )
+            # print ("ERROR: Spyre limitation: pointwise op with nonuniform stick indexing: ", stick_exprs)
 
         # See if the indexing across all inputs and the output is identical.
         can_use_same_layout = True
@@ -222,6 +264,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         if can_use_same_layout:
             # Identical indexing. Therefore no views or broadcasts. Just propagate layout
             stl = device_layout_like(args[0].layout, output.dtype)
+            out_stride = output.stride
         else:
             # Use row major adjusted to put stick dimension last
             # TODO: Should we also push size 1 dims to the interior here like in unary above??
@@ -229,16 +272,17 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 raise Unsupported(
                     "pointwise op with views/broadcasts without stick dim"
                 )
-
             stick_expr = next(iter(stick_exprs))
             maybe_stick_dim = matching_dim(out_coords, stick_expr)
             out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
             dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
             dim_order += [out_stick_dim]
             stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+            out_stride = output.stride
+            
 
         result = FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
+            output.device, output.dtype, output.size, out_stride, stl
         )
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -355,6 +399,54 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
     )
 
 
+def print_node(n):
+    print("=== SchedulerNode ===")
+
+    if hasattr(n, "_kernel"):
+        print("Has kernel:", n._kernel)
+    else:
+        print("Has Kernel:  NO")
+
+    print("reads:", n.read_writes.reads)
+    for dep in n.read_writes.reads:
+        print("Read Dep Name", repr(dep.name))
+
+    print("writes:", n.read_writes.writes)
+    for dep in n.read_writes.writes:
+        print("Write Dep Name", repr(dep.name))
+
+    if hasattr(n, "min_order"):
+        print("min_order:", n.min_order)
+    else:
+        print("No min order field")
+    if hasattr(n, "max_order"):
+        print("max_order:", n.max_order)
+    else:
+        print("No max order field")
+    print("ancestors:", n.ancestors)
+    print("unmet_dependencies:", n.unmet_dependencies)
+    print()
+
+    print("=== Buffer node: ===")
+    buffer = n.node
+    if hasattr(buffer, "operation_name"):
+        print("Node operation name", buffer.get_operation_name())
+    else:
+        print("Node operation name is missing")
+    print("node.node:", buffer)
+
+    # print("--- CLOSURES ---")
+    # fn = buffer.data.inner_fn
+    # print("FN:", fn)
+    # print("FREEVARS:", fn.__code__.co_freevars)
+    # print("CLOSURE:", fn.__closure__)
+    # for cell in fn.__closure__ or []:
+    #     print("CELL:", cell.cell_contents, type(cell.cell_contents))
+
+    print("---------------------------------")
+    print()
+
+
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -393,6 +485,8 @@ def propagate_spyre_tensor_layouts(
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
+            print ("ABOUT TO DECIDE LAYOUT")
+            print_node(n)
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
                 output_layout = pointwise_layout(n, get_mem_deps(n))
@@ -420,5 +514,6 @@ def propagate_spyre_tensor_layouts(
             n.node.layout = output_layout
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
+        print_node(n)
 
     return nodes

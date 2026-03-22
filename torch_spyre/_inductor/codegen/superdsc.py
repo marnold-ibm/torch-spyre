@@ -215,6 +215,15 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             outputs=outputs,
             **kwargs,
         )
+    if op == "restickify":
+        return generate_transpose(
+            pointers,
+            op=op,
+            dimensions=dimensions,
+            inputs=inputs,
+            outputs=outputs,
+            **kwargs,
+        )
     return generate_sfp_op(
         pointers,
         op=op,

@@ -14,6 +14,7 @@
 
 # Helper methods to handle views
 
+from numpy import rint
 import sympy
 from typing import Optional, Sequence
 
@@ -46,6 +47,10 @@ def compute_coordinates(
     Stride and index must be relative to the same storage (both host or device).
     Stride values<=0 are ignored.
     """
+
+
+    # print ("MRA: In compute coordinates: size:", size, "stride:", stride, "var_ranges:", var_ranges, "index:", index)
+
     # find stride immediately strictly larger that dim stride
     n = len(size)
     next_stride = [sympy.oo] * n
@@ -106,8 +111,10 @@ def compute_device_coordinates(
     """
     Derive an array of coordinate expressions into a device tensor from an index
     """
+
     rel_stride = compute_relative_stride(len(size), device_size, dim_map)
     host_coordinates = compute_coordinates(size, stride, var_ranges, index)
+
     coordinates = [sympy.S.Zero] * len(device_size)
     for dim in range(len(device_size)):
         if dim_map[dim] == -1:
