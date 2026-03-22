@@ -1,0 +1,45 @@
+TL;DR
+  Restickify cannot fix stick incompatibility by changing only the device layout and leaving the
+  host stride unchanged.  That intuition is wrong.
+
+  The host stride is inextricably linked to the load index expression — they are the same thing,
+  expressed two different ways.  Forcing a [1,256] host stride and col-major layout changes both the
+  dim order and the index expression — they cancel out, leaving the stick variable unchanged, and stick
+  incompatibility remains.
+
+Running example: y.t().restickify() + x
+
+  y:          shape [128, 256], host stride [256, 1]  (row-major)
+  y.t():      shape [256, 128], host stride [1, 256]  (col-major, transposed view)
+  buf0:       shape [256, 128], host stride [1, 256]  (restickify output, same host stride as y.t())
+  x (arg1_1): shape [256, 128], host stride [128, 1]  (row-major)
+
+y.t() (col-major, host stride [1,256], dim_map=[1,0,1]):
+  STL:              SpyreTensorLayout(device_size=[2, 256, 64], dim_map =[1, 0, 1], stride_map =[64, 128, 1], device_dtype=DataFormats.SEN169_FP16)
+  device coords:    [floor((Mod(c0, 128))/64), floor(c0/128) + floor(2*c1), floor(Mod(c0, 64))]
+  stick expression: floor(Mod(c0, 64))  =>  loop variable c0
+
+buf0 (col-major, host stride [1,256], dim_map=[0,1,0], after restickify):
+  STL:              SpyreTensorLayout(device_size=[4, 128, 64], dim_map =[0, 1, 0], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16)
+  device coords:    [floor(c0/64), floor(c1), floor(Mod(c0, 64))]
+  stick expression: floor(Mod(c0, 64))  =>  loop variable c0  (unchanged from y.t())
+
+x (row-major, host stride [128,1], dim_map=[1,0,1]):
+  STL:              SpyreTensorLayout(device_size=[2, 256, 64], dim_map =[1, 0, 1], stride_map =[64, 128, 1], device_dtype=DataFormats.SEN169_FP16)
+  device coords:    [floor(c1/64), floor(c0), floor(Mod(c1, 64))]
+  stick expression: floor(Mod(c1, 64))  =>  loop variable c1
+
+Stick compatibility (y.t() vs x):  INCOMPATIBLE
+Stick compatibility (buf0  vs x):  INCOMPATIBLE
+
+The stick variable of buf0 is c0 regardless of dim_map, as the add kernel shows directly:
+
+  def inner_fn(index):       # (from y.t().restickify() + x)
+      i0, i1 = index
+      tmp0 = ops.load(buf0,    i0 + 256 * i1)  # stride [1,256]: i0 has stride 1 => stick = c0
+      tmp1 = ops.load(arg1_1,  i1 + 128 * i0)  # stride [128,1]: i1 has stride 1 => stick = c1
+      tmp2 = tmp0 + tmp1
+      return tmp2
+
+The load index is the host stride written as code; restickify cannot change either.
+If col-major stride [1,256] is required, a separate restickify kernel is needed after the add.
