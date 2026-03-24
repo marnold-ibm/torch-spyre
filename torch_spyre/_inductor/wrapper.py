@@ -77,14 +77,32 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
         name = buffer.get_name()
         codegen_shape_tuple = self.codegen_python_shape_tuple(tuple(layout.size))
-        codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
+
+        # If alloc_stride/alloc_device_layout are set, use them for the
+        # allocation (controls host stride and device addressing metadata seen
+        # by the host), while the kernel itself uses layout.stride/device_layout
+        # for its store index.  The two must address the same physical bits.
+        if layout.alloc_stride is not None:
+            codegen_stride_tuple = self.codegen_python_shape_tuple(
+                tuple(layout.alloc_stride)
+            )
+        else:
+            codegen_stride_tuple = self.codegen_python_shape_tuple(
+                tuple(layout.stride)
+            )
+
+        alloc_device_layout = (
+            layout.alloc_device_layout
+            if layout.alloc_device_layout is not None
+            else layout.device_layout
+        )
 
         out = (
             f"{name} = spyre_empty_with_layout("
             f"{codegen_shape_tuple}, "
             f"{codegen_stride_tuple}, "
             f"{layout.dtype}, "
-            f"{layout.device_layout!r})"
+            f"{alloc_device_layout!r})"
         )
 
         return out

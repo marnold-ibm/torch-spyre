@@ -111,6 +111,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     origin_node = next(iter(pw.origins))
     op = origin_node.target
 
+    print(f"MRA pointwise_layout: op={op} nargs={len(args)}")
     for arg in args:
         print("MRA: input arg: ", arg)
 
@@ -139,16 +140,14 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 )
 
             case spyreop.restickify.default:
-                stl = SpyreTensorLayout(output.size, output.dtype)
-                output_stride = output.stride
-
-                # To reproduce [0,1,0] incompatibilty, uncomment this but also uncomment the 
-                # freeze_layout_with_stride_order in lowering.py
-                # stl = SpyreTensorLayout(
-                #     [256,128],          # device_size
-                #     torch.float16,
-                #     [1,0],
-                # )
+                # Produces correct answer!!!!!!
+                # Either one of these passes the stick test!
+                # 1,0,1 gets the right answer
+                stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [16384, 1, 256], get_device_dtype(output.dtype))
+                
+                # #  0,1,0 also passes stick test but gets wrong answer because backend uses dim-map to determine stick
+                # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
+                output_stride = [sympy.Integer(1), output.size[0]]
 
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output_stride, stl
@@ -265,6 +264,14 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             # Identical indexing. Therefore no views or broadcasts. Just propagate layout
             stl = device_layout_like(args[0].layout, output.dtype)
             out_stride = output.stride
+            input_stride = list(args[0].layout.stride)
+            alloc_stride = input_stride if input_stride != list(out_stride) else None
+            print(f"MRA can_use_same_layout: out_stride={out_stride} input_stride={input_stride} alloc_stride={alloc_stride}")
+            result = FixedTiledLayout(
+                output.device, output.dtype, output.size, out_stride, stl,
+                alloc_stride=alloc_stride,
+                alloc_device_layout=stl if alloc_stride is not None else None,
+            )
         else:
             # Use row major adjusted to put stick dimension last
             # TODO: Should we also push size 1 dims to the interior here like in unary above??
@@ -277,13 +284,24 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
             dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
             dim_order += [out_stick_dim]
-            stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
-            out_stride = output.stride
-            
-
-        result = FixedTiledLayout(
-            output.device, output.dtype, output.size, out_stride, stl
-        )
+            if os.environ.get("SPYRE_COLMAJOR_OUTPUT", "0") == "1":
+                # Col-major output: stride_map=[16384,1,256], host stride [1,NROWS].
+                # The loop recomputes decide_layout so store index is col-major too.
+                s0 = output.size[0]
+                s1 = output.size[1]
+                stl = SpyreTensorLayout(
+                    [s1 // 64, s0, 64],
+                    [1, 0, 1],
+                    [s0 * 64, sympy.Integer(1), s0],
+                    get_device_dtype(output.dtype),
+                )
+                out_stride = [sympy.Integer(1), s0]
+            else:
+                stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+                out_stride = output.stride
+            result = FixedTiledLayout(
+                output.device, output.dtype, output.size, out_stride, stl
+            )
 
         if logger.isEnabledFor(logging.DEBUG):
             input_info = ", ".join(
@@ -486,11 +504,27 @@ def propagate_spyre_tensor_layouts(
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             print ("ABOUT TO DECIDE LAYOUT")
-            print_node(n)
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
+                old_stride = list(n.node.layout.stride)
                 output_layout = pointwise_layout(n, get_mem_deps(n))
                 n.node.layout = output_layout
+                if (os.environ.get("SPYRE_COLMAJOR_OUTPUT", "0") == "1"
+                        and list(output_layout.stride) != old_stride):
+                    # Re-run decide_layout with col-major stride so the kernel's
+                    # store index and stride_map are consistent.
+                    from torch._inductor.ir import FlexibleLayout
+                    flex = FlexibleLayout(
+                        output_layout.device, output_layout.dtype, output_layout.size
+                    )
+                    n.node.layout = flex
+                    n.node.freeze_layout_with_stride_order(
+                        sorted(range(len(output_layout.stride)),
+                               key=lambda i: output_layout.stride[i])
+                    )
+                    ComputedBuffer.get_default_sizes_body.clear_cache(n.node)
+                    n.recompute_size_and_body()
+                    n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
                 output_layout = reduction_layout(n, get_mem_deps(n))
                 n.node.layout = output_layout

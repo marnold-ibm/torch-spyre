@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 from contextlib import contextmanager
 
 import torch
@@ -670,7 +671,9 @@ def lower_restickify(x):
     )
 
     pw.realize()
-    pw.freeze_layout_with_stride_order([1,0]) 
+
+    # This can also work
+    pw.freeze_layout_with_stride_order([0, 1])
 
     print("MRA: Restickify node created with stride and layout:", pw.get_stride(), pw.get_layout())
 

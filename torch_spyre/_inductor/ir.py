@@ -83,10 +83,14 @@ class FixedTiledLayout(FixedLayout):
         size: list[Expr],
         stride: list[Expr],
         device_layout: SpyreTensorLayout,
+        alloc_stride: Optional[list[Expr]] = None,
+        alloc_device_layout: Optional[SpyreTensorLayout] = None,
     ) -> None:
         super().__init__(device, dtype, size, stride)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
+        self.alloc_stride: Optional[list[Expr]] = alloc_stride
+        self.alloc_device_layout: Optional[SpyreTensorLayout] = alloc_device_layout
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
