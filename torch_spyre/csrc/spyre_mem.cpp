@@ -156,6 +156,29 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   stride_info.offset_src_ = 0;
   stride_info.offset_dst_ = 0;
 
+
+  // TEMPORARY HACK: Override stride_dst_ when DCI_HACK env var is set
+  const char* dci_hack_env = std::getenv("DCI_HACK");
+  DEBUGINFO("DCI_HACK check: host2device=", host2device, 
+            " env_var=", (dci_hack_env ? dci_hack_env : "NULL"));
+  
+  if (!host2device && dci_hack_env != nullptr && 
+      std::string(dci_hack_env) == "1") {
+    DEBUGINFO("DCI_HACK ACTIVE: Overriding stride_dst_ from ", 
+              stride_info.stride_dst_, " to [1, 256, 64]");
+    stride_info.stride_src_.clear();
+    stride_info.stride_src_ = {256, 1, 16384};
+    
+    stride_info.stride_dst_.clear();
+    // stride_info.stride_dst_ = {1, 512, 64};
+    stride_info.stride_dst_ = {1, 1, 64};
+    // stride_info.stride_dst_ = {1,256, 64};
+    // stride_info.stride_dst_ = {1,128, 64};
+
+    DEBUGINFO("DCI_HACK: stride_dst_ after override: ", stride_info.stride_dst_);
+  }
+
+
   // pull single value from stick if sparse tensor
   if (sparse) {
     stride_info.size_[0] = 1;

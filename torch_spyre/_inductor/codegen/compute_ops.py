@@ -134,6 +134,8 @@ class DimInfos:
     #     by any remaining dimensions not in the tensor
     def get_tensor_op_index_order(self, tensor):
         dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+        dev_dim_order = tensor["tensor_dim_order"]  
+
         it_dim_map = tensor["it_dim_map"]
         tensor_op_dims = [it_dim_map.index(i) for i in dev_dim_order if i in it_dim_map]
         remaining_op_dims = [i for i in self.dim_indices if i not in tensor_op_dims]
@@ -172,6 +174,8 @@ class DimInfos:
         dl = tensor["device_layout"]
         it_dim_map = tensor["it_dim_map"]
         dev_dim_order = dl.dim_map[::-1][1:]
+        dev_dim_order = tensor["tensor_dim_order"]  
+
         return [self.rows["label"][it_dim_map.index(dmv)] for dmv in dev_dim_order]
 
     # Returns dim infos for dimensions of the tensor,
@@ -186,7 +190,9 @@ class DimInfos:
     def get_tensor_stick_dim_labels(self, tensor):
         dl = tensor["device_layout"]
         idx = tensor["it_dim_map"].index(dl.host_stick_dim())
-        return [self.rows["label"][idx]]
+        # return [self.rows["label"][idx]]
+        # MRA HACK
+        return ["out"]
 
 
 # Extract the device size for a give host dim
@@ -195,7 +201,7 @@ def get_device_size(op_dim, tensor):
     dl = tensor["device_layout"]
     scale = tensor["it_dim_map"][op_dim]
     assert scale >= 0, "Scale value should be non-negative for tensor provided"
-    size = dl.device_size[dl.dim_map.index(scale)]
+    size = dl.device_size[dl.dim_map.index(scale)]  # MRA HACK
     if scale == dl.host_stick_dim():
         size *= dl.elems_per_stick()
     return size
@@ -514,6 +520,17 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     data_format = inputs[0]["device_layout"].device_dtype
     ndim = len(dimensions)
 
+    # TEMP DIM ORDERS HERE
+    for tensor in inputs + outputs:
+        dev_coords = tensor["device_coordinates"]
+        from_coords = dev_coords[:-1]  # drop stick
+        tensor["tensor_dim_order"] = list(range(len(from_coords)))
+        # if tensor == outputs[0]:
+        #     tensor["tensor_dim_order"] = list(reversed(tensor["tensor_dim_order"]))
+
+        print(f"MRA device_loop_order: {tensor['name']}  from_coords={from_coords}  tensor_dim_order={tensor['tensor_dim_order']}")
+
+
     cores = 1
     dim_splits = [1] * ndim
 
@@ -539,12 +556,15 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     op_dims_tensor = inputs[0] if reduction else outputs[0]
     
     dl = op_dims_tensor["device_layout"]
-    dim_map = dl.dim_map[::-1][1:]
+    # dim_map = dl.dim_map[::-1][1:]
+    dim_map = op_dims_tensor["tensor_dim_order"]  
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [
-        get_device_size(op_dim, op_dims_tensor) for op_dim in range(ndim)
+        # get_device_size(op_dim, op_dims_tensor) for op_dim in range(ndim)
+        # MRA HACK
+        256, 128
     ]
 
     dim_infos = DimInfos(

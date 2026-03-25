@@ -58,6 +58,7 @@ def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> tuple[Any, list[int]]:
                     "it_dim_map": ts.it_dim_map,
                     "device_layout": ts.device_layout,
                     "lx_addr": lx_addr,
+                    "device_coordinates": ts.device_coordinates,
                 }
             )
             arg_map.append(ts.arg_index)
@@ -68,6 +69,7 @@ def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> tuple[Any, list[int]]:
                     "it_dim_map": ts.it_dim_map,
                     "device_layout": ts.device_layout,
                     "lx_addr": lx_addr,
+                    "device_coordinates": ts.device_coordinates,
                 }
             )
             arg_map.append(ts.arg_index)

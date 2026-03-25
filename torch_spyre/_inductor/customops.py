@@ -258,4 +258,13 @@ def restickify(x: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
 
 @restickify.register_fake
 def _(x: torch.Tensor):
-    return x.new_empty(x.size())
+    # return x.new_empty(x.size())
+    size = x.size()
+    strides = x.stride()
+    
+    # if x.stride() == (128,1): 
+    #     strides = (1, size[0])  
+    # else:
+    #     strides = (size[1], 1)
+    print ("MRA4: x.size:", size, "x.stride", x.stride(), " new strides:", strides)    
+    return x.new_empty_strided(size, strides)

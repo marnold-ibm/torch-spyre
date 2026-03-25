@@ -655,6 +655,7 @@ def lower_restickify(x):
 
     loader = x.make_loader()
 
+    print ("MRA3: x layout:,", x.get_layout())
     fn = lowering.ops_wrapper(torch.ops.spyre.restickify.__name__)
     def inner_fn(index):
         return fn(loader(index))
@@ -673,7 +674,10 @@ def lower_restickify(x):
     pw.realize()
 
     # This can also work
-    pw.freeze_layout_with_stride_order([0, 1])
+    if x.get_layout().stride == [1, 256]:
+        pw.freeze_layout_with_stride_order([0, 1])
+    else:
+        pw.freeze_layout_with_stride_order([1, 0])
 
     print("MRA: Restickify node created with stride and layout:", pw.get_stride(), pw.get_layout())
 

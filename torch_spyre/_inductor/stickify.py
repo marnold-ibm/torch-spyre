@@ -143,14 +143,19 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 # Produces correct answer!!!!!!
                 # Either one of these passes the stick test!
                 # 1,0,1 gets the right answer
-                stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [16384, 1, 256], get_device_dtype(output.dtype))
+                # stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [16384, 1, 256], get_device_dtype(output.dtype))
                 
-                # #  0,1,0 also passes stick test but gets wrong answer because backend uses dim-map to determine stick
-                # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
-                output_stride = [sympy.Integer(1), output.size[0]]
+                #  0,1,0 also passes stick test but gets wrong answer because backend uses dim-map to determine stick
+                if output.stride == [1, 256]:
+                    stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
+                else:
+                    stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [64, 128, 1], get_device_dtype(output.dtype))
+
+                print ("MRA4:  restickify output stride is:", output.stride, " and layout is: ", stl)
+                # output_stride = [sympy.Integer(1), output.size[0]]
 
                 return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output_stride, stl
+                    output.device, output.dtype, output.size, output.stride, stl
                 )
 
             case aten.clone.default:
@@ -215,22 +220,13 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        print ()
-        print ("MRA: ---------------- Calling host_coordinates for inputs ---------------")
         in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
-        print()
-        print ("MRA: ----------- Calling in_device_coords for inputs --------------- ")
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
-        print ()
-        print ("MRA: ---------- Calling host_coordinates for output -----------")
         out_coords = host_coordinates(output, output_dep)
-
 
         print ("MRA: in_coords: ", in_coords)
         print ("MRA: in_device_coords: ", in_device_coords)
         print ("MRA: out_coords: ", out_coords)
-
-        
 
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
@@ -245,13 +241,12 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         if len(stick_exprs) > 1:
             # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
 
-            print ("ERROR: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}")
+            print (f"ERROR: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}")
             print_node(n)
 
             raise Unsupported(
                 f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
             )
-            # print ("ERROR: Spyre limitation: pointwise op with nonuniform stick indexing: ", stick_exprs)
 
         # See if the indexing across all inputs and the output is identical.
         can_use_same_layout = True
@@ -263,44 +258,52 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         if can_use_same_layout:
             # Identical indexing. Therefore no views or broadcasts. Just propagate layout
             stl = device_layout_like(args[0].layout, output.dtype)
-            out_stride = output.stride
             input_stride = list(args[0].layout.stride)
-            alloc_stride = input_stride if input_stride != list(out_stride) else None
-            print(f"MRA can_use_same_layout: out_stride={out_stride} input_stride={input_stride} alloc_stride={alloc_stride}")
+            output_stride = list(output.stride)
+            alloc_stride = input_stride if input_stride != list(output.stride) else None
             result = FixedTiledLayout(
-                output.device, output.dtype, output.size, out_stride, stl,
+                output.device, output.dtype, output.size, output.stride, stl,
                 alloc_stride=alloc_stride,
                 alloc_device_layout=stl if alloc_stride is not None else None,
             )
         else:
-            # Use row major adjusted to put stick dimension last
             # TODO: Should we also push size 1 dims to the interior here like in unary above??
             if len(stick_exprs) == 0:
                 raise Unsupported(
                     "pointwise op with views/broadcasts without stick dim"
                 )
-            stick_expr = next(iter(stick_exprs))
-            maybe_stick_dim = matching_dim(out_coords, stick_expr)
-            out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
-            dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
-            dim_order += [out_stick_dim]
-            if os.environ.get("SPYRE_COLMAJOR_OUTPUT", "0") == "1":
-                # Col-major output: stride_map=[16384,1,256], host stride [1,NROWS].
-                # The loop recomputes decide_layout so store index is col-major too.
-                s0 = output.size[0]
-                s1 = output.size[1]
-                stl = SpyreTensorLayout(
-                    [s1 // 64, s0, 64],
-                    [1, 0, 1],
-                    [s0 * 64, sympy.Integer(1), s0],
-                    get_device_dtype(output.dtype),
-                )
-                out_stride = [sympy.Integer(1), s0]
+            
+            SELECT_LAYOUT = True
+            if SELECT_LAYOUT:
+                # Must select a layout that matches the host stride.  TODO: Just compute it instead?
+                s_i = 0
+                s_arg = args[0]
+                # print ("Searching for output.stride:", output.stride)
+                # print ("For node:")
+                # print_node(n)
+                # for i,arg in enumerate(args):
+                #     print ("MRA4: ARG CONSIDERED:", i, arg)
+                #     if arg.layout.stride == list(output.stride):
+                #         s_arg = arg
+                #         s_i = i
+                #         break   
+
+                stl = device_layout_like(s_arg.layout, output.dtype)
+                output_stride = s_arg.layout.stride
+
+                print ("MRA4: selected input ", s_i, " with layout ", s_arg.layout, " and device layout ", stl)
+                # TODO: This is only valid if the strides match
+                # assert output_stride == s_arg.layout.stride, f"Output stride {output.stride} must match chosen arg {s_i} layout {s_arg.layout.stride} or they are incompatible"
             else:
-                stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
-                out_stride = output.stride
+                # Use row major adjusted to put stick dimension last
+                stick_expr = next(iter(stick_exprs))
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
+                out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
+                dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+                dim_order += [out_stick_dim]
+
             result = FixedTiledLayout(
-                output.device, output.dtype, output.size, out_stride, stl
+                output.device, output.dtype, output.size, output_stride, stl
             )
 
         if logger.isEnabledFor(logging.DEBUG):
