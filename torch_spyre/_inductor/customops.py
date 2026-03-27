@@ -252,19 +252,32 @@ def _ones_scalar_fake(
 
 
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
-def restickify(x: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+def restickify(  # type: ignore[empty-body]
+    x: torch.Tensor, stride_order: list[int]
+) -> torch.Tensor:
     pass
 
 
 @restickify.register_fake
-def _(x: torch.Tensor):
-    # return x.new_empty(x.size())
+def _(x: torch.Tensor, stride_order: list[int]) -> torch.Tensor:
     size = x.size()
-    strides = x.stride()
-    
-    # if x.stride() == (128,1): 
-    #     strides = (1, size[0])  
-    # else:
-    #     strides = (size[1], 1)
-    print ("MRA4: x.size:", size, "x.stride", x.stride(), " new strides:", strides)    
+    # stride_order[i] is the rank of dimension i (0 = contiguous/stride-1).
+    # Compute strides so that the dimension with rank r gets the product of
+    # all sizes whose dimensions have a lower rank.
+    ndim = len(size)
+    assert len(stride_order) == ndim, (
+        f"stride_order length {len(stride_order)} must match tensor ndim {ndim}"
+    )
+    # stride_order[i] is the fill-order rank of dim i: 0 = first filled = stride 1,
+    # highest = last filled = largest stride.  Matches PyTorch Inductor convention.
+    strides = [1] * ndim
+    next_stride = 1
+    for i in stride_order:
+        strides[i] = next_stride
+        next_stride *= size[i]
+    # assert list(x.stride()) != strides, (
+    #     "restickify with identical stride order not supported"
+    # )
+
+    print ("MRA4: Origin size/strides", x.size(), x.stride(), "new size/strides:", size, strides)
     return x.new_empty_strided(size, strides)

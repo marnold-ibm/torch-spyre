@@ -202,7 +202,7 @@ class SpyreOpFuncs:
         return PointwiseOp("reciprocal", [x])
 
     @staticmethod
-    def restickify(x):
+    def restickify(x, stride_order):
         return PointwiseOp("restickify", [x])
 
     @staticmethod

@@ -140,19 +140,11 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 )
 
             case spyreop.restickify.default:
-                # Produces correct answer!!!!!!
-                # Either one of these passes the stick test!
-                # 1,0,1 gets the right answer
-                # stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [16384, 1, 256], get_device_dtype(output.dtype))
-                
-                #  0,1,0 also passes stick test but gets wrong answer because backend uses dim-map to determine stick
-                if output.stride == [1, 256]:
+                stride_order = origin_node.args[1]
+                if stride_order == [0, 1]:
                     stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
                 else:
                     stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [64, 128, 1], get_device_dtype(output.dtype))
-
-                print ("MRA4:  restickify output stride is:", output.stride, " and layout is: ", stl)
-                # output_stride = [sympy.Integer(1), output.size[0]]
 
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl

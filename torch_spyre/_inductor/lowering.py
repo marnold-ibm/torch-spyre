@@ -646,21 +646,13 @@ def clone(x, *, memory_format=None):
 
 
 @register_spyre_lowering(torch.ops.spyre.restickify)
-def lower_restickify(x):
-
-
-    # print ("MRA: Begin lowering restickify x size and stride:", x.get_size(), x.get_stride())
-    # x = V.graph.get_buffer(x.realize())
-    # print ("MRA: lowering after realize  x size and stride:", x.get_size(), x.get_stride())
-
+def lower_restickify(x, stride_order):
     loader = x.make_loader()
 
-    print ("MRA3: x layout:,", x.get_layout())
     fn = lowering.ops_wrapper(torch.ops.spyre.restickify.__name__)
+
     def inner_fn(index):
-        return fn(loader(index))
-        # return loader(index)
-    
+        return fn(loader(index), stride_order)
 
     pw = Pointwise.create(
         device=x.get_device(),
@@ -672,14 +664,8 @@ def lower_restickify(x):
     )
 
     pw.realize()
-
-    # This can also work
-    if x.get_layout().stride == [1, 256]:
-        pw.freeze_layout_with_stride_order([0, 1])
-    else:
-        pw.freeze_layout_with_stride_order([1, 0])
-
-    print("MRA: Restickify node created with stride and layout:", pw.get_stride(), pw.get_layout())
+    pw.freeze_layout_with_stride_order(stride_order)
+    print ("MRA: Lowering used stride order:", stride_order, "and output size:", pw.shape, "strides:", pw.get_stride())
 
     return pw
 

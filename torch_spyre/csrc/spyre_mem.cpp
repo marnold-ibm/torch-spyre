@@ -166,12 +166,12 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       std::string(dci_hack_env) == "1") {
     DEBUGINFO("DCI_HACK ACTIVE: Overriding stride_dst_ from ", 
               stride_info.stride_dst_, " to [1, 256, 64]");
-    stride_info.stride_src_.clear();
-    stride_info.stride_src_ = {256, 1, 16384};
+    // stride_info.stride_src_.clear();
+    // stride_info.stride_src_ = {256, 1, 16384};
     
     stride_info.stride_dst_.clear();
     // stride_info.stride_dst_ = {1, 512, 64};
-    stride_info.stride_dst_ = {1, 1, 64};
+    stride_info.stride_dst_ = {256, 1, 16384};
     // stride_info.stride_dst_ = {1,256, 64};
     // stride_info.stride_dst_ = {1,128, 64};
 
