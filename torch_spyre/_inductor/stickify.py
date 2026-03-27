@@ -53,6 +53,8 @@ from .pass_utils import (
     host_coordinates,
     device_coordinates,
 )
+from .insert_nodes import print_node
+
 from .views import matching_dim
 
 logger = get_inductor_logger("stickify")
@@ -104,7 +106,7 @@ def device_layout_like(
         )
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
+def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
@@ -231,14 +233,26 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         print ("MRA: stick_exprs: ", stick_exprs)
 
         if len(stick_exprs) > 1:
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
 
-            print (f"ERROR: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}")
+            # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+            # Choose arg[1] to determine the layout of the output (for now)
+            # and record that arg 1 needs to be permuted.
+            # Hardcoded for now as a sample, will do something smarter
+            # once moving to new OpSpec
+        
             print_node(n)
+            print (f"WARNING: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.  Injecting restickify")
+        
+            # Keep STL of output whatever pytorch wanted it to be
+            stl = SpyreTensorLayout(output.size, output.dtype)
 
-            raise Unsupported(
-                f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
+            target_layout = FixedTiledLayout(
+                output.device, output.dtype, output.size, output.stride, stl
             )
+            permute_needed[n] = {"arg_index": 1, "target_layout": target_layout}
+
+            return target_layout
+
 
         # See if the indexing across all inputs and the output is identical.
         can_use_same_layout = True
@@ -412,54 +426,6 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
     )
 
 
-def print_node(n):
-    print("=== SchedulerNode ===")
-
-    if hasattr(n, "_kernel"):
-        print("Has kernel:", n._kernel)
-    else:
-        print("Has Kernel:  NO")
-
-    print("reads:", n.read_writes.reads)
-    for dep in n.read_writes.reads:
-        print("Read Dep Name", repr(dep.name))
-
-    print("writes:", n.read_writes.writes)
-    for dep in n.read_writes.writes:
-        print("Write Dep Name", repr(dep.name))
-
-    if hasattr(n, "min_order"):
-        print("min_order:", n.min_order)
-    else:
-        print("No min order field")
-    if hasattr(n, "max_order"):
-        print("max_order:", n.max_order)
-    else:
-        print("No max order field")
-    print("ancestors:", n.ancestors)
-    print("unmet_dependencies:", n.unmet_dependencies)
-    print()
-
-    print("=== Buffer node: ===")
-    buffer = n.node
-    if hasattr(buffer, "operation_name"):
-        print("Node operation name", buffer.get_operation_name())
-    else:
-        print("Node operation name is missing")
-    print("node.node:", buffer)
-
-    # print("--- CLOSURES ---")
-    # fn = buffer.data.inner_fn
-    # print("FN:", fn)
-    # print("FREEVARS:", fn.__code__.co_freevars)
-    # print("CLOSURE:", fn.__closure__)
-    # for cell in fn.__closure__ or []:
-    #     print("CELL:", cell.cell_contents, type(cell.cell_contents))
-
-    print("---------------------------------")
-    print()
-
-
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -495,6 +461,8 @@ def propagate_spyre_tensor_layouts(
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
 
+    permute_needed: dict[BaseSchedulerNode, dict[str, Any]] = {}
+
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
@@ -502,7 +470,7 @@ def propagate_spyre_tensor_layouts(
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
                 old_stride = list(n.node.layout.stride)
-                output_layout = pointwise_layout(n, get_mem_deps(n))
+                output_layout = pointwise_layout(n, get_mem_deps(n), permute_needed)
                 n.node.layout = output_layout
                 if (os.environ.get("SPYRE_COLMAJOR_OUTPUT", "0") == "1"
                         and list(output_layout.stride) != old_stride):
@@ -545,4 +513,4 @@ def propagate_spyre_tensor_layouts(
             logger.warning(f"unhandled scheduler node type {type(n)}")
         print_node(n)
 
-    return nodes
+    return nodes, permute_needed
