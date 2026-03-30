@@ -15,7 +15,7 @@
 import torch
 
 from .logging_utils import get_inductor_logger
-from torch._inductor.ir import ComputedBuffer, Pointwise, ops
+from torch._inductor.ir import ComputedBuffer, StorageBox, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
@@ -24,11 +24,8 @@ from torch._inductor.scheduler import (
 from torch._inductor.virtualized import V
 
 from torch.utils._ordered_set import OrderedSet
-from torch.fx import Node
 
 logger = get_inductor_logger("insert_nodes")
-
-aten = torch.ops.aten
 
 
 class NameSwapHandler(WrapperHandler):
@@ -77,14 +74,16 @@ def print_node(n):
         print("Node operation name is missing")
     print("node.node:", buffer)
 
-    print("--- CLOSURES ---")
-    fn = buffer.data.inner_fn
-    print("FN:", fn)
-    print("FREEVARS:", fn.__code__.co_freevars)
-    print("CLOSURE:", fn.__closure__)
+    PRINT_CLOSURES = False
+    if PRINT_CLOSURES:
+        print("--- CLOSURES ---")
+        fn = buffer.data.inner_fn
+        print("FN:", fn)
+        print("FREEVARS:", fn.__code__.co_freevars)
+        print("CLOSURE:", fn.__closure__)
 
-    for cell in fn.__closure__ or []:
-        print("CELL:", cell.cell_contents, type(cell.cell_contents))
+        for cell in fn.__closure__ or []:
+            print("CELL:", cell.cell_contents, type(cell.cell_contents))
 
     print("---------------------------------")
     print()
@@ -123,62 +122,49 @@ def insert_permutes(
             # Get the arg info for the input we need to permute
             mem_dep = list(n.read_writes.reads)[permute_info["arg_index"]]
             arg_name = mem_dep.name
-            arg_buff = V.graph.get_buffer(arg_name).data.data
+            arg_buff = V.graph.get_buffer(arg_name).data  # StorageBox or ReinterpretView
+            arg_buff_name = arg_name  # name for NameSwapHandler
 
-            # Create node to do the restickify 
+            # Create node to do the restickify
 
             # NODE_CREATE_START
-            def inner_fn(index, _ab=arg_buff):
-                i0, i1 = index
-                tmp0 = ops.load(_ab.name, i0 + 64 * i1)
-                return tmp0
+            from torch_spyre._inductor.stickify import propagate_spyre_tensor_layouts  # noqa: PLC0415
 
-            pw_node = Pointwise(
-                device=torch.device("spyre"),
-                dtype=torch.float16,
-                inner_fn=inner_fn,
-                ranges=[64, 64],
+            # Build env so run_node can find the TensorBox for arg_name
+            graph_lowering = V.graph
+            fx_graph = graph_lowering.graph
+            env = {}
+            for tbs in graph_lowering.name_to_users.values():
+                for tb in tbs:
+                    tb_fx_node = list(tb.data.origins)[0]
+                    env[tb_fx_node] = tb
+            graph_lowering.env.update(env)
+
+            # Find the FX node that feeds arg_index of the add — may be a permute, not a placeholder
+            fx_arg_node = n.node.data.origin_node.args[permute_info["arg_index"]]
+            fx_non_placeholder = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
+            fx_graph.inserting_before(fx_non_placeholder)
+            new_fx_node = fx_graph.create_node(
+                "call_function", torch.ops.spyre.restickify, (fx_arg_node, [0,1])
             )
+            graph_lowering.orig_gm.recompile()
 
-            new_origin_node = Node(
-                graph=V.graph.graph,
-                name="clone_default",
-                op="call_function",
-                target=aten.clone.default,
-                args=(),
-                kwargs={},
-            )
-
-            # No constructor for these and object is frozen
-            object.__setattr__(pw_node, "origin_node", new_origin_node)
-            object.__setattr__(pw_node, "origins", OrderedSet([new_origin_node]))
-            if hasattr(n.node.data, "stack_traces"):
-                object.__setattr__(pw_node, "stack_traces", n.node.data.stack_traces)
-
-            # Create the output buffer
-            new_buff = ComputedBuffer(
-                name="buf0000_injected",  # Not actually used: renamed by register_buffer for some reason
-                layout=permute_info["target_layout"],
-                data=pw_node,
-                _split_size=None,
-                _original_inner_fn=None,
-                _original_ranges=None,
-                _original_reduction_ranges=None,
-            )
-            _ = graph.register_operation(new_buff)
-
-            registered_buff = graph.register_buffer(new_buff)
-            if registered_buff != new_buff.name:
-                new_buff.name = registered_buff
+            # Lower via run_node — handles buffer registration automatically
+            new_tb = graph_lowering.run_node(new_fx_node)
+            new_buff = new_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+            graph_lowering.env[new_fx_node] = new_tb
 
             new_sn = scheduler.create_scheduler_node(new_buff)
+            new_sn.node.layout = permute_info["target_layout"]
+            ComputedBuffer.get_default_sizes_body.clear_cache(new_sn.node)
+            new_sn._compute_attrs()
             # NODE_CREATE_END
         
             # ===================================================
             # Now create a wrapper that replaces reads of args that have new buffers
 
             name_map = {
-                arg_buff.name: new_buff.name
+                arg_buff_name: new_buff.name
             }  # add more arg pairs to swap here if needed
             orig_inner = n.node.data.inner_fn
 
@@ -202,16 +188,8 @@ def insert_permutes(
             n.node = new_computed_buffer
 
             # Recomputes internal metadata, including read/write dependencies based on new inner_fn
+            ComputedBuffer.get_default_sizes_body.clear_cache(n.node)
             n._compute_attrs()
-
-            new_buff_writes = list(new_sn.read_writes.writes)
-            orig_reads = list(n.read_writes.reads)
-            n.read_writes.reads = OrderedSet(
-                [
-                    new_buff_writes[0] if i == permute_info["arg_index"] else read
-                    for i, read in enumerate(orig_reads)
-                ]
-            )
 
             for buf in new_sn.get_outputs():
                 scheduler.name_to_buf[buf.get_name()] = buf
@@ -225,6 +203,6 @@ def insert_permutes(
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
 
-    # dump_ir(scheduler.nodes)
+    dump_ir(scheduler.nodes)
 
     return scheduler.nodes

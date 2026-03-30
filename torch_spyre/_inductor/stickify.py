@@ -53,7 +53,7 @@ from .pass_utils import (
     host_coordinates,
     device_coordinates,
 )
-from .insert_nodes import print_node
+from .insert_nodes import print_node, dump_ir
 
 from .views import matching_dim
 
@@ -240,16 +240,21 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
             # Hardcoded for now as a sample, will do something smarter
             # once moving to new OpSpec
         
-            print_node(n)
+            # print_node(n)
             print (f"WARNING: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.  Injecting restickify")
         
             # Keep STL of output whatever pytorch wanted it to be
-            stl = SpyreTensorLayout(output.size, output.dtype)
+            #stl = SpyreTensorLayout(output.size, output.dtype)
+            stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
 
             target_layout = FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
+                output.device, output.dtype, [256,128], [1,256], stl
             )
-            permute_needed[n] = {"arg_index": 1, "target_layout": target_layout}
+
+            for arg in args:
+                print ("ARG:", arg)
+
+            permute_needed[n] = {"arg_index": 0, "target_layout": target_layout}
 
             return target_layout
 
@@ -511,6 +516,6 @@ def propagate_spyre_tensor_layouts(
             n.node.layout = output_layout
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
-        print_node(n)
 
+    # dump_ir(nodes)
     return nodes, permute_needed
