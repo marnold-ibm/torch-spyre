@@ -51,6 +51,8 @@ from .pass_utils import (
     device_coordinates,
 )
 from .views import matching_dim
+from .insert_nodes import print_node, dump_ir
+
 
 logger = get_inductor_logger("stickify")
 
@@ -62,7 +64,7 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
+def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
@@ -83,6 +85,21 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
+
+            case spyreop.restickify.default:
+                # MRA TEMP CODE
+                # stride_order = origin_node.args[1]
+                # if stride_order == [0, 1]:
+                #     stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
+                # else:
+                #     # stl = SpyreTensorLayout([2, 256, 64], [1,0,1], [64, 128, 1], get_device_dtype(output.dtype))
+                #     stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [8192, 1, 128], get_device_dtype(output.dtype))
+
+                # return FixedTiledLayout(
+                #     output.device, output.dtype, output.size, output.stride, stl
+                # )
+                assert(False)
+                pass
 
             case _:
                 x_stl = x.layout.device_layout
@@ -150,6 +167,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
         out_coords = host_coordinates(output, output_dep)
 
+        print ("IN COORDS:", in_coords)
+        print ("IN DEVICE COORDS:", in_device_coords)
+        print ("OUT COORDS:", out_coords)
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
         # the indexing expression must be identical.
@@ -157,12 +177,43 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         for idc in in_device_coords:
             if idc[-1] != 0:
                 stick_exprs.add(idc[-1])
+        stick_expr = next(iter(stick_exprs))
 
         if len(stick_exprs) > 1:
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            raise Unsupported(
-                f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
-            )
+            # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+        
+            for arg in args:
+                print ("ARG:", arg)
+
+            print ("NODE BEFORE RESTICKIFY:")
+            print_node(n)
+            print (f"WARNING: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.  Injecting restickify")
+        
+            # For now leave arg 0 and permute all others that have a conflict
+            stick_expr = in_device_coords[0][-1]
+            print ("MRA1: USING STICK EXPR:", stick_expr)
+
+            for i, idc in enumerate(in_device_coords[1:], start=1):
+                print (f"MRA1 ARG {i} device coords: {idc} is equal to stick expr? {idc[-1] == stick_expr}")
+                if idc[-1] != stick_expr:
+                    print (f"MRA2: ARG {i} has incompatible stick expr. Permuting.")
+                    # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [8192, 1, 128], get_device_dtype(output.dtype))
+                    # target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [128,1], stl)
+
+                    stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
+                    target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [1,256], stl)
+
+                    permute_needed[n] = {"arg_index":i, "target_layout": target_layout}  # target_layout is determined later based on output layout
+
+            # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype)) 
+            # target_layout = FixedTiledLayout(
+            #     output.device, output.dtype, [256,128], [1,256], stl
+            # )
+            # if chosen_arg == 0:
+            #     # If we mess with arg 0 we must return this layout. Otherwise it'll create a different one below that
+            #     # is incompatible with the new layout of arg 0 
+            #     return target_layout
+
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -191,7 +242,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 maybe_stick_dim = None
                 out_stick_dim = -1
             else:
-                maybe_stick_dim = matching_dim(out_coords, next(iter(stick_exprs)))
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
 
             dim_order = [
@@ -206,6 +257,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             ]
             dim_order += [out_stick_dim]
             stl = SpyreTensorLayout(output.size, output.stride, output.dtype, dim_order)
+            print ("DAVE's code computed DIM ORDER: ", dim_order)
+            print ("DAVE's code computed STL: ", stl)
 
         result = FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
@@ -358,12 +411,14 @@ def propagate_spyre_tensor_layouts(
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
 
+    permute_needed: dict[BaseSchedulerNode, dict[str, Any]] = {}
+
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, get_mem_deps(n))
+                output_layout = pointwise_layout(n, get_mem_deps(n), permute_needed)
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
                 output_layout = reduction_layout(n, get_mem_deps(n))
@@ -388,5 +443,8 @@ def propagate_spyre_tensor_layouts(
             n.node.layout = output_layout
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
+    print ("STICKIFY: after layout propagation:")
+    dump_ir(nodes)
 
-    return nodes
+    print ("MRA5: permute needed:", permute_needed)
+    return nodes, permute_needed

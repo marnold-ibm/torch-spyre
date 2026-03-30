@@ -34,6 +34,7 @@
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -154,6 +155,36 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   }
   stride_info.offset_src_ = 0;
   stride_info.offset_dst_ = 0;
+
+
+
+  // TEMPORARY HACK: Override stride_dst_ when DCI_HACK env var is set.
+  // Format: DCI_HACK=a,b,c  (three comma-separated integers), e.g. "128,1,8192"
+  const char* dci_hack_env = std::getenv("DCI_HACK");
+  DEBUGINFO("DCI_HACK check: host2device=", host2device,
+            " env_var=", (dci_hack_env ? dci_hack_env : "NULL"));
+
+  if (!host2device && dci_hack_env != nullptr) {
+    std::istringstream dci_ss(dci_hack_env);
+    std::string token;
+    std::vector<int64_t> dci_vals;
+    while (std::getline(dci_ss, token, ',')) {
+      dci_vals.push_back(std::stoll(token));
+    }
+    if (dci_vals.size() == 3) {
+      DEBUGINFO("DCI_HACK ACTIVE: Overriding stride_dst_ from ",
+                stride_info.stride_dst_, " to [", dci_vals[0], ", ",
+                dci_vals[1], ", ", dci_vals[2], "]");
+      stride_info.stride_dst_.clear();
+      stride_info.stride_dst_ = {dci_vals[0], dci_vals[1], dci_vals[2]};
+      DEBUGINFO("DCI_HACK: stride_dst_ after override: ", stride_info.stride_dst_);
+    } else {
+      DEBUGINFO("DCI_HACK: expected 3 comma-separated values, got ",
+                dci_vals.size(), " — ignoring");
+    }
+  }
+
+
 
   // pull single value from stick if sparse tensor
   if (sparse) {

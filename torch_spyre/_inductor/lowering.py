@@ -503,3 +503,44 @@ def clone(x, *, memory_format=None):
         result.realize()
         result.freeze_layout_with_stride_order(stride_order)
     return result
+
+
+# @register_spyre_lowering(torch.ops.spyre.restickify)
+# def lower_restickify(x, stride_order):
+#     loader = x.make_loader()
+
+#     print (f"MRA: In lower_restickify.  x.shape={x.get_size()}, x.stride={x.get_stride()}, requested stride_order={stride_order}")
+#     fn = lowering.ops_wrapper(torch.ops.spyre.restickify.__name__)
+
+#     def inner_fn(index):
+#         return fn(loader(index), stride_order)
+
+#     pw = Pointwise.create(
+#         device=x.get_device(),
+#         dtype=x.get_dtype(),
+#         inner_fn=inner_fn,
+#         ranges=x.get_size(),
+#         origin_node=None,
+#         traceback=x.get_traceback(),
+#     )
+
+#     pw.realize()
+#     pw.freeze_layout_with_stride_order(stride_order)
+#     # Clear cached body so simplify_and_reorder re-derives with the frozen layout
+#     # from torch._inductor.ir import ComputedBuffer as _CB  # noqa: PLC0415
+#     # _CB.get_default_sizes_body.clear_cache(pw.data.data)
+
+#     print ("MRA: lower_restickify done:  final shape = ", pw.shape, " stride order:", stride_order, "and output size:", pw.shape, "strides:", pw.get_stride())
+
+#     return pw
+
+@register_spyre_lowering(torch.ops.spyre.restickify)
+def restickify(x, stride_order):
+    # from torch._inductor.ir import FlexibleLayout, get_stride_order
+    from torch._inductor.lowering import clone as clone_lowering
+
+    result = clone_lowering(x)
+    result.realize()
+    result.freeze_layout_with_stride_order(stride_order)
+    return result
+
