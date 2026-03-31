@@ -75,6 +75,7 @@ def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) ->
     it shares a host dim with the stick — then it gets host_size // stick_size.
     The last (stick) device dim is always stick_size (64 at fp16).
     """
+    print ("MRA2: compute_device_size: host_size:", host_size, "dim_map:", dim_map)
     stick_host_dim = dim_map[-1]
     result = []
     for j in range(len(dim_map) - 1):
@@ -95,6 +96,7 @@ def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -
     device sizes for each host dim so that higher-dimensional cases with a host
     dim appearing 3+ times in dim_map are handled correctly.
     """
+    print ("MRA2: dim_map_to_stride_map: host_stride:", host_stride, "device_size:", device_size, "dim_map:", dim_map)
     n = len(device_size)
     stride_map = [-1] * n
     last_stride: dict[int, int] = {}
@@ -275,9 +277,11 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     # stl = SpyreTensorLayout([2,256,64], new_dim_map, [16384, 1, 256], dl.device_dtype)
                     # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [1, 256], stl)
 
+                    # STL (device size and stride map) are function of dim map and device layout 
                     device_size = compute_device_size(list(arg.layout.size), new_dim_map)
                     stride_map = dim_map_to_stride_map(list(arg.layout.stride), device_size, new_dim_map)
                     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
+                    # FixedTileLayout incorporates python's view using the host stride
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
 
                     print ("MRA2: Using computed layout:", target_layout)
