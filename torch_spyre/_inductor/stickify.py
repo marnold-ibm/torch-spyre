@@ -64,6 +64,30 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
+def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) -> list:
+    """Compute device_size from host_size and dim_map."""
+    stick_host_dim = dim_map[-1]
+    result = []
+    for j in range(len(dim_map) - 1):
+        h = dim_map[j]
+        if h == stick_host_dim:
+            result.append(host_size[h] // stick_size)
+        else:
+            result.append(host_size[h])
+    result.append(stick_size)
+    return result
+
+
+def make_stride_map(host_stride: list, device_size: list, dim_map: list) -> list:
+    """Derive stride_map from host_stride and tiling geometry."""
+    n = len(device_size)
+    rel = [
+        next((device_size[k] for k in range(j + 1, n) if dim_map[k] == dim_map[j]), 1)
+        for j in range(n)
+    ]
+    return [host_stride[dim_map[j]] * rel[j] for j in range(n)]
+
+
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
@@ -163,6 +187,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
+        for i, arg in enumerate(args):
+            print(f"MRA ARG: {i} layout: {arg.layout}, dep: {arg.dep}")
         in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
         out_coords = host_coordinates(output, output_dep)
@@ -193,17 +219,49 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
             stick_expr = in_device_coords[0][-1]
             print ("MRA1: USING STICK EXPR:", stick_expr)
 
-            for i, idc in enumerate(in_device_coords[1:], start=1):
-                print (f"MRA1 ARG {i} device coords: {idc} is equal to stick expr? {idc[-1] == stick_expr}")
+            for arg_i, (ic, idc, arg) in enumerate(zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1):
+                dl = arg.layout.device_layout
+                print (f"MRA2: ARG {arg_i} ({arg.dep.name}) coords: {ic}, device coords: {idc}, stick expr: {stick_expr}, arg: {arg}")
+                new_stick_dim = matching_dim(ic, stick_expr)
+                print (f"MRA2: New stick dim for arg {arg_i} is: {new_stick_dim}")
+                orig_dim_map = arg.layout.device_layout.dim_map
+                old_stick_dim = orig_dim_map[-1]
+
+                # Swap the new stick dim and old stick dim
+                new_dim_map = [new_stick_dim if x == old_stick_dim else old_stick_dim if x == new_stick_dim else x for x in orig_dim_map]
+                print (f"MRA2: Computed new dim map for {arg_i} is: {new_dim_map}")
+
                 if idc[-1] != stick_expr:
-                    print (f"MRA2: ARG {i} has incompatible stick expr. Permuting.")
+                    # host_stride[d] = coeff of the dep var whose range matches output.size[d]
+                    out_dim_var = [next(v for v, r in arg.dep.ranges.items() if r == output.size[d]) for d in range(len(output.size))]
+                    arg_host_stride = [int(arg.dep.index.subs({v: (1 if v == out_dim_var[d] else 0) for v in arg.dep.ranges})) for d in range(len(output.size))]
+                    print (f"MRA2: ARG {arg_i} has incompatible stick expr. Permuting. arg_host_stride={arg_host_stride}")
                     # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [8192, 1, 128], get_device_dtype(output.dtype))
                     # target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [128,1], stl)
 
-                    stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype))
-                    target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [1,256], stl)
+                    # # Works for
+                    # #    x.t() + y
+                    # #    x.t() + y + z
+                    # # stl = SpyreTensorLayout([2,256,64], new_dim_map, [8192, 1, 128], dl.device_dtype) # worked
+                    device_size = compute_device_size(list(arg.layout.size), new_dim_map)
+                    stride_map = make_stride_map(list(arg.layout.stride), device_size, new_dim_map)
+                    print(f"MRA2: computed device_size={device_size} stride_map={stride_map} arg_host_stride={arg_host_stride}")
 
-                    permute_needed[n] = {"arg_index":i, "target_layout": target_layout}  # target_layout is determined later based on output layout
+                    # # Works for x.t() + y, x.t() + y + z
+                    # stl = SpyreTensorLayout([4, 128, 64], new_dim_map, [8192, 1, 128], dl.device_dtype)
+                    # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [128,1], stl)
+
+                    # # Works for y + x.t()
+                    # stl = SpyreTensorLayout([2,256,64], new_dim_map, [16384, 1, 256], dl.device_dtype)
+                    # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [1, 256], stl)
+
+                    stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
+                    target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
+
+                    print ("MRA2: Using computed layout:", target_layout)
+                    if n not in permute_needed:
+                        permute_needed[n] = []
+                    permute_needed[n].append({"arg_index": arg_i, "target_layout": target_layout})
 
             # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype)) 
             # target_layout = FixedTiledLayout(
