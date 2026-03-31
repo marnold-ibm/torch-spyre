@@ -65,7 +65,16 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
 
 
 def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) -> list:
-    """Compute device_size from host_size and dim_map."""
+    """Compute device_size from host_size and a target dim_map.
+
+    The C++ SpyreTensorLayout constructor only produces a correct stride_map
+    when the host is contiguous in the given dim_order.  We replicate the logic
+    here to handle non-contiguous strides (e.g. after a transpose).
+
+    Each non-stick device dim gets the full size of its host dim, except when
+    it shares a host dim with the stick — then it gets host_size // stick_size.
+    The last (stick) device dim is always stick_size (64 at fp16).
+    """
     stick_host_dim = dim_map[-1]
     result = []
     for j in range(len(dim_map) - 1):
@@ -78,14 +87,28 @@ def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) ->
     return result
 
 
-def make_stride_map(host_stride: list, device_size: list, dim_map: list) -> list:
-    """Derive stride_map from host_stride and tiling geometry."""
+def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -> list:
+    """Compute stride_map from host_stride and tiling geometry (device_size, dim_map).
+
+    Python port of the C++ static function dim_map_to_stride_map, which is not
+    exposed to Python.  Iterates backwards, accumulating the product of inner
+    device sizes for each host dim so that higher-dimensional cases with a host
+    dim appearing 3+ times in dim_map are handled correctly.
+    """
     n = len(device_size)
-    rel = [
-        next((device_size[k] for k in range(j + 1, n) if dim_map[k] == dim_map[j]), 1)
-        for j in range(n)
-    ]
-    return [host_stride[dim_map[j]] * rel[j] for j in range(n)]
+    stride_map = [-1] * n
+    last_stride: dict[int, int] = {}
+    for j in range(n - 1, -1, -1):
+        d = dim_map[j]
+        if d == -1:
+            stride_map[j] = -1
+        elif d not in last_stride:
+            stride_map[j] = host_stride[d]
+            last_stride[d] = stride_map[j] * device_size[j]
+        else:
+            stride_map[j] = last_stride[d]
+            last_stride[d] = stride_map[j] * device_size[j]
+    return stride_map
 
 
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
@@ -233,8 +256,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
 
                 if idc[-1] != stick_expr:
                     # host_stride[d] = coeff of the dep var whose range matches output.size[d]
-                    out_dim_var = [next(v for v, r in arg.dep.ranges.items() if r == output.size[d]) for d in range(len(output.size))]
-                    arg_host_stride = [int(arg.dep.index.subs({v: (1 if v == out_dim_var[d] else 0) for v in arg.dep.ranges})) for d in range(len(output.size))]
+                    # For each output dim, extract how many elements the arg's buffer advances
+                    # per step in that dim — i.e. the coefficient of that dim's loop variable in dep.index.
+                    arg_host_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
                     print (f"MRA2: ARG {arg_i} has incompatible stick expr. Permuting. arg_host_stride={arg_host_stride}")
                     # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [8192, 1, 128], get_device_dtype(output.dtype))
                     # target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [128,1], stl)
@@ -243,10 +267,6 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     # #    x.t() + y
                     # #    x.t() + y + z
                     # # stl = SpyreTensorLayout([2,256,64], new_dim_map, [8192, 1, 128], dl.device_dtype) # worked
-                    device_size = compute_device_size(list(arg.layout.size), new_dim_map)
-                    stride_map = make_stride_map(list(arg.layout.stride), device_size, new_dim_map)
-                    print(f"MRA2: computed device_size={device_size} stride_map={stride_map} arg_host_stride={arg_host_stride}")
-
                     # # Works for x.t() + y, x.t() + y + z
                     # stl = SpyreTensorLayout([4, 128, 64], new_dim_map, [8192, 1, 128], dl.device_dtype)
                     # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [128,1], stl)
@@ -255,6 +275,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     # stl = SpyreTensorLayout([2,256,64], new_dim_map, [16384, 1, 256], dl.device_dtype)
                     # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [1, 256], stl)
 
+                    device_size = compute_device_size(list(arg.layout.size), new_dim_map)
+                    stride_map = dim_map_to_stride_map(list(arg.layout.stride), device_size, new_dim_map)
                     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
 
