@@ -24,6 +24,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.virtualized import V
 
 from torch.utils._ordered_set import OrderedSet
+from .pass_utils import dump_ir
 
 logger = get_inductor_logger("insert_nodes")
 
@@ -37,81 +38,13 @@ class NameSwapHandler(WrapperHandler):
         return super().load(self._name_map.get(name, name), index)
 
 
-# Temporary debugging methods while developing
-def print_node(n):
-    print("=== SchedulerNode ===")
-
-    if hasattr(n, "_kernel"):
-        print("Has kernel:", n._kernel)
-    else:
-        print("Has Kernel:  NO")
-
-    print("reads:", n.read_writes.reads)
-    for dep in n.read_writes.reads:
-        print("Read Dep Name", repr(dep.name))
-
-    print("writes:", n.read_writes.writes)
-    for dep in n.read_writes.writes:
-        print("Write Dep Name", repr(dep.name))
-
-    if hasattr(n, "min_order"):
-        print("min_order:", n.min_order)
-    else:
-        print("No min order field")
-    if hasattr(n, "max_order"):
-        print("max_order:", n.max_order)
-    else:
-        print("No max order field")
-    print("ancestors:", n.ancestors)
-    print("unmet_dependencies:", n.unmet_dependencies)
-    print()
-
-    print("=== Buffer node: ===")
-    buffer = n.node
-    if hasattr(buffer, "operation_name"):
-        print("Node operation name", buffer.get_operation_name())
-    else:
-        print("Node operation name is missing")
-    print("node.node:", buffer)
-
-    PRINT_CLOSURES = False
-    if PRINT_CLOSURES:
-        print("--- CLOSURES ---")
-        fn = buffer.data.inner_fn
-        print("FN:", fn)
-        print("FREEVARS:", fn.__code__.co_freevars)
-        print("CLOSURE:", fn.__closure__)
-
-        for cell in fn.__closure__ or []:
-            print("CELL:", cell.cell_contents, type(cell.cell_contents))
-
-    print("---------------------------------")
-    print()
-
-
-def dump_ir(nodes: list[BaseSchedulerNode]):
-    print("=============== DUMPING FULL IR ==================")
-    print()
-
-    print("== Graph Inputs ==")
-    print([x for x in V.graph.graph_inputs])
-
-    print("== Registered Buffers ==")
-    for buf in V.graph.buffers:
-        print(buf.name)
-
-    print("== IR NODES ==")
-
-    for n in nodes:
-        if isinstance(n, SchedulerNode):
-            print_node(n)
-
-
 def _create_restickify_node(
     permute_info: dict, n: BaseSchedulerNode, scheduler
 ) -> tuple[str, object]:
-    """Create one restickify scheduler node for a single incompatible arg.
-
+    """
+    Insert one restickify scheduler node for a given incompatible arg specified in permute_info.
+    Restickify nodes will comply with the layout specified in permute_infos.
+    
     Returns (old_buffer_name, new_scheduler_node).
     """
     from torch_spyre._inductor.stickify import propagate_spyre_tensor_layouts  # noqa: PLC0415
@@ -130,7 +63,7 @@ def _create_restickify_node(
             env[tb_fx_node] = tb
     graph_lowering.env.update(env)
 
-    # Find the FX node that feeds arg_index — may be a permute, not a placeholder
+    # Find the FX node that feeds arg_index and needs permute
     fx_arg_node = n.node.data.origin_node.args[permute_info["arg_index"]]
     fx_non_placeholder = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
     fx_graph.inserting_before(fx_non_placeholder)
@@ -155,7 +88,10 @@ def _create_restickify_node(
 def _apply_permutes_to_node(
     n: BaseSchedulerNode, permute_infos: list[dict], scheduler
 ) -> None:
-    """Insert restickify nodes for all incompatible args of n, then patch n's inner_fn."""
+    """Create a restickify node for each incompatible input arg of node n.  
+    Use NameSwapHandler to patch n's inner_fn to use the new buffer names instead of 
+    original input buffers.  
+    """
     name_map = {}
 
     for permute_info in permute_infos:
@@ -167,7 +103,6 @@ def _apply_permutes_to_node(
         scheduler.nodes.append(new_sn)
 
     # Patch inner_fn once with the full name_map covering all permuted args
-    print(f"MRA: name_map for {n.node.name}: {name_map}")
     orig_inner = n.node.data.inner_fn
     def new_inner_fn(index, _map=name_map, _orig_inner=orig_inner):
         with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
@@ -196,6 +131,10 @@ def _apply_permutes_to_node(
 def insert_permutes(
     nodes: list[BaseSchedulerNode], permute_needed: dict
 ) -> list[BaseSchedulerNode]:
+    """
+    Insert restickify nodes for all nodes in permute_needed. 
+    Returns the new list of nodes including the inserted restickify nodes.
+    """
     if not permute_needed:
         return nodes
 
@@ -206,13 +145,13 @@ def insert_permutes(
 
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
-    # Can skip sorting if new_sn was inserted in the correct spot to
+
+    # Can maybe skip sorting if new_sn was inserted in the correct spot to
     # maintain topological order, but safer to just re-sort
     sorted_order = scheduler._topological_sort_nodes()
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
 
-    print ("INSERT NODES: after inserting permutes:")
-    dump_ir(scheduler.nodes)
+    dump_ir(scheduler.nodes, "insert_permutes")
 
     return scheduler.nodes

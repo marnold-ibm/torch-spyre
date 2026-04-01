@@ -51,7 +51,6 @@ from .pass_utils import (
     device_coordinates,
 )
 from .views import matching_dim
-from .insert_nodes import print_node, dump_ir
 
 
 logger = get_inductor_logger("stickify")
@@ -233,60 +232,36 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
 
         if len(stick_exprs) > 1:
             # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+            logger.warning(f"WARNING: Injecting restickify to address Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.")
         
-            for arg in args:
-                print ("ARG:", arg)
-
-            print ("NODE BEFORE RESTICKIFY:")
-            print_node(n)
-            print (f"WARNING: Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.  Injecting restickify")
-        
-            # For now leave arg 0 and permute all others that have a conflict
+            # Arbitrary Choice 1: leave arg 0 and permute all others that have a conflict
+            # TODO: can arg0 have no stick?
             stick_expr = in_device_coords[0][-1]
-            print ("MRA1: USING STICK EXPR:", stick_expr)
-
             for arg_i, (ic, idc, arg) in enumerate(zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1):
+                
                 dl = arg.layout.device_layout
-                print (f"MRA2: ARG {arg_i} ({arg.dep.name}) coords: {ic}, device coords: {idc}, stick expr: {stick_expr}, arg: {arg}")
-                new_stick_dim = matching_dim(ic, stick_expr)
-                print (f"MRA2: New stick dim for arg {arg_i} is: {new_stick_dim}")
+                new_sd = matching_dim(ic, stick_expr)
                 orig_dim_map = arg.layout.device_layout.dim_map
-                old_stick_dim = orig_dim_map[-1]
+                old_sd = orig_dim_map[-1]
 
                 # Swap the new stick dim and old stick dim
-                new_dim_map = [new_stick_dim if x == old_stick_dim else old_stick_dim if x == new_stick_dim else x for x in orig_dim_map]
-                print (f"MRA2: Computed new dim map for {arg_i} is: {new_dim_map}")
+                new_dim_map = [new_sd if x == old_sd else old_sd if x == new_sd else x for x in orig_dim_map]
 
                 if idc[-1] != stick_expr:
-                    # host_stride[d] = coeff of the dep var whose range matches output.size[d]
-                    # For each output dim, extract how many elements the arg's buffer advances
-                    # per step in that dim — i.e. the coefficient of that dim's loop variable in dep.index.
-                    arg_host_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
+                    # Stick expr doesn't match, this arg needs permute.  Compute the desired layout for this arg 
+                    # now and pass it to the next phase that will inject permutes to conform to this layout
 
-                    print (f"MRA2: ARG {arg_i} has incompatible stick expr. Permuting. arg_host_stride={arg_host_stride}")
-                    # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [8192, 1, 128], get_device_dtype(output.dtype))
-                    # target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [128,1], stl)
-
-                    # # Works for
-                    # #    x.t() + y
-                    # #    x.t() + y + z
-                    # # stl = SpyreTensorLayout([2,256,64], new_dim_map, [8192, 1, 128], dl.device_dtype) # worked
-                    # # Works for x.t() + y, x.t() + y + z
-                    # stl = SpyreTensorLayout([4, 128, 64], new_dim_map, [8192, 1, 128], dl.device_dtype)
-                    # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [128,1], stl)
-
-                    # # Works for y + x.t()
-                    # stl = SpyreTensorLayout([2,256,64], new_dim_map, [16384, 1, 256], dl.device_dtype)
-                    # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [1, 256], stl)
-
-                    # STL (device size and stride map) are function of dim map and device layout
+                    # STL (device size and stride map) are function of dim map and on-device layout only
                     device_size = compute_device_size(list(arg.layout.size), new_dim_map)
                     stride_map = dim_map_to_stride_map(list(arg.layout.stride), device_size, new_dim_map)
                     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
-                    # FixedTiledLayout incorporates python's view using the host stride
+
+                    # FixedTiledLayout requires the host stride which si not present in the arg, but 
+                    # must be extracted from the index expression.
+                    arg_host_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
 
-                    print ("MRA2: Using computed layout:", target_layout)
+                    # Record instructions to insert a restickify before this node to convert from arg.layout to target_layout
                     if n not in permute_needed:
                         permute_needed[n] = []
                     permute_needed[n].append({"arg_index": arg_i, "target_layout": target_layout})
@@ -521,8 +496,5 @@ def propagate_spyre_tensor_layouts(
             n.node.layout = output_layout
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
-    print ("STICKIFY: after layout propagation:")
-    dump_ir(nodes)
 
-    print ("MRA5: permute needed:", permute_needed)
     return nodes, permute_needed
