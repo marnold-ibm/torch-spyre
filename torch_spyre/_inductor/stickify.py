@@ -87,9 +87,10 @@ def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) ->
     result.append(stick_size)
     return result
 
-
 def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -> list:
     """Compute stride_map from host_stride and tiling geometry (device_size, dim_map).
+
+    TODO: Remove this and make C++ version available?
 
     Python port of the C++ static function dim_map_to_stride_map, which is not
     exposed to Python.  Iterates backwards, accumulating the product of inner
@@ -261,6 +262,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     # For each output dim, extract how many elements the arg's buffer advances
                     # per step in that dim — i.e. the coefficient of that dim's loop variable in dep.index.
                     arg_host_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
+
                     print (f"MRA2: ARG {arg_i} has incompatible stick expr. Permuting. arg_host_stride={arg_host_stride}")
                     # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [8192, 1, 128], get_device_dtype(output.dtype))
                     # target_layout = FixedTiledLayout(output.device, output.dtype, [256,128], [128,1], stl)
@@ -277,11 +279,11 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     # stl = SpyreTensorLayout([2,256,64], new_dim_map, [16384, 1, 256], dl.device_dtype)
                     # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, [1, 256], stl)
 
-                    # STL (device size and stride map) are function of dim map and device layout 
+                    # STL (device size and stride map) are function of dim map and device layout
                     device_size = compute_device_size(list(arg.layout.size), new_dim_map)
                     stride_map = dim_map_to_stride_map(list(arg.layout.stride), device_size, new_dim_map)
                     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
-                    # FixedTileLayout incorporates python's view using the host stride
+                    # FixedTiledLayout incorporates python's view using the host stride
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
 
                     print ("MRA2: Using computed layout:", target_layout)
@@ -289,14 +291,6 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                         permute_needed[n] = []
                     permute_needed[n].append({"arg_index": arg_i, "target_layout": target_layout})
 
-            # stl = SpyreTensorLayout([2, 256, 64], [0,1,0], [16384, 1, 256], get_device_dtype(output.dtype)) 
-            # target_layout = FixedTiledLayout(
-            #     output.device, output.dtype, [256,128], [1,256], stl
-            # )
-            # if chosen_arg == 0:
-            #     # If we mess with arg 0 we must return this layout. Otherwise it'll create a different one below that
-            #     # is incompatible with the new layout of arg 0 
-            #     return target_layout
 
 
         # If the indexing and device element size are identical
@@ -340,9 +334,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                 if d != out_stick_dim and out_coords[d] == 0
             ]
             dim_order += [out_stick_dim]
+            print (f"DAVE's code ({output_dep.name}) computed DIM ORDER: {dim_order} and stick dim {out_stick_dim}")
             stl = SpyreTensorLayout(output.size, output.stride, output.dtype, dim_order)
-            print ("DAVE's code computed DIM ORDER: ", dim_order)
-            print ("DAVE's code computed STL: ", stl)
+            print (f"DAVE's code ({output_dep.name}) computed STL: ", stl)
 
         result = FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
