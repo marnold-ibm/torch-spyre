@@ -39,15 +39,15 @@ class NameSwapHandler(WrapperHandler):
 
 
 def _create_restickify_node(
-    restick_info: dict, n: BaseSchedulerNode, scheduler
+    restick_arg_info: dict, n: BaseSchedulerNode, scheduler
 ) -> tuple[str, object]:
     """
-    Insert one restickify scheduler node for a given incompatible arg specified in restick_info.
-    Restickify nodes will comply with the layout specified in restick_infos.
+    Insert one restickify scheduler node for a given incompatible arg specified in restick_arg_info.
+    Restickify nodes will comply with the layout specified in restick_arg_infos.
     
     Returns (old_buffer_name, new_scheduler_node).
     """
-    mem_dep = list(n.read_writes.reads)[restick_info["arg_index"]]
+    mem_dep = list(n.read_writes.reads)[restick_arg_info["arg_index"]]
     arg_name = mem_dep.name
 
     graph_lowering = V.graph
@@ -74,30 +74,30 @@ def _create_restickify_node(
     )
     fx_non_placeholder = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
     fx_graph.inserting_before(fx_non_placeholder)
-    new_fx_node = fx_graph.create_node(
+    restick_fx_node = fx_graph.create_node(
         "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
     )
     graph_lowering.orig_gm.recompile()
 
     # Lower via run_node — handles buffer registration automatically
-    new_tb = graph_lowering.run_node(new_fx_node)
-    new_buff = new_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
-    assert isinstance(new_buff, ComputedBuffer), f"Expected ComputedBuffer, got {type(new_buff).__name__}"
-    # new_fx_node is synthetically created post-lowering and has no ATen metadata.
+    restick_tb = graph_lowering.run_node(restick_fx_node)
+    restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+    assert isinstance(restick_buff, ComputedBuffer), f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
+    # restick_fx_node is synthetically created post-lowering and has no ATen metadata.
     # Restickify runs before any view op on the arg, so there is no ATen op to
-    # attribute it to. Leave origins as just new_fx_node — the comment will show [].
-    new_buff.origins = OrderedSet([new_fx_node])
-    graph_lowering.env[new_fx_node] = new_tb
+    # attribute it to. Leave origins as just restick_fx_node — the comment will show [].
+    restick_buff.origins = OrderedSet([restick_fx_node])
+    graph_lowering.env[restick_fx_node] = restick_tb
 
-    new_sn = scheduler.create_scheduler_node(new_buff)
-    new_sn.node.layout = restick_info["target_layout"]
-    ComputedBuffer.get_default_sizes_body.clear_cache(new_sn.node)
-    new_sn._compute_attrs()
+    restick_sn = scheduler.create_scheduler_node(restick_buff)
+    restick_sn.node.layout = restick_arg_info["target_layout"]
+    ComputedBuffer.get_default_sizes_body.clear_cache(restick_sn.node)
+    restick_sn._compute_attrs()
 
-    return arg_name, new_sn
+    return arg_name, restick_sn
 
 
-def _apply_restickify_to_node_inputs(
+def insert_restickify_on_node_inputs(
     n: BaseSchedulerNode, restick_infos: list[dict], scheduler
 ) -> None:
     """Create a restickify node for each incompatible input arg of node n.  
@@ -106,13 +106,13 @@ def _apply_restickify_to_node_inputs(
     """
     name_map = {}
 
-    for restick_info in restick_infos:
-        old_name, new_sn = _create_restickify_node(restick_info, n, scheduler)
-        name_map[old_name] = new_sn.node.name
+    for restick_arg_info in restick_infos:
+        old_name, restick_sn = _create_restickify_node(restick_arg_info, n, scheduler)
+        name_map[old_name] = restick_sn.node.name
 
-        for buf in new_sn.get_outputs():
+        for buf in restick_sn.get_outputs():
             scheduler.name_to_buf[buf.get_name()] = buf
-        scheduler.nodes.append(new_sn)
+        scheduler.nodes.append(restick_sn)
 
     # Patch inner_fn once with the full name_map covering all restickified args
     orig_inner = n.node.data.inner_fn
@@ -122,8 +122,9 @@ def _apply_restickify_to_node_inputs(
 
     object.__setattr__(n.node.data, "inner_fn", new_inner_fn)
 
-    # Rebuild ComputedBuffer to minimise internal datastructures that need to be hacked
-    new_computed_buffer = ComputedBuffer(
+    # Rebuilding ComputedBuffer around patched inner_fn to reduce
+    # number of internal datastructures that need to be hacked
+    new_consumer_buffer = ComputedBuffer(
         name=n.node.name,
         layout=n.node.layout,
         data=n.node.data,
@@ -132,9 +133,9 @@ def _apply_restickify_to_node_inputs(
         _original_ranges=n.node._original_ranges,
         _original_reduction_ranges=n.node._original_reduction_ranges,
     )
-    new_computed_buffer.operation_name = n.node.operation_name
-    new_computed_buffer.origins = n.node.origins
-    n.node = new_computed_buffer
+    new_consumer_buffer.operation_name = n.node.operation_name
+    new_consumer_buffer.origins = n.node.origins
+    n.node = new_consumer_buffer
 
     # Recompute internal metadata including read/write dependencies based on new inner_fn
     ComputedBuffer.get_default_sizes_body.clear_cache(n.node)
@@ -145,13 +146,12 @@ def insert_restickify(
     nodes: list[BaseSchedulerNode], restick_needed: dict
 ) -> list[BaseSchedulerNode]:
     """
-    Insert restickify nodes for all nodes in restick_needed. 
-    Returns the new list of nodes including the inserted restickify nodes.
+    Insert restickify(ies) before all nodes in restick_needed. 
     """
     scheduler = V.graph.scheduler
     for n in list(nodes):  # copy because loop updates scheduler.nodes
         if n in restick_needed:
-            _apply_restickify_to_node_inputs(n, restick_needed[n], scheduler)
+            insert_restickify_on_node_inputs(n, restick_needed[n], scheduler)
 
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
