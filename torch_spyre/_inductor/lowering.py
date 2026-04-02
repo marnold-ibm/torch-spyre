@@ -533,9 +533,73 @@ def clone(x, *, memory_format=None):
 #     return pw
 
 
+# @register_spyre_lowering(torch.ops.spyre.restickify)
+# def lower_restickify(x, restickify_stride):
+#     loader = x.make_loader()
+
+#     def inner_fn(index):
+#         return loader(index)
+
+#     pw = Pointwise.create(
+#         device=x.get_device(),
+#         dtype=x.get_dtype(),
+#         inner_fn=inner_fn,
+#         ranges=x.get_size(),
+#         origin_node=V.get_current_node(),
+#         traceback=x.get_traceback(),
+#     )
+
+#     pw.realize()
+
+#     print ("MRA4: lower_restickify done:  final shape = ", pw.shape, " restickify_stride:", restickify_stride, "and output size:", pw.shape, "strides:", pw.get_stride())
+#     return pw
+
+# @register_spyre_lowering(torch.ops.spyre.restickify)
+# def lower_restickify(x, restickify_stride):
+
+#     base = x
+#     while hasattr(base, "data"):
+#         base = base.data
+
+#     loader = base.make_loader()
+
+#     def inner_fn(index):
+#         return loader(index)
+
+#     pw = Pointwise.create(
+#         device=x.get_device(),
+#         dtype=x.get_dtype(),
+#         inner_fn=inner_fn,
+#         ranges=x.get_size(),
+#         origin_node=V.get_current_node(),
+#         traceback=x.get_traceback(),
+#     )
+
+#     pw.realize()
+
+#     print(
+#         "MRA4: lower_restickify done: final shape = ",
+#         pw.shape,
+#         "restickify_stride:", restickify_stride,
+#         "and output size:", pw.shape,
+#         "strides:", pw.get_stride(),
+#     )
+
+#     return pw
+
+
+from torch._inductor.ir import StorageBox
+
 @register_spyre_lowering(torch.ops.spyre.restickify)
 def lower_restickify(x, restickify_stride):
-    loader = x.make_loader()
+
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
+
+    loader = base.make_loader()
+
+    base_size = base.get_size()
 
     def inner_fn(index):
         return loader(index)
@@ -544,13 +608,21 @@ def lower_restickify(x, restickify_stride):
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=x.get_size(),
+        ranges=base_size,   # <-- this determines pw.shape
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )
 
     pw.realize()
-    print ("MRA4: lower_restickify done:  final shape = ", pw.shape, " restickify_stride:", restickify_stride, "and output size:", pw.shape, "strides:", pw.get_stride())
+
+    print(
+        "MRA4:",
+        "pw.shape =", pw.shape,
+        "base.size =", base_size,
+        "x.size =", x.get_size(),
+        "pw.strides =", pw.get_stride(),
+    )
+
     return pw
 
 # @register_spyre_lowering(torch.ops.spyre.restickify)

@@ -426,13 +426,13 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             # Reshapes, transposes, and other dataops
             origin = getattr(self.current_node.node.data, "origin_node", None)
-            if origin is not None and origin.target == torch.ops.spyre.restickify:
-                restickify_stride = origin.args[1]
-                if list(restickify_stride) != [int(s) for s in layout.stride]:
-                    syms = list(iteration_space(self.current_node).keys())
-                    dst_index = sum(s * sym for s, sym in zip(restickify_stride, syms))
-                    print("MRA_restickify: rewrote dst index to:", dst_index)
-                    dst = TensorAccess(name, dst_index, layout)
+            # if origin is not None and origin.target == torch.ops.spyre.restickify:
+            #     restickify_stride = origin.args[1]
+            #     if list(restickify_stride) != [int(s) for s in layout.stride]:
+            #         syms = list(iteration_space(self.current_node).keys())
+            #         dst_index = sum(s * sym for s, sym in zip(restickify_stride, syms))
+            #         print("MRA_restickify: rewrote dst index to:", dst_index)
+            #         dst = TensorAccess(name, dst_index, layout)
             args = [
                 self.create_tensor_arg(True, value.name, value),
                 self.create_tensor_arg(False, real_dst_name, dst),
