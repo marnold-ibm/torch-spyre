@@ -216,6 +216,8 @@ def restickify(  # type: ignore[empty-body]
 
 @restickify.register_fake
 def _(x: torch.Tensor, stride_order: list[int]) -> torch.Tensor:
+    
+    assert False, "old code needs updating"
     size = x.size()
     # stride_order[i] is the rank of dimension i (0 = contiguous/stride-1).
     # Compute strides so that the dimension with rank r gets the product of
@@ -232,5 +234,5 @@ def _(x: torch.Tensor, stride_order: list[int]) -> torch.Tensor:
         strides[i] = next_stride
         next_stride *= size[i]
 
-    print ("MRA4: Origin size/strides", x.size(), x.stride(), "new size/strides:", size, strides)
+    print ("MRA99: Origin size/strides", x.size(), x.stride(), "new size/strides:", size, strides)
     return x.new_empty_strided(size, strides)

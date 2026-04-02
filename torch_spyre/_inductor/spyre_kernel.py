@@ -304,6 +304,11 @@ class SpyreKernel(Kernel[CSEVariable]):
     def create_tensor_arg(
         self, is_input: bool, name: str, tensor: TensorAccess
     ) -> TensorArg:
+        print ("MRA11: About to compute coordinates for tensor", name, "with layout:", tensor)
+        print ("MRA11: device size:", tensor.layout.device_layout.device_size)
+        print ("MRA11: stride map:", tensor.layout.device_layout.stride_map)
+        print ("MRA11: iteration space:", iteration_space(self.current_node))
+        print ("MRA11: tensor index:", tensor.index)
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
@@ -382,6 +387,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
+        print ("MRA1: store", name, "index:", index, "value:", value, "mode:", mode)
         _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
@@ -404,6 +410,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if isinstance(value, UnimplementedOp):
             self.op_specs.append(value)
         elif isinstance(value, PointwiseOp):
+            print ("MRA1: IN PointwiseOp OP SPYRE KERNEL STORE, value.op=", value.op)
             # Pointwise compute ops
             args: list[TensorArg] = []
             for input in value.arguments:
@@ -415,7 +422,17 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info.update(value.op_info)
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
+            print("MRA1: IN TensorAccess OP SPYRE KERNEL STORE", value)
+
             # Reshapes, transposes, and other dataops
+            origin = getattr(self.current_node.node.data, "origin_node", None)
+            if origin is not None and origin.target == torch.ops.spyre.restickify:
+                restickify_stride = origin.args[1]
+                if list(restickify_stride) != [int(s) for s in layout.stride]:
+                    syms = list(iteration_space(self.current_node).keys())
+                    dst_index = sum(s * sym for s, sym in zip(restickify_stride, syms))
+                    print("MRA_restickify: rewrote dst index to:", dst_index)
+                    dst = TensorAccess(name, dst_index, layout)
             args = [
                 self.create_tensor_arg(True, value.name, value),
                 self.create_tensor_arg(False, real_dst_name, dst),

@@ -47,8 +47,6 @@ def _create_restickify_node(
     
     Returns (old_buffer_name, new_scheduler_node).
     """
-    from torch_spyre._inductor.stickify import propagate_spyre_tensor_layouts  # noqa: PLC0415
-
     mem_dep = list(n.read_writes.reads)[permute_info["arg_index"]]
     arg_name = mem_dep.name
 
@@ -68,13 +66,14 @@ def _create_restickify_node(
     fx_non_placeholder = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
     fx_graph.inserting_before(fx_non_placeholder)
     new_fx_node = fx_graph.create_node(
-        "call_function", torch.ops.spyre.restickify, (fx_arg_node, [0, 1])
+        "call_function", torch.ops.spyre.restickify, (fx_arg_node, permute_info["restickify_stride"])
     )
     graph_lowering.orig_gm.recompile()
 
     # Lower via run_node — handles buffer registration automatically
     new_tb = graph_lowering.run_node(new_fx_node)
     new_buff = new_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+    new_buff.origins.discard(fx_arg_node)
     graph_lowering.env[new_fx_node] = new_tb
 
     new_sn = scheduler.create_scheduler_node(new_buff)
@@ -121,6 +120,7 @@ def _apply_permutes_to_node(
         _original_reduction_ranges=n.node._original_reduction_ranges,
     )
     new_computed_buffer.operation_name = n.node.operation_name
+    new_computed_buffer.origins = n.node.origins
     n.node = new_computed_buffer
 
     # Recompute internal metadata including read/write dependencies based on new inner_fn
@@ -152,6 +152,5 @@ def insert_permutes(
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
 
-    dump_ir(scheduler.nodes, "insert_permutes")
-
+    dump_ir(scheduler.nodes, "After inserting insert permutes")
     return scheduler.nodes

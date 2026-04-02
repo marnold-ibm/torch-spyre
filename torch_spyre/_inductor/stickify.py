@@ -17,6 +17,7 @@ import logging
 
 import torch
 from .logging_utils import get_inductor_logger
+from torch._inductor.ir import get_stride_order
 from torch._inductor.ir import (
     ComputedBuffer,
     FallbackKernel,
@@ -213,7 +214,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
         )
     else:
         for i, arg in enumerate(args):
-            print(f"MRA ARG: {i} layout: {arg.layout}, dep: {arg.dep}")
+            print(f"MRA ARG: {i} {arg}")
         in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
         out_coords = host_coordinates(output, output_dep)
@@ -231,6 +232,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
         stick_expr = next(iter(stick_exprs))
 
         if len(stick_exprs) > 1:
+            pass
             # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
             logger.warning(f"WARNING: Injecting restickify to address Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.")
         
@@ -247,6 +249,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                 # Swap the new stick dim and old stick dim
                 new_dim_map = [new_sd if x == old_sd else old_sd if x == new_sd else x for x in orig_dim_map]
 
+                print("MRA: old_sd:", old_sd, "new_sd:", new_sd, "ndim:", len(output.size))
                 if idc[-1] != stick_expr:
                     # Stick expr doesn't match, this arg needs permute.  Compute the desired layout for this arg 
                     # now and pass it to the next phase that will inject permutes to conform to this layout
@@ -256,17 +259,29 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     stride_map = dim_map_to_stride_map(list(arg.layout.stride), device_size, new_dim_map)
                     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
 
-                    # FixedTiledLayout requires the host stride which si not present in the arg, but 
-                    # must be extracted from the index expression.
-                    arg_host_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
+
+                    # compute the stride order for the restickify operation
+                    restickify_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
+                    restickify_stride_order = list(reversed(get_stride_order(restickify_stride)))
+
+                    arg_host_stride = arg.layout.stride
+
+                
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
+
+                    # RESTORE CHANGE 1
+                    # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, restickify_stride, stl)
+
+                    print ("MRA2: restickify_stride:", restickify_stride, "arg_host_stride:", arg_host_stride, "restickify_stride_order:", restickify_stride_order, "target_layout:", target_layout)
 
                     # Record instructions to insert a restickify before this node to convert from arg.layout to target_layout
                     if n not in permute_needed:
                         permute_needed[n] = []
-                    permute_needed[n].append({"arg_index": arg_i, "target_layout": target_layout})
-
-
+                    permute_needed[n].append({
+                        "arg_index": arg_i,
+                        "target_layout": target_layout,
+                        "restickify_stride": restickify_stride,
+                    })
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
