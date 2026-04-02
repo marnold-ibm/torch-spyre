@@ -34,7 +34,7 @@ from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .constants import DEVICE_NAME
-from .insert_nodes import insert_permutes
+from .insert_restickify import insert_restickify
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
     has_spyre_device = any(
@@ -116,8 +116,9 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     The returned list of nodes must also be in topological order.
     """
 
-    nodes, permute_needed = propagate_spyre_tensor_layouts(nodes)
-    nodes = insert_permutes(nodes, permute_needed)
+    nodes, restick_needed = propagate_spyre_tensor_layouts(nodes)
+    if restick_needed:
+        nodes = insert_restickify(nodes, restick_needed)
     nodes = core_division_planning(nodes)
     if os.environ.get("LX_PLANNING", "0") == "1":
         nodes = scratchpad_planning(nodes)

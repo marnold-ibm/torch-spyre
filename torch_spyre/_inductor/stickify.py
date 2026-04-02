@@ -114,7 +114,7 @@ def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -
     return stride_map
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed: dict) -> FixedTiledLayout:
+def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], restick_needed: dict) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
@@ -236,7 +236,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
             # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
             logger.warning(f"WARNING: Injecting restickify to address Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}.")
         
-            # Arbitrary Choice 1: leave arg 0 and permute all others that have a conflict
+            # Arbitrary Choice 1: leave arg 0 and restick all others that have a conflict
             # TODO: can arg0 have no stick?
             stick_expr = in_device_coords[0][-1]
             for arg_i, (ic, idc, arg) in enumerate(zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1):
@@ -251,8 +251,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
 
                 print("MRA: old_sd:", old_sd, "new_sd:", new_sd, "ndim:", len(output.size))
                 if idc[-1] != stick_expr:
-                    # Stick expr doesn't match, this arg needs permute.  Compute the desired layout for this arg 
-                    # now and pass it to the next phase that will inject permutes to conform to this layout
+                    # Stick expr doesn't match, this arg needs restick.  Compute the desired layout for this arg 
+                    # now and pass it to the next phase that will inject restickify to conform to this layout
 
                     # STL (device size and stride map) are function of dim map and on-device layout only
                     device_size = compute_device_size(list(arg.layout.size), new_dim_map)
@@ -264,9 +264,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
 
                     # Record instructions to insert a restickify before this node to convert from arg.layout to target_layout
-                    if n not in permute_needed:
-                        permute_needed[n] = []
-                    permute_needed[n].append({
+                    if n not in restick_needed:
+                        restick_needed[n] = []
+                    restick_needed[n].append({
                         "arg_index": arg_i,
                         "target_layout": target_layout,
                     })
@@ -467,14 +467,14 @@ def propagate_spyre_tensor_layouts(
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
 
-    permute_needed: dict[BaseSchedulerNode, dict[str, Any]] = {}
+    restick_needed: dict[BaseSchedulerNode, dict[str, Any]] = {}
 
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, get_mem_deps(n), permute_needed)
+                output_layout = pointwise_layout(n, get_mem_deps(n), restick_needed)
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
                 output_layout = reduction_layout(n, get_mem_deps(n))
@@ -500,4 +500,4 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
 
-    return nodes, permute_needed
+    return nodes, restick_needed

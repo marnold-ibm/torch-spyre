@@ -26,7 +26,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .pass_utils import dump_ir
 
-logger = get_inductor_logger("insert_nodes")
+logger = get_inductor_logger("insert_restickify")
 
 
 class NameSwapHandler(WrapperHandler):
@@ -39,15 +39,15 @@ class NameSwapHandler(WrapperHandler):
 
 
 def _create_restickify_node(
-    permute_info: dict, n: BaseSchedulerNode, scheduler
+    restick_info: dict, n: BaseSchedulerNode, scheduler
 ) -> tuple[str, object]:
     """
-    Insert one restickify scheduler node for a given incompatible arg specified in permute_info.
-    Restickify nodes will comply with the layout specified in permute_infos.
+    Insert one restickify scheduler node for a given incompatible arg specified in restick_info.
+    Restickify nodes will comply with the layout specified in restick_infos.
     
     Returns (old_buffer_name, new_scheduler_node).
     """
-    mem_dep = list(n.read_writes.reads)[permute_info["arg_index"]]
+    mem_dep = list(n.read_writes.reads)[restick_info["arg_index"]]
     arg_name = mem_dep.name
 
     graph_lowering = V.graph
@@ -90,15 +90,15 @@ def _create_restickify_node(
     graph_lowering.env[new_fx_node] = new_tb
 
     new_sn = scheduler.create_scheduler_node(new_buff)
-    new_sn.node.layout = permute_info["target_layout"]
+    new_sn.node.layout = restick_info["target_layout"]
     ComputedBuffer.get_default_sizes_body.clear_cache(new_sn.node)
     new_sn._compute_attrs()
 
     return arg_name, new_sn
 
 
-def _apply_permutes_to_node(
-    n: BaseSchedulerNode, permute_infos: list[dict], scheduler
+def _apply_restickify_to_node_inputs(
+    n: BaseSchedulerNode, restick_infos: list[dict], scheduler
 ) -> None:
     """Create a restickify node for each incompatible input arg of node n.  
     Use NameSwapHandler to patch n's inner_fn to use the new buffer names instead of 
@@ -106,15 +106,15 @@ def _apply_permutes_to_node(
     """
     name_map = {}
 
-    for permute_info in permute_infos:
-        old_name, new_sn = _create_restickify_node(permute_info, n, scheduler)
+    for restick_info in restick_infos:
+        old_name, new_sn = _create_restickify_node(restick_info, n, scheduler)
         name_map[old_name] = new_sn.node.name
 
         for buf in new_sn.get_outputs():
             scheduler.name_to_buf[buf.get_name()] = buf
         scheduler.nodes.append(new_sn)
 
-    # Patch inner_fn once with the full name_map covering all permuted args
+    # Patch inner_fn once with the full name_map covering all restickified args
     orig_inner = n.node.data.inner_fn
     def new_inner_fn(index, _map=name_map, _orig_inner=orig_inner):
         with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
@@ -141,20 +141,17 @@ def _apply_permutes_to_node(
     n._compute_attrs()
 
 
-def insert_permutes(
-    nodes: list[BaseSchedulerNode], permute_needed: dict
+def insert_restickify(
+    nodes: list[BaseSchedulerNode], restick_needed: dict
 ) -> list[BaseSchedulerNode]:
     """
-    Insert restickify nodes for all nodes in permute_needed. 
+    Insert restickify nodes for all nodes in restick_needed. 
     Returns the new list of nodes including the inserted restickify nodes.
     """
-    if not permute_needed:
-        return nodes
-
     scheduler = V.graph.scheduler
     for n in list(nodes):  # copy because loop updates scheduler.nodes
-        if n in permute_needed:
-            _apply_permutes_to_node(n, permute_needed[n], scheduler)
+        if n in restick_needed:
+            _apply_restickify_to_node_inputs(n, restick_needed[n], scheduler)
 
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
@@ -165,5 +162,4 @@ def insert_permutes(
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
 
-    dump_ir(scheduler.nodes, "After inserting insert permutes")
     return scheduler.nodes
