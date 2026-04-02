@@ -628,11 +628,10 @@ from torch._inductor.ir import StorageBox, TensorBox, Pointwise
 from torch._inductor.virtualized import V
 
 @register_spyre_lowering(torch.ops.spyre.restickify)
-def lower_restickify(x, restickify_stride):
+def lower_restickify(x):
 
     base = x
     while not isinstance(base, StorageBox):
-        print(f"  [restickify] skipping view: {type(base).__name__} {base}")
         base = base.data
 
     loader = base.make_loader()

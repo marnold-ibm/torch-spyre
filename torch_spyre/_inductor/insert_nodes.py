@@ -53,7 +53,9 @@ def _create_restickify_node(
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
 
-    # Build env so run_node can find the TensorBox for arg_name
+    # View ops (e.g. permute) lower to ReinterpretView with no buffer name, so
+    # they are absent from name_to_users and missing from env. Rebuild from
+    # name_to_users so fetch_args_kwargs_from_env can resolve fx_arg_node.
     env = {}
     for tbs in graph_lowering.name_to_users.values():
         for tb in tbs:
@@ -61,19 +63,30 @@ def _create_restickify_node(
             env[tb_fx_node] = tb
     graph_lowering.env.update(env)
 
-    # Find the FX node that feeds arg_index and needs permute
-    fx_arg_node = n.node.data.origin_node.args[permute_info["arg_index"]]
+    # Find the FX node whose buffer name matches arg_name.
+    # Using arg_index to index origin_node.args is fragile since FX args include
+    # scalars/constants that don't appear in read_writes.reads.
+    fx_arg_node = next(
+        fx_node for fx_node, tb in graph_lowering.env.items()
+        if isinstance(fx_node, torch.fx.Node)
+        and isinstance(tb, TensorBox)
+        and tb.get_name() == arg_name
+    )
     fx_non_placeholder = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
     fx_graph.inserting_before(fx_non_placeholder)
     new_fx_node = fx_graph.create_node(
-        "call_function", torch.ops.spyre.restickify, (fx_arg_node, permute_info["restickify_stride"])
+        "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
     )
     graph_lowering.orig_gm.recompile()
 
     # Lower via run_node — handles buffer registration automatically
     new_tb = graph_lowering.run_node(new_fx_node)
     new_buff = new_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
-    new_buff.origins.discard(fx_arg_node)
+    assert isinstance(new_buff, ComputedBuffer), f"Expected ComputedBuffer, got {type(new_buff).__name__}"
+    # new_fx_node is synthetically created post-lowering and has no ATen metadata.
+    # Restickify runs before any view op on the arg, so there is no ATen op to
+    # attribute it to. Leave origins as just new_fx_node — the comment will show [].
+    new_buff.origins = OrderedSet([new_fx_node])
     graph_lowering.env[new_fx_node] = new_tb
 
     new_sn = scheduler.create_scheduler_node(new_buff)

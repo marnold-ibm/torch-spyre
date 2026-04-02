@@ -260,19 +260,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
 
 
-                    # compute the stride order for the restickify operation
-                    restickify_stride = [int(arg.dep.index.coeff(next(iter(out_coords[d].free_symbols)))) for d in range(len(output.size))]
-                    restickify_stride_order = list(reversed(get_stride_order(restickify_stride)))
-
                     arg_host_stride = arg.layout.stride
-
-                
                     target_layout = FixedTiledLayout(output.device, output.dtype, output.size, arg_host_stride, stl)
-
-                    # RESTORE CHANGE 1
-                    # target_layout = FixedTiledLayout(output.device, output.dtype, output.size, restickify_stride, stl)
-
-                    print ("MRA2: restickify_stride:", restickify_stride, "arg_host_stride:", arg_host_stride, "restickify_stride_order:", restickify_stride_order, "target_layout:", target_layout)
 
                     # Record instructions to insert a restickify before this node to convert from arg.layout to target_layout
                     if n not in permute_needed:
@@ -280,7 +269,6 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg], permute_needed:
                     permute_needed[n].append({
                         "arg_index": arg_i,
                         "target_layout": target_layout,
-                        "restickify_stride": restickify_stride,
                     })
 
         # If the indexing and device element size are identical

@@ -209,13 +209,13 @@ def _ones_scalar_fake(
 
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
 def restickify(  # type: ignore[empty-body]
-    x: torch.Tensor, stride_order: list[int]
+    x: torch.Tensor,
 ) -> torch.Tensor:
     pass
 
 
 @restickify.register_fake
-def _(x: torch.Tensor, stride_order: list[int]) -> torch.Tensor:
+def _(x: torch.Tensor) -> torch.Tensor:
     
     assert False, "old code needs updating"
     size = x.size()
