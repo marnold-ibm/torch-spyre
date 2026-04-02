@@ -72,7 +72,12 @@ def _create_restickify_node(
 
     # Lower via run_node — handles buffer registration automatically
     new_tb = graph_lowering.run_node(new_fx_node)
-    new_buff = new_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+    # new_tb is TensorBox -> (ReinterpretView ->) StorageBox -> ComputedBuffer
+    # Walk past any view nodes to find the ComputedBuffer
+    inner = new_tb.data
+    while not isinstance(inner, StorageBox):
+        inner = inner.data
+    new_buff = inner.data  # StorageBox -> ComputedBuffer
     new_buff.origins.discard(fx_arg_node)
     graph_lowering.env[new_fx_node] = new_tb
 
