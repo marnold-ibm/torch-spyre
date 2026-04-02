@@ -39,19 +39,18 @@ def _compare(fn, *args):
     )
 
 
-SIZE_PAIRS = [
+SIZE_PAIRS_2D = [
     (256, 128),
     (64, 128),
 ]
 
 
-@pytest.fixture(params=SIZE_PAIRS, ids=lambda p: f"{p[0]}x{p[1]}")
+@pytest.fixture(params=SIZE_PAIRS_2D, ids=lambda p: f"{p[0]}x{p[1]}")
 def tensors(request):
     s1, s2 = request.param
     # A, B: shape [s1, s2]
     A = torch.randn((s1, s2), dtype=torch.float16)
     B = torch.randn((s1, s2), dtype=torch.float16)
-    # X, Y: shape [s2, s1]  (transposed layout)
     X = torch.randn((s2, s1), dtype=torch.float16)
     Y = torch.randn((s2, s1), dtype=torch.float16)
     return A, B, X, Y
