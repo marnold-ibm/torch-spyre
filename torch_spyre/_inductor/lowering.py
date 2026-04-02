@@ -624,43 +624,23 @@ def clone(x, *, memory_format=None):
 
 #     return pw
 
-from torch._inductor.ir import StorageBox, TensorBox, Pointwise, ReinterpretView
+from torch._inductor.ir import StorageBox, TensorBox, Pointwise
 from torch._inductor.virtualized import V
 
 @register_spyre_lowering(torch.ops.spyre.restickify)
 def lower_restickify(x, restickify_stride):
 
-    # -----------------------------
-    # 1. Walk down to StorageBox
-    #    while recording views
-    # -----------------------------
     base = x
-    views = []
-
-    while True:
-        if isinstance(base, TensorBox):
-            base = base.data
-            continue
-
-        if isinstance(base, StorageBox):
-            break
-
-        # real view node (View / ReinterpretView / ExpandView / etc.)
-        views.append(base)
+    while not isinstance(base, StorageBox):
+        print(f"  [restickify] skipping view: {type(base).__name__} {base}")
         base = base.data
 
-    # -----------------------------
-    # 2. Build loader from storage
-    # -----------------------------
     loader = base.make_loader()
     base_size = base.get_size()
 
     def inner_fn(index):
         return loader(index)
 
-    # -----------------------------
-    # 3. Create pointwise op on base
-    # -----------------------------
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
@@ -672,27 +652,7 @@ def lower_restickify(x, restickify_stride):
 
     pw.realize()
 
-    # -----------------------------
-    # 4. Reapply views
-    # -----------------------------
-    result = pw
-    for v in reversed(views):
-        if isinstance(v, ReinterpretView):
-            # ReinterpretView needs a StorageBox as data; pw is TensorBox(StorageBox(...))
-            inner = result.data if isinstance(result, TensorBox) else result
-            assert isinstance(inner, StorageBox), f"Expected StorageBox, got {type(inner).__name__}"
-            result = TensorBox(ReinterpretView(data=inner, layout=v.layout))
-        else:
-            raise NotImplementedError(f"Don't know how to reapply view type: {type(v).__name__}")
-
-    print(
-        "restickify debug:",
-        "base_size =", base_size,
-        "x_size =", x.get_size(),
-        "result_size =", result.get_size(),
-    )
-
-    return result
+    return pw
 
 # @register_spyre_lowering(torch.ops.spyre.restickify)
 # def restickify(x, stride_order):
