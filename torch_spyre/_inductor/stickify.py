@@ -209,7 +209,7 @@ def pointwise_layout(
         for idc in in_device_coords:
             if idc[-1] != 0:
                 stick_exprs.add(idc[-1])
-        stick_expr = next(iter(stick_exprs))
+        stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
         if len(stick_exprs) > 1:
             # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
