@@ -461,9 +461,7 @@ def propagate_spyre_tensor_layouts(
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
-
     restick_needed: dict[BaseSchedulerNode, list[dict[str, Any]]] = {}
-
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
