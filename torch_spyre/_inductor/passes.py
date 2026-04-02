@@ -35,6 +35,7 @@ from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
+from .insert_restickify import insert_restickify
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -119,7 +120,9 @@ def scheduler_pre_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
     The returned list of nodes must also be in topological order.
     """
 
-    nodes = propagate_spyre_tensor_layouts(nodes)
+    nodes, restick_needed = propagate_spyre_tensor_layouts(nodes)
+    if restick_needed:
+        nodes = insert_restickify(nodes, restick_needed)
     nodes = core_division_planning(nodes)
     if os.environ.get("LX_PLANNING", "0") == "1":
         nodes = scratchpad_planning(nodes)

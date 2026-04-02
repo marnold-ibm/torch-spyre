@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from typing import Any
 
 
 import torch
@@ -52,6 +53,7 @@ from .pass_utils import (
 )
 from .views import matching_dim
 
+
 logger = get_inductor_logger("stickify")
 
 aten = torch.ops.aten
@@ -62,7 +64,58 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
+def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) -> list:
+    """Compute device_size from host_size and a target dim_map.
+
+    The C++ SpyreTensorLayout constructor only produces a correct stride_map
+    when the host is contiguous in the given dim_order.  We replicate the logic
+    here to handle non-contiguous strides (e.g. after a transpose).
+
+    Each non-stick device dim gets the full size of its host dim, except when
+    it shares a host dim with the stick — then it gets host_size // stick_size.
+    The last (stick) device dim is always stick_size (64 at fp16).
+    """
+    stick_host_dim = dim_map[-1]
+    result = []
+    for j in range(len(dim_map) - 1):
+        h = dim_map[j]
+        if h == stick_host_dim:
+            result.append(host_size[h] // stick_size)
+        else:
+            result.append(host_size[h])
+    result.append(stick_size)
+    return result
+
+
+def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -> list:
+    """Compute stride_map from host_stride and tiling geometry (device_size, dim_map).
+
+    TODO: Remove this and make C++ version available?
+
+    Python port of the C++ static function dim_map_to_stride_map, which is not
+    exposed to Python.  Iterates backwards, accumulating the product of inner
+    device sizes for each host dim so that higher-dimensional cases with a host
+    dim appearing 3+ times in dim_map are handled correctly.
+    """
+    n = len(device_size)
+    stride_map = [-1] * n
+    last_stride: dict[int, int] = {}
+    for j in range(n - 1, -1, -1):
+        d = dim_map[j]
+        if d == -1:
+            stride_map[j] = -1
+        elif d not in last_stride:
+            stride_map[j] = host_stride[d]
+            last_stride[d] = stride_map[j] * device_size[j]
+        else:
+            stride_map[j] = last_stride[d]
+            last_stride[d] = stride_map[j] * device_size[j]
+    return stride_map
+
+
+def pointwise_layout(
+    n: SchedulerNode, args: list[SchedNodeArg], restick_needed: dict
+) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
@@ -162,12 +215,64 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         for idc in in_device_coords:
             if idc[-1] != 0:
                 stick_exprs.add(idc[-1])
+        stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
         if len(stick_exprs) > 1:
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            raise Unsupported(
-                f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
+            # This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+            logger.warning(
+                f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
             )
+
+            # Arbitrary Choice 1: let arg[0] define the stick variable nd restick all others that have a conflict
+            # TODO: can arg0 have no stick?
+            stick_expr = in_device_coords[0][-1]
+            for arg_i, (ic, idc, arg) in enumerate(
+                zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1
+            ):
+                if idc[-1] != stick_expr:
+                    # Stick expr doesn't match, this arg needs restick.  Compute the desired layout for this arg
+                    # now and pass it to the insert_restickify pass that will inject restickify as prescribed
+
+                    dl = arg.layout.device_layout
+                    new_sd = matching_dim(ic, stick_expr)
+                    assert new_sd is not None, (
+                        f"Could not find a host dimension matching stick expr {stick_expr} in {ic}"
+                    )
+                    orig_dim_map = arg.layout.device_layout.dim_map
+                    old_sd = orig_dim_map[-1]
+
+                    # Arbitrary Choice 2: What layout do we want for non-stick dimensions?
+                    # Current choice: swap the new stick dim and old stick dim, leave rest as-is
+                    new_dim_map = [
+                        new_sd if x == old_sd else old_sd if x == new_sd else x
+                        for x in orig_dim_map
+                    ]
+
+                    # STL (device size and stride map) are function of dim map and on-device layout only
+                    device_size = compute_device_size(
+                        list(arg.layout.size), new_dim_map
+                    )
+                    stride_map = dim_map_to_stride_map(
+                        list(arg.layout.stride), device_size, new_dim_map
+                    )
+                    stl = SpyreTensorLayout(
+                        device_size, new_dim_map, stride_map, dl.device_dtype
+                    )
+
+                    # Fixed layout is unchanged - only the stl device layout changes
+                    target_layout = FixedTiledLayout(
+                        output.device, output.dtype, output.size, arg.layout.stride, stl
+                    )
+
+                    # Record instructions to insert a restickify before this node to convert from arg.layout to target_layout
+                    if n not in restick_needed:
+                        restick_needed[n] = []
+                    restick_needed[n].append(
+                        {
+                            "arg_index": arg_i,
+                            "target_layout": target_layout,
+                        }
+                    )
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -196,7 +301,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 maybe_stick_dim = None
                 out_stick_dim = -1
             else:
-                maybe_stick_dim = matching_dim(out_coords, next(iter(stick_exprs)))
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
 
             dim_order = [
@@ -330,7 +435,7 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
 
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
+) -> tuple[list[BaseSchedulerNode], dict[BaseSchedulerNode, list[dict[str, Any]]]]:
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
@@ -362,13 +467,13 @@ def propagate_spyre_tensor_layouts(
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
-
+    restick_needed: dict[BaseSchedulerNode, list[dict[str, Any]]] = {}
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, get_mem_deps(n))
+                output_layout = pointwise_layout(n, get_mem_deps(n), restick_needed)
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
                 output_layout = reduction_layout(n, get_mem_deps(n))
@@ -394,4 +499,4 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
 
-    return nodes
+    return nodes, restick_needed
