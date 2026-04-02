@@ -15,16 +15,14 @@
 import torch
 
 from .logging_utils import get_inductor_logger
-from torch._inductor.ir import ComputedBuffer, StorageBox, TensorBox
+from torch._inductor.ir import ComputedBuffer, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
-    SchedulerNode,
 )
 from torch._inductor.virtualized import V
 
 from torch.utils._ordered_set import OrderedSet
-from .pass_utils import dump_ir
 
 logger = get_inductor_logger("insert_restickify")
 
@@ -44,7 +42,7 @@ def _create_restickify_node(
     """
     Insert one restickify scheduler node for a given incompatible arg specified in restick_arg_info.
     Restickify nodes will comply with the layout specified in restick_arg_infos.
-    
+
     Returns (old_buffer_name, new_scheduler_node).
     """
     mem_dep = list(n.read_writes.reads)[restick_arg_info["arg_index"]]
@@ -67,7 +65,8 @@ def _create_restickify_node(
     # Using arg_index to index origin_node.args is fragile since FX args include
     # scalars/constants that don't appear in read_writes.reads.
     fx_arg_node = next(
-        fx_node for fx_node, tb in graph_lowering.env.items()
+        fx_node
+        for fx_node, tb in graph_lowering.env.items()
         if isinstance(fx_node, torch.fx.Node)
         and isinstance(tb, TensorBox)
         and tb.get_name() == arg_name
@@ -82,7 +81,9 @@ def _create_restickify_node(
     # Lower via run_node — handles buffer registration automatically
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
-    assert isinstance(restick_buff, ComputedBuffer), f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
+    assert isinstance(restick_buff, ComputedBuffer), (
+        f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
+    )
     # restick_fx_node is synthetically created post-lowering and has no ATen metadata.
     # Restickify runs before any view op on the arg, so there is no ATen op to
     # attribute it to. Leave origins as just restick_fx_node — the comment will show [].
@@ -100,9 +101,9 @@ def _create_restickify_node(
 def insert_restickify_on_node_inputs(
     n: BaseSchedulerNode, restick_infos: list[dict], scheduler
 ) -> None:
-    """Create a restickify node for each incompatible input arg of node n.  
-    Use NameSwapHandler to patch n's inner_fn to use the new buffer names instead of 
-    original input buffers.  
+    """Create a restickify node for each incompatible input arg of node n.
+    Use NameSwapHandler to patch n's inner_fn to use the new buffer names instead of
+    original input buffers.
     """
     name_map = {}
 
@@ -116,6 +117,7 @@ def insert_restickify_on_node_inputs(
 
     # Patch inner_fn once with the full name_map covering all restickified args
     orig_inner = n.node.data.inner_fn
+
     def new_inner_fn(index, _map=name_map, _orig_inner=orig_inner):
         with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
             return _orig_inner(index)
@@ -146,7 +148,7 @@ def insert_restickify(
     nodes: list[BaseSchedulerNode], restick_needed: dict
 ) -> list[BaseSchedulerNode]:
     """
-    Insert restickify(ies) before all nodes in restick_needed. 
+    Insert restickify(ies) before all nodes in restick_needed.
     """
     scheduler = V.graph.scheduler
     for n in list(nodes):  # copy because loop updates scheduler.nodes

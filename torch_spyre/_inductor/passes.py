@@ -36,6 +36,7 @@ from .scratchpad import scratchpad_planning
 from .constants import DEVICE_NAME
 from .insert_restickify import insert_restickify
 
+
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
     has_spyre_device = any(
         isinstance(node, torch.fx.Node)

@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import Reduction, Pointwise
+from torch._inductor.ir import Reduction, Pointwise, StorageBox
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -31,6 +31,7 @@ from .errors import Unsupported
 import threading
 from .logging_utils import get_inductor_logger
 import logging
+
 
 logger = get_inductor_logger("lowering")
 
@@ -505,137 +506,15 @@ def clone(x, *, memory_format=None):
     return result
 
 
-# @register_spyre_lowering(torch.ops.spyre.restickify)
-# def lower_restickify(x, stride_order):
-#     loader = x.make_loader()
-#     fn = lowering.ops_wrapper(torch.ops.spyre.restickify.__name__)
-
-#     def inner_fn(index):
-#         return fn(loader(index), stride_order)
-
-#     pw = Pointwise.create(
-#         device=x.get_device(),
-#         dtype=x.get_dtype(),
-#         inner_fn=inner_fn,
-#         ranges=x.get_size(),
-#         origin_node=None,
-#         traceback=x.get_traceback(),
-#     )
-
-#     pw.realize()
-#     pw.freeze_layout_with_stride_order(stride_order)
-#     # Clear cached body so simplify_and_reorder re-derives with the frozen layout
-#     # from torch._inductor.ir import ComputedBuffer as _CB  # noqa: PLC0415
-#     # _CB.get_default_sizes_body.clear_cache(pw.data.data)
-
-#     print ("MRA: lower_restickify done:  final shape = ", pw.shape, " stride order:", stride_order, "and output size:", pw.shape, "strides:", pw.get_stride())
-
-#     return pw
-
-
-# @register_spyre_lowering(torch.ops.spyre.restickify)
-# def lower_restickify(x, restickify_stride):
-#     loader = x.make_loader()
-
-#     def inner_fn(index):
-#         return loader(index)
-
-#     pw = Pointwise.create(
-#         device=x.get_device(),
-#         dtype=x.get_dtype(),
-#         inner_fn=inner_fn,
-#         ranges=x.get_size(),
-#         origin_node=V.get_current_node(),
-#         traceback=x.get_traceback(),
-#     )
-
-#     pw.realize()
-
-#     print ("MRA4: lower_restickify done:  final shape = ", pw.shape, " restickify_stride:", restickify_stride, "and output size:", pw.shape, "strides:", pw.get_stride())
-#     return pw
-
-# @register_spyre_lowering(torch.ops.spyre.restickify)
-# def lower_restickify(x, restickify_stride):
-
-#     base = x
-#     while hasattr(base, "data"):
-#         base = base.data
-
-#     loader = base.make_loader()
-
-#     def inner_fn(index):
-#         return loader(index)
-
-#     pw = Pointwise.create(
-#         device=x.get_device(),
-#         dtype=x.get_dtype(),
-#         inner_fn=inner_fn,
-#         ranges=x.get_size(),
-#         origin_node=V.get_current_node(),
-#         traceback=x.get_traceback(),
-#     )
-
-#     pw.realize()
-
-#     print(
-#         "MRA4: lower_restickify done: final shape = ",
-#         pw.shape,
-#         "restickify_stride:", restickify_stride,
-#         "and output size:", pw.shape,
-#         "strides:", pw.get_stride(),
-#     )
-
-#     return pw
-
-
-# from torch._inductor.ir import StorageBox
-# @register_spyre_lowering(torch.ops.spyre.restickify)
-# def lower_restickify(x, restickify_stride):
-
-#     base = x
-#     while not isinstance(base, StorageBox):
-#         base = base.data
-
-#     loader = base.make_loader()
-
-#     base_size = base.get_size()
-
-#     def inner_fn(index):
-#         return loader(index)
-
-#     pw = Pointwise.create(
-#         device=x.get_device(),
-#         dtype=x.get_dtype(),
-#         inner_fn=inner_fn,
-#         ranges=base_size,   
-#         origin_node=V.get_current_node(),
-#         traceback=x.get_traceback(),
-#     )
-
-#     pw.realize()
-
-#     print(
-#         "MRA4:",
-#         "pw.shape =", pw.shape,
-#         "base.size =", base_size,
-#         "x.size =", x.get_size(),
-#         "pw.strides =", pw.get_stride(),
-#     )
-
-#     return pw
-
-from torch._inductor.ir import StorageBox, TensorBox, Pointwise
-from torch._inductor.virtualized import V
-
 @register_spyre_lowering(torch.ops.spyre.restickify)
 def lower_restickify(x):
-
+    # Restickify must operate on base tenors, so we need
+    # to unwrap any views.
     base = x
     while not isinstance(base, StorageBox):
         base = base.data
 
     loader = base.make_loader()
-    base_size = base.get_size()
 
     def inner_fn(index):
         return loader(index)
@@ -644,24 +523,10 @@ def lower_restickify(x):
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=base_size,
+        ranges=base.get_size(),
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )
 
     pw.realize()
-
     return pw
-
-# @register_spyre_lowering(torch.ops.spyre.restickify)
-# def restickify(x, stride_order):
-#     # from torch._inductor.ir import FlexibleLayout, get_stride_order
-#     from torch._inductor.lowering import clone as clone_lowering
-
-#     result = clone_lowering(x)
-#     result.realize()
-
-#     # result.freeze_layout_with_stride_order(stride_order)
-#     print ("RESTICKIFY: frozen with stride order:", stride_order, "and output size:", result.get_size(), "strides:", result.get_stride())
-#     return result
-
