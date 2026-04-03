@@ -118,9 +118,9 @@ def scheduler_pre_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
     The returned list of nodes must also be in topological order.
     """
 
-    nodes, restick_needed = propagate_spyre_tensor_layouts(nodes)
-    if restick_needed:
-        nodes = insert_restickify(nodes, restick_needed)
+    nodes, restickify_plan = propagate_spyre_tensor_layouts(nodes)
+    if restickify_plan:
+        nodes = insert_restickify(nodes, restickify_plan)
     nodes = core_division_planning(nodes)
     if os.environ.get("LX_PLANNING", "0") == "1":
         nodes = scratchpad_planning(nodes)

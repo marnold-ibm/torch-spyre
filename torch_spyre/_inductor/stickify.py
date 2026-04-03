@@ -122,11 +122,14 @@ def restickify_stride_map(
     new_var = next(iter(target_stick_expr.free_symbols))
     result = []
     for j, coord in enumerate(idc):
-        if old_var in coord.free_symbols:
+        if j == len(idc) - 1:
+            # Last device dim is always the stick; stride_map is the host stride of new_sd.
+            result.append(host_stride[new_sd])
+        elif old_var in coord.free_symbols:
             result.append(old_stride_map[j] * host_stride[new_sd] // host_stride[old_sd])
         elif new_var in coord.free_symbols:
             result.append(old_stride_map[j] * host_stride[old_sd] // host_stride[new_sd])
-        elif coord == sympy.S.Zero and j != len(idc) - 1:
+        elif coord == sympy.S.Zero:
             # Degenerate outer stick: rescale to new_sd like any other old_sd dim.
             result.append(old_stride_map[j] * host_stride[new_sd] // host_stride[old_sd])
         else:
@@ -141,7 +144,7 @@ def schedule_restickify(
     target_stick_expr,
     ic: list,
     idc: list,
-    restick_needed: dict,
+    restick_plan: dict,
 ) -> None:
     """Record a restickify needed for arg to match target_stick_expr.
 
@@ -189,14 +192,14 @@ def schedule_restickify(
     target_layout = FixedTiledLayout(
         arg.layout.device, arg.layout.dtype, arg.layout.size, arg.layout.stride, stl
     )
-    restick_needed.setdefault(n, []).append(
+    restick_plan.setdefault(n, []).append(
         {"arg_index": arg_i, "target_layout": target_layout}
     )
     return target_layout
 
 
 def pointwise_layout(
-    n: SchedulerNode, args: list[SchedNodeArg], restick_needed: dict
+    n: SchedulerNode, args: list[SchedNodeArg], restick_plan: dict
 ) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
@@ -312,7 +315,7 @@ def pointwise_layout(
                 zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1
             ):
                 if idc[-1] != stick_expr:
-                    schedule_restickify(n, arg, arg_i, stick_expr, ic, idc, restick_needed)
+                    schedule_restickify(n, arg, arg_i, stick_expr, ic, idc, restick_plan)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -374,7 +377,7 @@ def pointwise_layout(
 
 
 def reduction_layout(
-    n: SchedulerNode, args: list[SchedNodeArg], restick_needed: dict
+    n: SchedulerNode, args: list[SchedNodeArg], restick_plan: dict
 ) -> FixedTiledLayout:
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
@@ -412,7 +415,7 @@ def reduction_layout(
             logger.warning(
                 f"Injecting restickify on {red.reduction_type} x input to move stick to reduction_dim"
             )
-            tl = schedule_restickify(n, x, 0, reduction_coord, x_coords, x_dev_coords, restick_needed)
+            tl = schedule_restickify(n, x, 0, reduction_coord, x_coords, x_dev_coords, restick_plan)
             x_stick_expr = device_coordinates(tl, x.dep)[-1]
         # y's stick must be on the generated_dim, i.e. a dim that appears in the output.
         # If y_stick_expr doesn't appear in out_coords, y needs restickifying.
@@ -424,7 +427,7 @@ def reduction_layout(
             generated_coord = next(
                 c for c in y_coords if matching_dim(out_coords, c) is not None
             )
-            tl = schedule_restickify(n, y, 1, generated_coord, y_coords, y_dev_coords, restick_needed)
+            tl = schedule_restickify(n, y, 1, generated_coord, y_coords, y_dev_coords, restick_plan)
             y_stick_expr = device_coordinates(tl, y.dep)[-1]
 
         out_stick_dim = matching_dim(out_coords, y_stick_expr)
@@ -529,16 +532,16 @@ def propagate_spyre_tensor_layouts(
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
-    restick_needed: dict[BaseSchedulerNode, list[dict[str, Any]]] = {}
+    restick_plan: dict[BaseSchedulerNode, list[dict[str, Any]]] = {}
     it = iter(nodes)
     for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, get_mem_deps(n), restick_needed)
+                output_layout = pointwise_layout(n, get_mem_deps(n), restick_plan)
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
-                output_layout = reduction_layout(n, get_mem_deps(n), restick_needed)
+                output_layout = reduction_layout(n, get_mem_deps(n), restick_plan)
                 n.node.layout = output_layout
             else:
                 logger.warning(f"Warning: unhandled node type {type(n.node)}")
@@ -561,4 +564,4 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled scheduler node type {type(n)}")
 
-    return nodes, restick_needed
+    return nodes, restick_plan
