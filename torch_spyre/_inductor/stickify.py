@@ -113,6 +113,44 @@ def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -
     return stride_map
 
 
+def schedule_restickify(
+    n: SchedulerNode,
+    arg: SchedNodeArg,
+    arg_i: int,
+    target_stick_expr,
+    ic: list,
+    restick_needed: dict,
+) -> None:
+    """Record a restickify needed for arg to match target_stick_expr.
+
+    Computes the target FixedTiledLayout by swapping the current stick dim with
+    the host dim that matches target_stick_expr, then appends an entry to
+    restick_needed[n] for the insert_restickify pass to act on.
+    """
+    dl = arg.layout.device_layout
+    new_sd = matching_dim(ic, target_stick_expr)
+    assert new_sd is not None, (
+        f"Could not find a host dimension matching stick expr {target_stick_expr} in {ic}"
+    )
+    orig_dim_map = dl.dim_map
+    old_sd = orig_dim_map[-1]
+    new_dim_map = [
+        new_sd if x == old_sd else old_sd if x == new_sd else x
+        for x in orig_dim_map
+    ]
+    device_size = compute_device_size(list(arg.layout.size), new_dim_map)
+    stride_map = dim_map_to_stride_map(
+        list(arg.layout.stride), device_size, new_dim_map
+    )
+    stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
+    target_layout = FixedTiledLayout(
+        arg.layout.device, arg.layout.dtype, arg.layout.size, arg.layout.stride, stl
+    )
+    restick_needed.setdefault(n, []).append(
+        {"arg_index": arg_i, "target_layout": target_layout}
+    )
+
+
 def pointwise_layout(
     n: SchedulerNode, args: list[SchedNodeArg], restick_needed: dict
 ) -> FixedTiledLayout:
@@ -224,55 +262,13 @@ def pointwise_layout(
             )
 
             # Arbitrary Choice 1: let arg[0] define the stick variable nd restick all others that have a conflict
-            # TODO: can arg0 have no stick?
             stick_expr = in_device_coords[0][-1]
+            assert stick_expr != 0, "Expected arg 0 to have non-zero stick indexing expression"
             for arg_i, (ic, idc, arg) in enumerate(
                 zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1
             ):
                 if idc[-1] != stick_expr:
-                    # Stick expr doesn't match, this arg needs restick.  Compute the desired layout for this arg
-                    # now and pass it to the insert_restickify pass that will inject restickify as prescribed
-
-                    dl = arg.layout.device_layout
-                    new_sd = matching_dim(ic, stick_expr)
-                    assert new_sd is not None, (
-                        f"Could not find a host dimension matching stick expr {stick_expr} in {ic}"
-                    )
-                    orig_dim_map = arg.layout.device_layout.dim_map
-                    old_sd = orig_dim_map[-1]
-
-                    # Arbitrary Choice 2: What layout do we want for non-stick dimensions?
-                    # Current choice: swap the new stick dim and old stick dim, leave rest as-is
-                    new_dim_map = [
-                        new_sd if x == old_sd else old_sd if x == new_sd else x
-                        for x in orig_dim_map
-                    ]
-
-                    # STL (device size and stride map) are function of dim map and on-device layout only
-                    device_size = compute_device_size(
-                        list(arg.layout.size), new_dim_map
-                    )
-                    stride_map = dim_map_to_stride_map(
-                        list(arg.layout.stride), device_size, new_dim_map
-                    )
-                    stl = SpyreTensorLayout(
-                        device_size, new_dim_map, stride_map, dl.device_dtype
-                    )
-
-                    # Fixed layout is unchanged - only the stl device layout changes
-                    target_layout = FixedTiledLayout(
-                        output.device, output.dtype, output.size, arg.layout.stride, stl
-                    )
-
-                    # Record instructions to insert a restickify before this node to convert from arg.layout to target_layout
-                    if n not in restick_needed:
-                        restick_needed[n] = []
-                    restick_needed[n].append(
-                        {
-                            "arg_index": arg_i,
-                            "target_layout": target_layout,
-                        }
-                    )
+                    schedule_restickify(n, arg, arg_i, stick_expr, ic, restick_needed)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -333,7 +329,9 @@ def pointwise_layout(
         return result
 
 
-def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
+def reduction_layout(
+    n: SchedulerNode, args: list[SchedNodeArg], restick_needed: dict
+) -> FixedTiledLayout:
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dep = next(iter(n.read_writes.writes))
@@ -357,14 +355,16 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 f"{red.reduction_type}: failed to map stick_dims to host coords"
             )
 
-        if (
-            x_stick_dim != len(x.layout.size) - 1
-            or y_stick_dim != len(y.layout.size) - 1
-        ):
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            raise Unsupported(
-                f"Spyre limitation: {red.reduction_type} requires restickify"
+        if x_stick_dim != len(x.layout.size) - 1:
+            logger.warning(
+                f"Injecting restickify on {red.reduction_type} x input to move stick dim to last position"
             )
+            schedule_restickify(n, x, 0, x_stick_expr, x_coords, restick_needed)
+        if y_stick_dim != len(y.layout.size) - 1:
+            logger.warning(
+                f"Injecting restickify on {red.reduction_type} y input to move stick dim to last position"
+            )
+            schedule_restickify(n, y, 1, y_stick_expr, y_coords, restick_needed)
         out_stick_dim = matching_dim(out_coords, y_stick_expr)
         if out_stick_dim is None:
             raise Unsupported(
@@ -476,7 +476,7 @@ def propagate_spyre_tensor_layouts(
                 output_layout = pointwise_layout(n, get_mem_deps(n), restick_needed)
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
-                output_layout = reduction_layout(n, get_mem_deps(n))
+                output_layout = reduction_layout(n, get_mem_deps(n), restick_needed)
                 n.node.layout = output_layout
             else:
                 logger.warning(f"Warning: unhandled node type {type(n.node)}")

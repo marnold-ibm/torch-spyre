@@ -56,68 +56,58 @@ def tensors(request):
     return A, B, X, Y
 
 
+# -------- Pointwise tests ----------
+
 # 2-arg tests
 def test_2arg_at_plus_x(tensors):
     A, _, X, _ = tensors
     _compare(lambda a, x: a.t() + x, A, X)
 
-
 def test_2arg_x_plus_at(tensors):
     A, _, X, _ = tensors
     _compare(lambda a, x: x + a.t(), A, X)
-
 
 def test_2arg_xt_plus_a(tensors):
     A, _, X, _ = tensors
     _compare(lambda a, x: x.t() + a, A, X)
 
-
 def test_2arg_a_plus_xt(tensors):
     A, _, X, _ = tensors
     _compare(lambda a, x: a + x.t(), A, X)
-
 
 # 3-arg tests
 def test_3arg_at_bt_x(tensors):
     A, B, X, _ = tensors
     _compare(lambda a, b, x: a.t() + b.t() + x, A, B, X)
 
-
 def test_3arg_at_x_bt(tensors):
     A, B, X, _ = tensors
     _compare(lambda a, b, x: a.t() + x + b.t(), A, B, X)
-
 
 def test_3arg_x_at_bt(tensors):
     A, B, X, _ = tensors
     _compare(lambda a, b, x: x + a.t() + b.t(), A, B, X)
 
-
 def test_3arg_at_x_y(tensors):
     A, _, X, Y = tensors
     _compare(lambda a, x, y: a.t() + x + y, A, X, Y)
-
 
 # 4-arg tests
 def test_4arg_at_bt_x_y(tensors):
     A, B, X, Y = tensors
     _compare(lambda a, b, x, y: a.t() + b.t() + x + y, A, B, X, Y)
 
-
 def test_4arg_at_x_bt_y(tensors):
     A, B, X, Y = tensors
     _compare(lambda a, b, x, y: a.t() + x + b.t() + y, A, B, X, Y)
-
 
 def test_4arg_x_at_y_bt(tensors):
     A, B, X, Y = tensors
     _compare(lambda a, b, x, y: x + a.t() + y + b.t(), A, B, X, Y)
 
-
 def test_4arg_at_x_y_bt(tensors):
     A, B, X, Y = tensors
     _compare(lambda a, b, x, y: a.t() + x + y + b.t(), A, B, X, Y)
-
 
 # 3D tests
 # a: [s0, s1, s2], x: [s0, s2, s1] — transpose dims 1 and 2
@@ -127,13 +117,11 @@ def test_3d_transpose12_plus_x(s0, s1, s2):
     x = torch.randn((s0, s2, s1), dtype=torch.float16)
     _compare(lambda a, x: a.transpose(1, 2) + x, a, x)
 
-
 @pytest.mark.parametrize("s0,s1,s2", [(2, 256, 128), (4, 128, 64)])
 def test_3d_x_plus_transpose12(s0, s1, s2):
     a = torch.randn((s0, s1, s2), dtype=torch.float16)
     x = torch.randn((s0, s2, s1), dtype=torch.float16)
     _compare(lambda a, x: x + a.transpose(1, 2), a, x)
-
 
 # 4D tests
 # a: [s0, s1, s2, s3], x: [s0, s3, s2, s1] — transpose dims 1 and 3
@@ -143,9 +131,13 @@ def test_4d_transpose13_plus_x(s0, s1, s2, s3):
     x = torch.randn((s0, s3, s2, s1), dtype=torch.float16)
     _compare(lambda a, x: a.transpose(1, 3) + x, a, x)
 
-
 @pytest.mark.parametrize("s0,s1,s2,s3", [(2, 256, 3, 128), (2, 128, 4, 64)])
 def test_4d_x_plus_transpose13(s0, s1, s2, s3):
     a = torch.randn((s0, s1, s2, s3), dtype=torch.float16)
     x = torch.randn((s0, s3, s2, s1), dtype=torch.float16)
     _compare(lambda a, x: x + a.transpose(1, 3), a, x)
+
+
+# ------- Matmul Tests ---------
+
+

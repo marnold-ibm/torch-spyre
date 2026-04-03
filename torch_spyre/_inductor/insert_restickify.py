@@ -71,13 +71,13 @@ def _create_restickify_node(
         and isinstance(tb, TensorBox)
         and tb.get_name() == arg_name
     )
-    fx_non_placeholder = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
-    fx_graph.inserting_before(fx_non_placeholder)
-    restick_fx_node = fx_graph.create_node(
-        "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
-    )
-    graph_lowering.orig_gm.recompile()
-
+    # Insert before the first computation node so the restickify node
+    # precedes all potential consumers in the graph node list.
+    first_compute_node = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
+    with fx_graph.inserting_before(first_compute_node):
+        restick_fx_node = fx_graph.create_node(
+            "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
+        )
     # Lower via run_node — handles buffer registration automatically
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
