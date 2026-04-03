@@ -30,13 +30,14 @@ from utils_inductor import _compile_and_run, compare_with_cpu
 DEVICE = torch.device("spyre")
 
 
-def _compare(fn, *args):
+def _compare(fn, *args, check_strides=True):
     spyre_result = _compile_and_run(fn, args, DEVICE)
     compare_with_cpu(fn, *args, target=spyre_result, run_eager=False)
-    cpu_result = fn(*args)
-    assert cpu_result.stride() == spyre_result.stride(), (
-        f"Stride mismatch: CPU {cpu_result.stride()} vs Spyre {spyre_result.stride()}"
-    )
+    if check_strides:
+        cpu_result = fn(*args)
+        assert cpu_result.stride() == spyre_result.stride(), (
+            f"Stride mismatch: CPU {cpu_result.stride()} vs Spyre {spyre_result.stride()}"
+        )
 
 
 def _make_2d_tensors(s1, s2):
@@ -123,7 +124,7 @@ def test_4arg_at_x_y_bt(tensors_multiarg):
     _compare(lambda a, b, x, y: a.t() + x + y + b.t(), A, B, X, Y)
 
 
-# 3D tests: a=[s0,s1,s2], x=[s0,s2,s1] — transpose dims 1 and 2
+# 3D tests
 SIZES_3D = [
     (2, 256, 128), 
     (4, 128, 64)
@@ -145,7 +146,7 @@ def test_3d_x_plus_transpose12(tensors_3d):
     _compare(lambda a, x: x + a.transpose(1, 2), a, x)
 
 
-# 4D tests: a=[s0,s1,s2,s3], x=[s0,s3,s2,s1] — transpose dims 1 and 3
+# 4D tests: 
 SIZES_4D = [
     (2, 256, 3, 128),
     (2, 128, 4, 64)
@@ -167,7 +168,29 @@ def test_4d_x_plus_transpose13(tensors_4d):
     _compare(lambda a, x: x + a.transpose(1, 3), a, x)
 
 
-# 2-arg tests with size-1 
+# Expand tests
+SIZES_EXPAND = [(128, 256)]
+
+@pytest.fixture(params=SIZES_EXPAND, ids=lambda p: f"{p[0]}x{p[1]}")
+def tensors_expand(request):
+    s0, s1 = request.param
+    x = torch.randn((s0, s1, s1), dtype=torch.float16)
+    y = torch.randn((s1, s0), dtype=torch.float16)
+    return x, y
+
+def test_expand_x_plus_yt_expand(tensors_expand):
+    x, y = tensors_expand
+    _compare(lambda x, y: x + y.transpose(0, 1).unsqueeze(1).expand(x.shape), x, y)
+
+def test_expand_yt_expand_plus_x(tensors_expand):
+    x, y = tensors_expand
+    _compare(lambda x, y: y.transpose(0, 1).unsqueeze(1).expand(x.shape) + x, x, y, 
+        check_strides=False     # Stride differes from CPU even before restickify, skipping stride check
+
+    )
+
+
+# 2-arg tests with size-1
 SIZES_4D_SIZE1 = [
     (128, 256)
 ]
