@@ -15,7 +15,7 @@
 import logging
 from typing import Any
 
-
+import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
@@ -64,53 +64,74 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def compute_device_size(host_size: list, dim_map: list, stick_size: int = 64) -> list:
-    """Compute device_size from host_size and a target dim_map.
+def restickify_device_size(
+    old_device_size: list,
+    idc: list,
+    old_stick_expr,
+    target_stick_expr,
+    host_size: list,
+    old_sd: int,
+    new_sd: int,
+    stick_size: int = 64,
+) -> list:
+    """Compute device_size for a restickify by swapping old_stick_expr with target_stick_expr.
 
-    The C++ SpyreTensorLayout constructor only produces a correct stride_map
-    when the host is contiguous in the given dim_order.  We replicate the logic
-    here to handle non-contiguous strides (e.g. after a transpose).
-
-    Each non-stick device dim gets the full size of its host dim, except when
-    it shares a host dim with the stick — then it gets host_size // stick_size.
-    The last (stick) device dim is always stick_size (64 at fp16).
+    Uses idc coordinate expressions to identify which device dims cover old_sd vs new_sd:
+    - Last device dim (stick): size is always stick_size
+    - Dims involving old_var (outer stick): size becomes host_size[new_sd] // stick_size
+    - Dims involving new_var (non-stick for new_sd): size becomes host_size[old_sd]
+    - Constant zero (degenerate outer stick when host_size[old_sd] == stick_size): host_size[new_sd] // stick_size
+    All other dims are unchanged.
     """
-    stick_host_dim = dim_map[-1]
+    old_var = next(iter(old_stick_expr.free_symbols))
+    new_var = next(iter(target_stick_expr.free_symbols))
     result = []
-    for j in range(len(dim_map) - 1):
-        h = dim_map[j]
-        if h == stick_host_dim:
-            result.append(host_size[h] // stick_size)
+    for j, coord in enumerate(idc):
+        if j == len(idc) - 1:
+            # Last device dim is always the stick, size is always stick_size.
+            result.append(stick_size)
+        elif old_var in coord.free_symbols:
+            result.append(host_size[new_sd] // stick_size)
+        elif new_var in coord.free_symbols:
+            result.append(host_size[old_sd])
+        elif coord == sympy.S.Zero and j != len(idc) - 1:
+            # Degenerate outer stick: host_size[old_sd] == stick_size so floor(var/stick_size) == 0.
+            # Still belongs to old_sd; new outer stick size is host_size[new_sd] // stick_size.
+            result.append(host_size[new_sd] // stick_size)
         else:
-            result.append(host_size[h])
-    result.append(stick_size)
+            result.append(old_device_size[j])
     return result
 
 
-def dim_map_to_stride_map(host_stride: list, device_size: list, dim_map: list) -> list:
-    """Compute stride_map from host_stride and tiling geometry (device_size, dim_map).
+def restickify_stride_map(
+    old_stride_map: list,
+    idc: list,
+    old_stick_expr,
+    target_stick_expr,
+    host_stride: list,
+    old_sd: int,
+    new_sd: int,
+) -> list:
+    """Compute stride_map for a restickify by swapping old_stick_expr with target_stick_expr.
 
-    TODO: Remove this and make C++ version available?
-
-    Python port of the C++ static function dim_map_to_stride_map, which is not
-    exposed to Python.  Iterates backwards, accumulating the product of inner
-    device sizes for each host dim so that higher-dimensional cases with a host
-    dim appearing 3+ times in dim_map are handled correctly.
+    Uses idc coordinate expressions to identify which device dims cover old_sd vs new_sd,
+    then rescales their stride_map values by host_stride[new_sd] / host_stride[old_sd]
+    and vice versa. All other dims are unchanged.
     """
-    n = len(device_size)
-    stride_map = [-1] * n
-    last_stride: dict[int, int] = {}
-    for j in range(n - 1, -1, -1):
-        d = dim_map[j]
-        if d == -1:
-            stride_map[j] = -1
-        elif d not in last_stride:
-            stride_map[j] = host_stride[d]
-            last_stride[d] = stride_map[j] * device_size[j]
+    old_var = next(iter(old_stick_expr.free_symbols))
+    new_var = next(iter(target_stick_expr.free_symbols))
+    result = []
+    for j, coord in enumerate(idc):
+        if old_var in coord.free_symbols:
+            result.append(old_stride_map[j] * host_stride[new_sd] // host_stride[old_sd])
+        elif new_var in coord.free_symbols:
+            result.append(old_stride_map[j] * host_stride[old_sd] // host_stride[new_sd])
+        elif coord == sympy.S.Zero and j != len(idc) - 1:
+            # Degenerate outer stick: rescale to new_sd like any other old_sd dim.
+            result.append(old_stride_map[j] * host_stride[new_sd] // host_stride[old_sd])
         else:
-            stride_map[j] = last_stride[d]
-            last_stride[d] = stride_map[j] * device_size[j]
-    return stride_map
+            result.append(old_stride_map[j])
+    return result
 
 
 def schedule_restickify(
@@ -119,30 +140,52 @@ def schedule_restickify(
     arg_i: int,
     target_stick_expr,
     ic: list,
+    idc: list,
     restick_needed: dict,
 ) -> None:
     """Record a restickify needed for arg to match target_stick_expr.
 
-    Computes the target FixedTiledLayout by swapping the current stick dim with
-    the host dim that matches target_stick_expr, then appends an entry to
-    restick_needed[n] for the insert_restickify pass to act on.
+    Computes the target FixedTiledLayout by replacing the current stick
+    coordinate expression with target_stick_expr in the device layout, then
+    appends an entry to restick_needed[n] for the insert_restickify pass to act on.
     """
     dl = arg.layout.device_layout
     new_sd = matching_dim(ic, target_stick_expr)
     assert new_sd is not None, (
         f"Could not find a host dimension matching stick expr {target_stick_expr} in {ic}"
     )
-    orig_dim_map = dl.dim_map
-    old_sd = orig_dim_map[-1]
+    host_size = list(arg.layout.size)
+    host_stride = list(arg.layout.stride)
+    old_sd = dl.dim_map[-1]
+    old_stick_expr = idc[-1]
+    old_stride_map = list(dl.stride_map)
+
+    print(f"schedule_restickify arg{arg_i}:")
+    print(f"  host_size={host_size} host_stride={host_stride}")
+    print(f"  ic={ic}")
+    print(f"  idc={idc}")
+    print(f"  old_stick_expr={old_stick_expr}  target_stick_expr={target_stick_expr}")
+    print(f"  old_sd={old_sd}  new_sd={new_sd}")
+    print(f"  before: device_size={list(dl.device_size)} dim_map={list(dl.dim_map)} stride_map={old_stride_map}")
+
+    # dim_map is kept for legacy reasons but is not used to derive device_size or stride_map.
     new_dim_map = [
         new_sd if x == old_sd else old_sd if x == new_sd else x
-        for x in orig_dim_map
+        for x in dl.dim_map
     ]
-    device_size = compute_device_size(list(arg.layout.size), new_dim_map)
-    stride_map = dim_map_to_stride_map(
-        list(arg.layout.stride), device_size, new_dim_map
+    device_size = restickify_device_size(
+        list(dl.device_size), idc, old_stick_expr, target_stick_expr,
+        host_size, old_sd, new_sd,
     )
+    stride_map = restickify_stride_map(
+        old_stride_map, idc, old_stick_expr, target_stick_expr,
+        host_stride, old_sd, new_sd,
+    )
+
+    print(f"  after:  device_size={device_size} dim_map={new_dim_map} stride_map={stride_map}")
+
     stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
+
     target_layout = FixedTiledLayout(
         arg.layout.device, arg.layout.dtype, arg.layout.size, arg.layout.stride, stl
     )
@@ -269,7 +312,7 @@ def pointwise_layout(
                 zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1
             ):
                 if idc[-1] != stick_expr:
-                    schedule_restickify(n, arg, arg_i, stick_expr, ic, restick_needed)
+                    schedule_restickify(n, arg, arg_i, stick_expr, ic, idc, restick_needed)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -369,7 +412,7 @@ def reduction_layout(
             logger.warning(
                 f"Injecting restickify on {red.reduction_type} x input to move stick to reduction_dim"
             )
-            tl = schedule_restickify(n, x, 0, reduction_coord, x_coords, restick_needed)
+            tl = schedule_restickify(n, x, 0, reduction_coord, x_coords, x_dev_coords, restick_needed)
             x_stick_expr = device_coordinates(tl, x.dep)[-1]
         # y's stick must be on the generated_dim, i.e. a dim that appears in the output.
         # If y_stick_expr doesn't appear in out_coords, y needs restickifying.
@@ -381,7 +424,7 @@ def reduction_layout(
             generated_coord = next(
                 c for c in y_coords if matching_dim(out_coords, c) is not None
             )
-            tl = schedule_restickify(n, y, 1, generated_coord, y_coords, restick_needed)
+            tl = schedule_restickify(n, y, 1, generated_coord, y_coords, y_dev_coords, restick_needed)
             y_stick_expr = device_coordinates(tl, y.dep)[-1]
 
         out_stick_dim = matching_dim(out_coords, y_stick_expr)

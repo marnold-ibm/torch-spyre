@@ -42,6 +42,7 @@ def _compare(fn, *args):
 SIZE_PAIRS_2D = [
     (256, 128),
     (64, 128),
+    (128, 64),
 ]
 
 
