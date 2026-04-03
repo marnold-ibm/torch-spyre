@@ -118,9 +118,9 @@ def insert_restickify_on_node_inputs(
     # Patch inner_fn once with the full name_map covering all restickified args
     orig_inner = n.node.data.inner_fn
 
-    def new_inner_fn(index, _map=name_map, _orig_inner=orig_inner):
+    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
         with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-            return _orig_inner(index)
+            return _orig_inner(*args)
 
     object.__setattr__(n.node.data, "inner_fn", new_inner_fn)
 

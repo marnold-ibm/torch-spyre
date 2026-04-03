@@ -149,6 +149,7 @@ def schedule_restickify(
     restick_needed.setdefault(n, []).append(
         {"arg_index": arg_i, "target_layout": target_layout}
     )
+    return target_layout
 
 
 def pointwise_layout(
@@ -355,16 +356,34 @@ def reduction_layout(
                 f"{red.reduction_type}: failed to map stick_dims to host coords"
             )
 
-        if x_stick_dim != len(x.layout.size) - 1:
-            logger.warning(
-                f"Injecting restickify on {red.reduction_type} x input to move stick dim to last position"
+        # Hardware stick constraints (DF16):
+        #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
+        #   Input2 (y): stick on generated_dim (the y coord that appears in output)
+        #   Output:     stick on generated_dim
+        # Restickify whichever input has its stick on the wrong dim.
+        if matching_dim(out_coords, x_stick_expr) is not None:
+            # x's stick is on a dim that appears in the output — move it to reduction_dim
+            reduction_coord = next(
+                c for c in x_coords if matching_dim(out_coords, c) is None
             )
-            schedule_restickify(n, x, 0, x_stick_expr, x_coords, restick_needed)
-        if y_stick_dim != len(y.layout.size) - 1:
             logger.warning(
-                f"Injecting restickify on {red.reduction_type} y input to move stick dim to last position"
+                f"Injecting restickify on {red.reduction_type} x input to move stick to reduction_dim"
             )
-            schedule_restickify(n, y, 1, y_stick_expr, y_coords, restick_needed)
+            tl = schedule_restickify(n, x, 0, reduction_coord, x_coords, restick_needed)
+            x_stick_expr = device_coordinates(tl, x.dep)[-1]
+        # y's stick must be on the generated_dim, i.e. a dim that appears in the output.
+        # If y_stick_expr doesn't appear in out_coords, y needs restickifying.
+        if matching_dim(out_coords, y_stick_expr) is None:
+            logger.warning(
+                f"Injecting restickify on {red.reduction_type} y input to move stick to generated_dim"
+            )
+            # Target is the y coord that appears in the output (the generated_dim)
+            generated_coord = next(
+                c for c in y_coords if matching_dim(out_coords, c) is not None
+            )
+            tl = schedule_restickify(n, y, 1, generated_coord, y_coords, restick_needed)
+            y_stick_expr = device_coordinates(tl, y.dep)[-1]
+
         out_stick_dim = matching_dim(out_coords, y_stick_expr)
         if out_stick_dim is None:
             raise Unsupported(

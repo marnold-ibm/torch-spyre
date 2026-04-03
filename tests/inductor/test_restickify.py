@@ -111,33 +111,65 @@ def test_4arg_at_x_y_bt(tensors):
 
 # 3D tests
 # a: [s0, s1, s2], x: [s0, s2, s1] — transpose dims 1 and 2
-@pytest.mark.parametrize("s0,s1,s2", [(2, 256, 128), (4, 128, 64)])
-def test_3d_transpose12_plus_x(s0, s1, s2):
+@pytest.fixture(params=[(2, 256, 128), (4, 128, 64)], ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}")
+def tensors_3d(request):
+    s0, s1, s2 = request.param
     a = torch.randn((s0, s1, s2), dtype=torch.float16)
     x = torch.randn((s0, s2, s1), dtype=torch.float16)
+    return a, x
+
+def test_3d_transpose12_plus_x(tensors_3d):
+    a, x = tensors_3d
     _compare(lambda a, x: a.transpose(1, 2) + x, a, x)
 
-@pytest.mark.parametrize("s0,s1,s2", [(2, 256, 128), (4, 128, 64)])
-def test_3d_x_plus_transpose12(s0, s1, s2):
-    a = torch.randn((s0, s1, s2), dtype=torch.float16)
-    x = torch.randn((s0, s2, s1), dtype=torch.float16)
+def test_3d_x_plus_transpose12(tensors_3d):
+    a, x = tensors_3d
     _compare(lambda a, x: x + a.transpose(1, 2), a, x)
 
 # 4D tests
 # a: [s0, s1, s2, s3], x: [s0, s3, s2, s1] — transpose dims 1 and 3
-@pytest.mark.parametrize("s0,s1,s2,s3", [(2, 256, 3, 128), (2, 128, 4, 64)])
-def test_4d_transpose13_plus_x(s0, s1, s2, s3):
+@pytest.fixture(params=[(2, 256, 3, 128), (2, 128, 4, 64)], ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}x{p[3]}")
+def tensors_4d(request):
+    s0, s1, s2, s3 = request.param
     a = torch.randn((s0, s1, s2, s3), dtype=torch.float16)
     x = torch.randn((s0, s3, s2, s1), dtype=torch.float16)
+    return a, x
+
+def test_4d_transpose13_plus_x(tensors_4d):
+    a, x = tensors_4d
     _compare(lambda a, x: a.transpose(1, 3) + x, a, x)
 
-@pytest.mark.parametrize("s0,s1,s2,s3", [(2, 256, 3, 128), (2, 128, 4, 64)])
-def test_4d_x_plus_transpose13(s0, s1, s2, s3):
-    a = torch.randn((s0, s1, s2, s3), dtype=torch.float16)
-    x = torch.randn((s0, s3, s2, s1), dtype=torch.float16)
+def test_4d_x_plus_transpose13(tensors_4d):
+    a, x = tensors_4d
     _compare(lambda a, x: x + a.transpose(1, 3), a, x)
 
 
 # ------- Matmul Tests ---------
 
+MATMUL_SIZE_PAIRS = [(128, 256), (64, 128)]
 
+@pytest.fixture(params=MATMUL_SIZE_PAIRS, ids=[f"{a}x{b}" for a, b in MATMUL_SIZE_PAIRS])
+def matmul_tensors_ab(request):
+    a, b = request.param
+    x = torch.randn((a, b), dtype=torch.float16) * 0.1
+    y = torch.randn((a, b), dtype=torch.float16) * 0.1
+    return x, y
+
+@pytest.fixture(params=MATMUL_SIZE_PAIRS, ids=[f"{a}x{b}" for a, b in MATMUL_SIZE_PAIRS])
+def matmul_tensors_ab_ba(request):
+    a, b = request.param
+    x = torch.randn((a, b), dtype=torch.float16) * 0.1
+    y = torch.randn((b, a), dtype=torch.float16) * 0.1
+    return x, y
+
+def test_matmul_xt_y(matmul_tensors_ab):
+    x, y = matmul_tensors_ab
+    _compare(lambda x, y: torch.matmul(x.t(), y), x, y)
+
+def test_matmul_x_yt(matmul_tensors_ab):
+    x, y = matmul_tensors_ab
+    _compare(lambda x, y: torch.matmul(x, y.t()), x, y)
+
+def test_matmul_xt_yt(matmul_tensors_ab_ba):
+    x, y = matmul_tensors_ab_ba
+    _compare(lambda x, y: torch.matmul(x.t(), y.t()), x, y)
