@@ -27,7 +27,6 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    relayout_linear_weights,
     replace_scalar_with_tensor,
 )
 from .stickify import propagate_spyre_tensor_layouts
@@ -36,6 +35,7 @@ from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from . import config
+from .insert_restickify import insert_restickify
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -82,7 +82,6 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         replace_scalar_with_tensor,
-        relayout_linear_weights,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]
@@ -137,11 +136,21 @@ class CustomPreFusionPasses(CustomNodePassBase):
     The returned list of nodes must also be in topological order.
     """
 
+<<<<<<< HEAD
     def get_passes(self):
         passes = [propagate_spyre_tensor_layouts, core_division_planning]
         if config.lx_planning:
             passes.append(scratchpad_planning)
         return passes
+=======
+    nodes, restickify_plan = propagate_spyre_tensor_layouts(nodes)
+    if restickify_plan:
+        nodes = insert_restickify(nodes, restickify_plan)
+    nodes = core_division_planning(nodes)
+    if os.environ.get("LX_PLANNING", "0") == "1":
+        nodes = scratchpad_planning(nodes)
+    return nodes
+>>>>>>> c885068 (Implement restickify feature)
 
 
 class CustomPostFusionPasses(CustomNodePassBase):

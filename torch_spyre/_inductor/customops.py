@@ -219,3 +219,10 @@ def overwrite(
 @overwrite.register_fake
 def _(input: torch.Tensor, output: torch.Tensor, dim: int, offset: int) -> torch.Tensor:
     return output
+
+
+@torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
+def restickify(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
