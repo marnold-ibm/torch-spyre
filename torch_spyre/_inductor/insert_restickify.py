@@ -99,7 +99,7 @@ def _create_restickify_node(
 
 
 def insert_restickify_on_node_inputs(
-    n: BaseSchedulerNode, restick_infos: list[dict], scheduler
+    n: BaseSchedulerNode, resticks_needed: list[dict], scheduler
 ) -> None:
     """Create a restickify node for each incompatible input arg of node n.
     Use NameSwapHandler to patch n's inner_fn to use the new buffer names instead of
@@ -107,7 +107,7 @@ def insert_restickify_on_node_inputs(
     """
     name_map = {}
 
-    for restick_arg_info in restick_infos:
+    for restick_arg_info in resticks_needed:
         old_name, restick_sn = _create_restickify_node(restick_arg_info, n, scheduler)
         name_map[old_name] = restick_sn.node.name
 
@@ -144,16 +144,19 @@ def insert_restickify_on_node_inputs(
     n._compute_attrs()
 
 
-def insert_restickify(
-    nodes: list[BaseSchedulerNode], restick_needed: dict
-) -> list[BaseSchedulerNode]:
+def insert_restickify(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
-    Insert restickify(ies) before all nodes in restick_needed.
+    Insert restickify(ies) before all nodes in restickify_plan
     """
+
+    restickify_plan = getattr(V.graph, "restickify_plan", {})
+    if not restickify_plan:
+        return nodes
+
     scheduler = V.graph.scheduler
     for n in list(nodes):  # copy because loop updates scheduler.nodes
-        if n in restick_needed:
-            insert_restickify_on_node_inputs(n, restick_needed[n], scheduler)
+        if n in restickify_plan:
+            insert_restickify_on_node_inputs(n, restickify_plan[n], scheduler)
 
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}

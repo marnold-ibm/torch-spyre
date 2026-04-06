@@ -14,7 +14,6 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-from typing import cast
 import torch
 from torch._inductor.pattern_matcher import (
     Arg,

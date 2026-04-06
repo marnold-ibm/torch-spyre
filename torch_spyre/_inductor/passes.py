@@ -136,21 +136,15 @@ class CustomPreFusionPasses(CustomNodePassBase):
     The returned list of nodes must also be in topological order.
     """
 
-<<<<<<< HEAD
     def get_passes(self):
-        passes = [propagate_spyre_tensor_layouts, core_division_planning]
+        passes = [
+            propagate_spyre_tensor_layouts,
+            insert_restickify,
+            core_division_planning,
+        ]
         if config.lx_planning:
             passes.append(scratchpad_planning)
         return passes
-=======
-    nodes, restickify_plan = propagate_spyre_tensor_layouts(nodes)
-    if restickify_plan:
-        nodes = insert_restickify(nodes, restickify_plan)
-    nodes = core_division_planning(nodes)
-    if os.environ.get("LX_PLANNING", "0") == "1":
-        nodes = scratchpad_planning(nodes)
-    return nodes
->>>>>>> c885068 (Implement restickify feature)
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
