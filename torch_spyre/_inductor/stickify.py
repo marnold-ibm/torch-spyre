@@ -438,43 +438,32 @@ def reduction_layout(
         #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
         #   Input2 (y): stick on generated_dim (the y coord that appears in output)
         #   Output:     stick on generated_dim
-        # Restickify whichever input has its stick on the wrong dim.
-        reduction_dim = next(
-            d for d, c in enumerate(x_coords) if matching_dim(out_coords, c) is None
-        )
-        generated_dim = next(
-            d
-            for d, c in enumerate(y_coords)
-            if matching_dim(out_coords, c) is not None
-            and matching_dim(x_coords, c) is None
-        )
-
-        if x_stick_dim != reduction_dim:
+        if matching_dim(out_coords, x_stick_expr) is not None:
             logger.warning(
                 f"Injecting restickify on {red.reduction_type} x input to move stick to reduction_dim"
             )
+            reduction_coord = next(
+                c
+                for c in x_coords
+                if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+            )
             tl = schedule_restickify(
-                n,
-                x,
-                0,
-                x_coords[reduction_dim],
-                x_coords,
-                x_dev_coords,
-                restickify_plan,
+                n, x, 0, reduction_coord, x_coords, x_dev_coords, restickify_plan
             )
             x_stick_expr = device_coordinates(tl, x.dep)[-1]
-        if y_stick_dim != generated_dim:
+        if matching_dim(out_coords, y_stick_expr) is None:
             logger.warning(
                 f"Injecting restickify on {red.reduction_type} y input to move stick to generated_dim"
             )
+            generated_coord = next(
+                c
+                for c in y_coords
+                if len(c.free_symbols) > 0
+                and matching_dim(out_coords, c) is not None
+                and matching_dim(x_coords, c) is None
+            )
             tl = schedule_restickify(
-                n,
-                y,
-                1,
-                y_coords[generated_dim],
-                y_coords,
-                y_dev_coords,
-                restickify_plan,
+                n, y, 1, generated_coord, y_coords, y_dev_coords, restickify_plan
             )
             y_stick_expr = device_coordinates(tl, y.dep)[-1]
 

@@ -27,7 +27,13 @@ from torch.utils._ordered_set import OrderedSet
 logger = get_inductor_logger("insert_restickify")
 
 
+
 class NameSwapHandler(WrapperHandler):
+    """
+    Wrapper to patch a node's inner_fn to use new buffer names after inserting 
+    nodes upstream that change the input buffers.
+    """
+
     def __init__(self, inner, name_map: dict[str, str]):
         super().__init__(inner)
         self._name_map = name_map
@@ -51,9 +57,9 @@ def _create_restickify_node(
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
 
-    # View ops (e.g. permute) lower to ReinterpretView with no buffer name, so
-    # they are absent from name_to_users and missing from env. Rebuild from
-    # name_to_users so fetch_args_kwargs_from_env can resolve fx_arg_node.
+    # View ops (e.g. permute) lower to ReinterpretView with no buffer name and
+    # are absent from env. Patch env from name_to_users so the search below can
+    # resolve them.
     env = {}
     for tbs in graph_lowering.name_to_users.values():
         for tb in tbs:
@@ -61,9 +67,9 @@ def _create_restickify_node(
             env[tb_fx_node] = tb
     graph_lowering.env.update(env)
 
-    # Find the FX node whose buffer name matches arg_name.
-    # Using arg_index to index origin_node.args is fragile since FX args include
-    # scalars/constants that don't appear in read_writes.reads.
+    # Search by buffer name rather than arg_index: FX args include scalars and
+    # constants that don't appear in read_writes.reads, making index-based lookup
+    # unreliable.
     fx_arg_node = next(
         fx_node
         for fx_node, tb in graph_lowering.env.items()
@@ -71,22 +77,21 @@ def _create_restickify_node(
         and isinstance(tb, TensorBox)
         and tb.get_name() == arg_name
     )
-    # Insert before the first computation node so the restickify node
-    # precedes all potential consumers in the graph node list.
+    # Insert at a valid position in the FX graph; scheduling order is determined
+    # by the topological sort in insert_restickify, not by position here.
     first_compute_node = next(n2 for n2 in fx_graph.nodes if n2.op != "placeholder")
     with fx_graph.inserting_before(first_compute_node):
         restick_fx_node = fx_graph.create_node(
             "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
         )
-    # Lower via run_node — handles buffer registration automatically
+    # Lower the FX node; run_node lowers and registers the output buffer in graph.buffers.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
     assert isinstance(restick_buff, ComputedBuffer), (
         f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
     )
-    # restick_fx_node is synthetically created post-lowering and has no ATen metadata.
-    # Restickify runs before any view op on the arg, so there is no ATen op to
-    # attribute it to. Leave origins as just restick_fx_node — the comment will show [].
+    # Synthetic node with no corresponding ATen op; set origins to the synthetic
+    # FX node so code that expects non-empty origins doesn't crash.
     restick_buff.origins = OrderedSet([restick_fx_node])
     graph_lowering.env[restick_fx_node] = restick_tb
 
@@ -102,8 +107,6 @@ def insert_restickify_on_node_inputs(
     n: BaseSchedulerNode, resticks_needed: list[dict], scheduler
 ) -> None:
     """Create a restickify node for each incompatible input arg of node n.
-    Use NameSwapHandler to patch n's inner_fn to use the new buffer names instead of
-    original input buffers.
     """
     name_map = {}
 
@@ -124,8 +127,7 @@ def insert_restickify_on_node_inputs(
 
     object.__setattr__(n.node.data, "inner_fn", new_inner_fn)
 
-    # Rebuilding ComputedBuffer around patched inner_fn to reduce
-    # number of internal datastructures that need to be hacked
+    # Reconstruct ComputedBuffer so internal caches see the patched inner_fn.
     new_consumer_buffer = ComputedBuffer(
         name=n.node.name,
         layout=n.node.layout,
@@ -161,8 +163,6 @@ def insert_restickify(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     scheduler.compute_dependencies()
     scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
 
-    # Can maybe skip sorting if new_sn was inserted in the correct spot to
-    # maintain topological order, but safer to just re-sort
     sorted_order = scheduler._topological_sort_nodes()
     scheduler.nodes = [node for group in sorted_order for node in group]
     scheduler.compute_ancestors()
