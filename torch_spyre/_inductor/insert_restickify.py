@@ -27,10 +27,9 @@ from torch.utils._ordered_set import OrderedSet
 logger = get_inductor_logger("insert_restickify")
 
 
-
 class NameSwapHandler(WrapperHandler):
     """
-    Wrapper to patch a node's inner_fn to use new buffer names after inserting 
+    Wrapper to patch a node's inner_fn to use new buffer names after inserting
     nodes upstream that change the input buffers.
     """
 
@@ -106,8 +105,7 @@ def _create_restickify_node(
 def insert_restickify_on_node_inputs(
     n: BaseSchedulerNode, resticks_needed: list[dict], scheduler
 ) -> None:
-    """Create a restickify node for each incompatible input arg of node n.
-    """
+    """Create a restickify node for each incompatible input arg of node n."""
     name_map = {}
 
     for restick_arg_info in resticks_needed:
