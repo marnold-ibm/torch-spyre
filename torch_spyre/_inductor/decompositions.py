@@ -603,6 +603,44 @@ def decompose_cat(
         return orig_decomp
 
 
+@register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
+def pad_decomp(
+    input: torch.Tensor,
+    pad: list[int],
+    value: float = 0,
+) -> torch.Tensor:
+    # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
+    n_dims_padded = len(pad) // 2
+
+    # Left-padding on any dimension requires updating the output start address,
+    # which the SFP overwrite op does not support.
+    if any(pad[2 * i] > 0 for i in range(n_dims_padded)):
+        raise Unsupported(
+            f"constant_pad_nd: left-padding is not supported on Spyre (pad={pad})"
+        )
+
+    # Apply padding one dimension at a time, from outermost to innermost.
+    # Each step fills an intermediate tensor with the pad value and overwrites
+    # it with the current tensor.  Processing outermost-first ensures that each
+    # overwrite call sees matching sizes on all non-overwrite dimensions.
+    scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
+    current = input
+    for i in range(n_dims_padded - 1, -1, -1):
+        left = pad[2 * i]
+        right = pad[2 * i + 1]
+        if left + right == 0:
+            continue
+        dim = input.dim() - 1 - i
+        intermediate_size = list(current.size())
+        intermediate_size[dim] += left + right
+        intermediate = scalar.expand(intermediate_size).clone()
+        current = torch.ops.spyre.overwrite(
+            input=current, output=intermediate, dim=dim, offset=left
+        )
+
+    return current
+
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################

@@ -820,6 +820,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_pad",
+            "test_pad_cpu",
+        ): {
+            "param_sets": {
+                "2d_last_dim_right": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 64),
+                ),
+                "2d_both_dims": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 64, 0, 2),
+                ),
+                "3d_last_dim_right": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 64),
+                ),
+                "3d_dim1_right": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 0, 0, 2),
+                ),
+            },
+        },
+        (
             "test_fallback",
             "test_fallback_cpu",
         ): {
@@ -1801,6 +1824,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.cat(tensors, dim=dim)
 
         compare_with_cpu(fn, *tensors)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pad_cpu(self, x, pad):
+        """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
+
+        def fn(x):
+            return torch.nn.functional.pad(x, pad)
+
+        compare_with_cpu(fn, x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
