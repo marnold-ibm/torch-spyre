@@ -19,6 +19,7 @@ from torch._inductor.ir import ComputedBuffer, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
+    NodeUser,
 )
 from torch._inductor.virtualized import V
 
@@ -119,6 +120,24 @@ def insert_restickify_on_node_inputs(
             scheduler.name_to_buf[buf.get_name()] = buf
         scheduler.nodes.append(restick_sn)
         global_name_map[old_name] = restick_sn.node.name
+
+        # Keep buf.users consistent so downstream passes (fusion, memory planning)
+        # see the correct graph structure without needing to re-run
+        # compute_dependencies().
+        #
+        # Before restickify:  input_buf -> n
+        # After restickify:   input_buf -> restick_sn -> n
+        #
+        # 1. input_buf: replace n as user with restick_sn
+        if old_name in scheduler.name_to_buf:
+            input_buf = scheduler.name_to_buf[old_name]
+            input_buf.users = [
+                u for u in input_buf.users if u.node is not n
+            ]
+            input_buf.users.append(NodeUser(restick_sn, can_inplace=False))
+        # 2. restick output buf: n is its sole user
+        for restick_out_buf in restick_sn.get_outputs():
+            restick_out_buf.users = [NodeUser(n, can_inplace=False)]
 
     # Patch inner_fn once with the full name_map covering all restickified args
     orig_inner = n.node.data.inner_fn
