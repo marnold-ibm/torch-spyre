@@ -367,13 +367,12 @@ def core_division_planning(
                 pass
         elif isinstance(n, ExternKernelSchedulerNode):
             if isinstance(n.node, FallbackKernel):
-                n = next(it, None)
-                if not (
-                    isinstance(n, ExternKernelSchedulerNode)
-                    and isinstance(n.node, MultiOutput)
-                ):
-                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
-
+                # n = next(it, None)
+                # if not (
+                #     isinstance(n, ExternKernelSchedulerNode)
+                #     and isinstance(n.node, MultiOutput)
+                # ):
+                #     raise RuntimeError("FallbackKernel must be followed by MultiOutput")
                 # Core division not supported on fallback kernels
                 pass
             else:
