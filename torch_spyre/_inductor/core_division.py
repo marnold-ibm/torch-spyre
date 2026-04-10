@@ -21,7 +21,6 @@ import torch
 from torch._inductor.ir import (
     ComputedBuffer,
     FallbackKernel,
-    MultiOutput,
     Pointwise,
     Reduction,
 )

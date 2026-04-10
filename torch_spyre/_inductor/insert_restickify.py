@@ -99,7 +99,7 @@ def _create_restickify_node(
     restick_sn.node.layout = restick_arg_info["target_layout"]
     ComputedBuffer.get_default_sizes_body.clear_cache(restick_sn.node)
     restick_sn._compute_attrs()
-    
+
     return arg_name, restick_sn
 
 
@@ -131,9 +131,7 @@ def insert_restickify_on_node_inputs(
         # 1. input_buf: replace n as user with restick_sn
         if old_name in scheduler.name_to_buf:
             input_buf = scheduler.name_to_buf[old_name]
-            input_buf.users = [
-                u for u in input_buf.users if u.node is not n
-            ]
+            input_buf.users = [u for u in input_buf.users if u.node is not n]
             input_buf.users.append(NodeUser(restick_sn, can_inplace=False))
         # 2. restick output buf: n is its sole user
         for restick_out_buf in restick_sn.get_outputs():
@@ -182,14 +180,16 @@ def insert_restickify(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     global_name_map: dict[str, str] = {}
     for n in list(nodes):  # copy because loop updates scheduler.nodes
         if n in restickify_plan:
-            insert_restickify_on_node_inputs(n, restickify_plan[n], scheduler, global_name_map)
+            insert_restickify_on_node_inputs(
+                n, restickify_plan[n], scheduler, global_name_map
+            )
 
     # Do NOT call scheduler.compute_dependencies() again. It already ran in
     # Scheduler.__init__ and left unmet_dependencies with mutation-renamed buffer
-    # names (e.g. buf18 already renamed to buf20 happens for Granite). Re-running it 
-    # applies those renames again, making nodes appear to read their own 
-    # output → topo-sort cycle. Instead, update unmet_dependencies incrementally 
-    # via prune_deps() (for new restickify nodes) and manual dep-swapping (for 
+    # names (e.g. buf18 already renamed to buf20 happens for Granite). Re-running it
+    # applies those renames again, making nodes appear to read their own
+    # output → topo-sort cycle. Instead, update unmet_dependencies incrementally
+    # via prune_deps() (for new restickify nodes) and manual dep-swapping (for
     # patched consumer nodes).
     for node in scheduler.nodes:
         node.prune_deps()
@@ -198,13 +198,18 @@ def insert_restickify(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     for n in list(nodes):
         if n in restickify_plan:
             from torch._inductor.dependencies import MemoryDep, StarDep
+
             new_unmet = OrderedSet()
             for dep in n.unmet_dependencies:
                 if dep.name in global_name_map:
                     # Replace with a dep on the restickify buffer
                     new_name = global_name_map[dep.name]
                     if isinstance(dep, MemoryDep):
-                        new_unmet.add(MemoryDep(new_name, dep.index, dep.var_names, dep.size, dep.mode))
+                        new_unmet.add(
+                            MemoryDep(
+                                new_name, dep.index, dep.var_names, dep.size, dep.mode
+                            )
+                        )
                     else:
                         new_unmet.add(StarDep(new_name))
                 else:
@@ -214,9 +219,7 @@ def insert_restickify(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     # Update name_to_fused_node to include the newly inserted restickify nodes.
     # The scheduler set this during __init__ before our pass ran, so the new nodes
     # are absent and _get_unmet_dep_nodes will KeyError without this update.
-    scheduler.name_to_fused_node.update(
-        {n.get_name(): n for n in scheduler.nodes}
-    )
+    scheduler.name_to_fused_node.update({n.get_name(): n for n in scheduler.nodes})
 
     sorted_order = scheduler._topological_sort_nodes()
     scheduler.nodes = [node for group in sorted_order for node in group]

@@ -301,3 +301,24 @@ def test_bmm_x_yt(bmm_tensors_ab):
 def test_bmm_xt_yt(bmm_tensors_ab_ba):
     x, y = bmm_tensors_ab_ba
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
+
+
+# ------- Mutation + restickify regression test ---------
+
+
+def test_bmm_with_inplace_mutation():
+    # Regression test: copy_() creates a mutation_renames chain in the Inductor
+    # scheduler. Combined with a bmm whose weight needs restickifying, this
+    # previously caused a topo-sort cycle when compute_dependencies() was called
+    # a second time inside insert_restickify.
+    B, M, K, N = 1, 8, 64, 64
+    x = torch.randn((B, M, K), dtype=torch.float16)
+    weight = torch.randn((N, K), dtype=torch.float16)
+    cache = torch.zeros((B, M, K), dtype=torch.float16)
+
+    def func(x, weight, cache):
+        cache.copy_(x)
+        return torch.bmm(cache, weight.t().unsqueeze(0).expand(B, -1, -1))
+
+    spyre_result = _compile_and_run(func, (x, weight, cache), DEVICE)
+    compare_with_cpu(func, x, weight, cache, target=spyre_result, run_eager=False)
