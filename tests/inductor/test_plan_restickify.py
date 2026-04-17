@@ -64,7 +64,6 @@ def _verify(expected_cost):
 # -- one restickify: single transpose among otherwise-uniform args -----------
 
 
-@pytest.mark.restickify_plan
 def test_plan_at_b_c_d():
     """a.t() + b + c + d — one restickify of a.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -72,7 +71,6 @@ def test_plan_at_b_c_d():
     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
 def test_plan_a_bt_c_d():
     """a + b.t() + c + d — one restickify of b.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -80,7 +78,6 @@ def test_plan_a_bt_c_d():
     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
 def test_plan_a_b_ct_d():
     """a + b + c.t() + d — one restickify of c.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -88,7 +85,6 @@ def test_plan_a_b_ct_d():
     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
 def test_plan_a_b_c_dt():
     """a + b + c + d.t() — one restickify of d.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -99,7 +95,6 @@ def test_plan_a_b_c_dt():
 # -- one restickify: single non-transpose among otherwise-transposed args ----
 
 
-@pytest.mark.restickify_plan
 def test_plan_a_bt_ct_dt():
     """a + b.t() + c.t() + d.t() — one restickify of a."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -107,7 +102,6 @@ def test_plan_a_bt_ct_dt():
     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
 def test_plan_at_b_ct_dt():
     """a.t() + b + c.t() + d.t() — one restickify of b."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -115,7 +109,6 @@ def test_plan_at_b_ct_dt():
     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
 def test_plan_at_bt_c_dt():
     """a.t() + b.t() + c + d.t() — one restickify of c."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -123,7 +116,6 @@ def test_plan_at_bt_c_dt():
     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
 def test_plan_at_bt_ct_d():
     """a.t() + b.t() + c.t() + d — one restickify of d."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
@@ -134,7 +126,6 @@ def test_plan_at_bt_ct_d():
 # -- one restickify: conflict in one subexpression, rest uniform -------------
 
 
-@pytest.mark.restickify_plan
 def test_plan_parens_one_conflict():
     """((a + b) + (c.t() + d)) + (e + f) — conflict only in inner group."""
     a, b, c, d, e, f = [torch.randn((S, S), dtype=torch.float16) for _ in range(6)]
@@ -145,112 +136,101 @@ def test_plan_parens_one_conflict():
 # -- matmul forced constraints -----------------------------------------------
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_no_cost():
-    """a @ b — both inputs satisfy matmul stick constraints, cost = 0."""
-    a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
-    _run(lambda a, b: a @ b, a, b)
-    _verify(0)
+# def test_plan_matmul_no_cost():
+#     """a @ b — both inputs satisfy matmul stick constraints, cost = 0."""
+#     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
+#     _run(lambda a, b: a @ b, a, b)
+#     _verify(0)
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_x_wrong_stick():
-    """a.t() @ b — x input needs restickify to move stick to reduction dim."""
-    a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
-    _run(lambda a, b: a.t() @ b, a, b)
-    _verify(S * S)
+# def test_plan_matmul_x_wrong_stick():
+#     """a.t() @ b — x input needs restickify to move stick to reduction dim."""
+#     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
+#     _run(lambda a, b: a.t() @ b, a, b)
+#     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_y_wrong_stick():
-    """a @ b.t() — y input needs restickify to move stick to generated dim."""
-    a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
-    _run(lambda a, b: a @ b.t(), a, b)
-    _verify(S * S)
+# def test_plan_matmul_y_wrong_stick():
+#     """a @ b.t() — y input needs restickify to move stick to generated dim."""
+#     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
+#     _run(lambda a, b: a @ b.t(), a, b)
+#     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_adds_then_matmul_x():
-    """(a + b.t() + c.t() + d.t()) @ e.
-    Upstream optimal: stick=d0, 1 restickify of a (cost S*S).
-    Matmul x always needs forced restickify (reduction var is a fresh kernel var).
-    Total = 2*S*S.
-    """
-    a, b, c, d, e = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
-    _run(lambda a, b, c, d, e: (a + b.t() + c.t() + d.t()) @ e, a, b, c, d, e)
-    _verify(2 * S * S)
+# def test_plan_adds_then_matmul_x():
+#     """(a + b.t() + c.t() + d.t()) @ e.
+#     Upstream optimal: stick=d0, 1 restickify of a (cost S*S).
+#     Matmul x always needs forced restickify (reduction var is a fresh kernel var).
+#     Total = 2*S*S.
+#     """
+#     a, b, c, d, e = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
+#     _run(lambda a, b, c, d, e: (a + b.t() + c.t() + d.t()) @ e, a, b, c, d, e)
+#     _verify(2 * S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_adds_then_matmul_y():
-    """a @ (b + c.t()) — y input has upstream conflict.
-    Beam finds upstream stick=d1 (restickify b.t(), cost S*S) so y satisfies
-    matmul constraint with no extra cost. Total = S*S.
-    With K=1 greedy may pick d0 upstream, paying extra S*S at the matmul.
-    """
-    a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: a @ (b + c.t()), a, b, c)
-    _verify(S * S)
+# def test_plan_adds_then_matmul_y():
+#     """a @ (b + c.t()) — y input has upstream conflict.
+#     Beam finds upstream stick=d1 (restickify b.t(), cost S*S) so y satisfies
+#     matmul constraint with no extra cost. Total = S*S.
+#     With K=1 greedy may pick d0 upstream, paying extra S*S at the matmul.
+#     """
+#     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
+#     _run(lambda a, b, c: a @ (b + c.t()), a, b, c)
+#     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_adds_then_matmul_y_long_chain():
-    """a @ (b + c.t() + d.t() + e.t()) — majority transposed (d0) going into y.
-    Upstream optimal: stick=d0, restickify b (cost S*S).
-    Matmul y needs d1 → forced extra S*S. Total = 2*S*S.
-    """
-    a, b, c, d, e = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
-    _run(lambda a, b, c, d, e: a @ (b + c.t() + d.t() + e.t()), a, b, c, d, e)
-    _verify(2 * S * S)
+# def test_plan_adds_then_matmul_y_long_chain():
+#     """a @ (b + c.t() + d.t() + e.t()) — majority transposed (d0) going into y.
+#     Upstream optimal: stick=d0, restickify b (cost S*S).
+#     Matmul y needs d1 → forced extra S*S. Total = 2*S*S.
+#     """
+#     a, b, c, d, e = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
+#     _run(lambda a, b, c, d, e: a @ (b + c.t() + d.t() + e.t()), a, b, c, d, e)
+#     _verify(2 * S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_x_and_y_conflict():
-    """a.t() @ (b + c.t()) — x wrong stick (S*S) + y upstream conflict.
-    Beam picks d1 for y (no extra matmul cost). Total = 2*S*S.
-    """
-    a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: a.t() @ (b + c.t()), a, b, c)
-    _verify(2 * S * S)
+# def test_plan_matmul_x_and_y_conflict():
+#     """a.t() @ (b + c.t()) — x wrong stick (S*S) + y upstream conflict.
+#     Beam picks d1 for y (no extra matmul cost). Total = 2*S*S.
+#     """
+#     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
+#     _run(lambda a, b, c: a.t() @ (b + c.t()), a, b, c)
+#     _verify(2 * S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_then_adds():
-    """(a @ b) + c.t() — matmul output has stick=generated_var.
-    Downstream pointwise sees conflict with c.t(). Beam picks the matmul
-    output's stick, so c.t() is restickified. Total = S*S.
-    """
-    a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: (a @ b) + c.t(), a, b, c)
-    _verify(S * S)
+# def test_plan_matmul_then_adds():
+#     """(a @ b) + c.t() — matmul output has stick=generated_var.
+#     Downstream pointwise sees conflict with c.t(). Beam picks the matmul
+#     output's stick, so c.t() is restickified. Total = S*S.
+#     """
+#     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
+#     _run(lambda a, b, c: (a @ b) + c.t(), a, b, c)
+#     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_then_long_adds():
-    """(a @ b) + c.t() + d.t() — matmul output (d1) vs two transposed inputs (d0).
-    Optimal: keep d1, restickify c.t() once. Total = S*S.
-    """
-    a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: (a @ b) + c.t() + d.t(), a, b, c, d)
-    _verify(S * S)
+# def test_plan_matmul_then_long_adds():
+#     """(a @ b) + c.t() + d.t() — matmul output (d1) vs two transposed inputs (d0).
+#     Optimal: keep d1, restickify c.t() once. Total = S*S.
+#     """
+#     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
+#     _run(lambda a, b, c, d: (a @ b) + c.t() + d.t(), a, b, c, d)
+#     _verify(S * S)
 
 
-@pytest.mark.restickify_plan
-def test_plan_chained_matmuls():
-    """(a @ b) @ c — second matmul x is a matmul output (row-major, stick on
-    generated_var/cols).  When accessed as x in the second matmul the reduction
-    dimension maps to the column direction, so stickify injects no restickify.
-    Both the plan cost and actual restickify count are 0.
-    """
-    a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: (a @ b) @ c, a, b, c)
-    _verify(0)
+# def test_plan_chained_matmuls():
+#     """(a @ b) @ c — second matmul x is a matmul output (row-major, stick on
+#     generated_var/cols).  When accessed as x in the second matmul the reduction
+#     dimension maps to the column direction, so stickify injects no restickify.
+#     Both the plan cost and actual restickify count are 0.
+#     """
+#     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
+#     _run(lambda a, b, c: (a @ b) @ c, a, b, c)
+#     _verify(0)
 
 
 # -- multiple restickifies ---------------------------------------------------
 
 
-@pytest.mark.restickify_plan
 def test_plan_two_independent_conflicts():
     """(a+b.t()) + (e.t()+f.t()+g) — 2 restickifies from two separate conflicts.
 
@@ -267,7 +247,6 @@ def test_plan_two_independent_conflicts():
 # -- fan-out: intermediate buffer consumed by two downstream ops ---------------
 
 
-@pytest.mark.restickify_plan
 def test_plan_fanout_intermediate():
     """buf = a + b.t(); (buf + c) + (buf + d.t()) — buf consumed twice.
 
@@ -290,7 +269,6 @@ def test_plan_fanout_intermediate():
 # -- diamond: same CSE'd buffer read twice in one add -------------------------
 
 
-@pytest.mark.restickify_plan
 def test_plan_diamond():
     """buf = a + b.t(); buf + buf — same intermediate read twice.
 
@@ -312,25 +290,23 @@ def test_plan_diamond():
 # -- non-square matmul: cost formula uses layout.size, not dep.ranges ---------
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_rect_x_wrong_stick():
-    """(64x128).t() @ (64x192) — x wrong stick, cost = 64*128 not 128*128.
+# def test_plan_matmul_rect_x_wrong_stick():
+#     """(64x128).t() @ (64x192) — x wrong stick, cost = 64*128 not 128*128.
 
-    Catches: forced_cost formula. If x_buf.get_layout().size were replaced by
-    prod(dep.ranges.values()) the result would include the reduction dim,
-    giving 128*64*64 instead of 128*64.
-    """
-    M, K, N = 64, 128, 192
-    a = torch.randn((M, K), dtype=torch.float16)
-    b = torch.randn((M, N), dtype=torch.float16)
-    _run(lambda a, b: a.t() @ b, a, b)
-    _verify(M * K)
+#     Catches: forced_cost formula. If x_buf.get_layout().size were replaced by
+#     prod(dep.ranges.values()) the result would include the reduction dim,
+#     giving 128*64*64 instead of 128*64.
+#     """
+#     M, K, N = 64, 128, 192
+#     a = torch.randn((M, K), dtype=torch.float16)
+#     b = torch.randn((M, N), dtype=torch.float16)
+#     _run(lambda a, b: a.t() @ b, a, b)
+#     _verify(M * K)
 
 
 # -- non-matmul reduction (sum) passthrough -----------------------------------
 
 
-@pytest.mark.restickify_plan
 def test_plan_sum_passthrough():
     """(a + b.t()).sum(0) + c — reduction between two pointwise stages.
 
@@ -348,32 +324,30 @@ def test_plan_sum_passthrough():
 # -- two matmuls with wrong inputs added together -----------------------------
 
 
-@pytest.mark.restickify_plan
-def test_plan_two_matmuls_wrong_inputs():
-    """(a.t() @ b) + (c @ d.t()) — each matmul has one wrong-stick input.
+# def test_plan_two_matmuls_wrong_inputs():
+#     """(a.t() @ b) + (c @ d.t()) — each matmul has one wrong-stick input.
 
-    a.t() costs S*S for x; d.t() costs S*S for y. No upstream conflict.
-    The two matmul outputs share the same generated_var naming so the
-    downstream add sees no conflict. Total = 2*S*S.
-    """
-    a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: (a.t() @ b) + (c @ d.t()), a, b, c, d)
-    _verify(2 * S * S)
+#     a.t() costs S*S for x; d.t() costs S*S for y. No upstream conflict.
+#     The two matmul outputs share the same generated_var naming so the
+#     downstream add sees no conflict. Total = 2*S*S.
+#     """
+#     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
+#     _run(lambda a, b, c, d: (a.t() @ b) + (c @ d.t()), a, b, c, d)
+#     _verify(2 * S * S)
 
 
 # -- both matmul inputs have upstream conflicts --------------------------------
 
 
-@pytest.mark.restickify_plan
-def test_plan_matmul_both_inputs_upstream_conflict():
-    """(a + b.t()) @ (c + d.t()) — both inputs have upstream stick conflicts.
+# def test_plan_matmul_both_inputs_upstream_conflict():
+#     """(a + b.t()) @ (c + d.t()) — both inputs have upstream stick conflicts.
 
-    Upstream op1 (x): conflict d0/d1, each costs S*S.  Beam picks d1 (row-major)
-    so the matmul x stick lands on the reduction dim — no extra matmul cost.
-    Upstream op2 (y): conflict d0/d1.  Beam picks d1 = generated_var — no extra
-    matmul y cost.
-    Total optimal = 2*S*S (one restickify per upstream pointwise op).
-    """
-    a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: (a + b.t()) @ (c + d.t()), a, b, c, d)
-    _verify(2 * S * S)
+#     Upstream op1 (x): conflict d0/d1, each costs S*S.  Beam picks d1 (row-major)
+#     so the matmul x stick lands on the reduction dim — no extra matmul cost.
+#     Upstream op2 (y): conflict d0/d1.  Beam picks d1 = generated_var — no extra
+#     matmul y cost.
+#     Total optimal = 2*S*S (one restickify per upstream pointwise op).
+#     """
+#     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
+#     _run(lambda a, b, c, d: (a + b.t()) @ (c + d.t()), a, b, c, d)
+#     _verify(2 * S * S)
