@@ -325,6 +325,19 @@ def pointwise_layout(
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
         out_coords = host_coordinates(output, output_dep)
 
+        print ()
+        print ("MRA: Pointwise aten op:", aten_op)
+        oc = host_coordinates(output, output_dep)
+        for arg in args:
+            ic = host_coordinates(arg.layout, arg.dep)
+            idc = device_coordinates(arg.layout, arg.dep)
+            print ("MRA:", arg)
+            print ("MRA IC:", ic)
+            print ("MRA IDC:", idc)
+            se = idc[-1]
+            print ("MRA: Stick Expr:", se)
+            print ("MRA: Stick Dim: ", matching_dim(ic, se))
+        print ("MRA OC:", oc)
 
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
@@ -338,13 +351,21 @@ def pointwise_layout(
         if len(stick_exprs) > 1:
             # This is a legal PyTorch operation that requires inserting restickify operations.
             logger.warning(
-                f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
+                f"MRA2: Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
             )
-            # Use the planned stick expr if available, otherwise fall back to arg[0].
-            # guidance values are device stick exprs (e.g. Mod(d1, 64)) from the
-            # first stickify pass — direct comparison against idc[-1] is valid.
-            guided = guidance.get(op.get_name()) if guidance else None
-            stick_expr = in_device_coords[0][-1] if guided is None else guided
+            # guidance[op_name] is the winning input buffer name (kernel-independent).
+            # Re-derive its stick expr via device_coordinates in *this* kernel's namespace.
+            guided_name = guidance.get(op.get_name()) if guidance else None
+            if guided_name is not None:
+                guided_arg = next((a for a in args if a.dep.name == guided_name), None)
+                if guided_arg is not None:
+                    guided_idx = args.index(guided_arg)
+                    stick_expr = in_device_coords[guided_idx][-1]
+                else:
+                    stick_expr = in_device_coords[0][-1]
+            else:
+                stick_expr = in_device_coords[0][-1]
+
             # Restickify every arg whose stick doesn't match — iterate ALL args,
             # not just [1:], since the planned winner may not be arg[0].
             for ic, idc, arg in zip(in_coords, in_device_coords, args):
@@ -371,6 +392,13 @@ def pointwise_layout(
                 template_stl.stride_map,
                 get_device_dtype(output.dtype),
             )
+
+            maybe_stick_dim = matching_dim(out_coords, stick_expr)
+            out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
+
+            print ("MRA: Same Layout stick dim:", out_stick_dim)
+
+
         else:
             # Use row major adjusted to put stick dimension last
             # and move all non-stick size one dimensions to the right to avoid tiling them.
@@ -380,6 +408,8 @@ def pointwise_layout(
             else:
                 maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
+
+            print ("MRA: Computed out stick dim:", out_stick_dim)
 
             dim_order = [
                 d
@@ -634,7 +664,7 @@ def propagate_spyre_tensor_layouts(
             for entry in entries
         )
         logger.warning(
-            f"restickify plan: {n_restickifies} restickif{'y' if n_restickifies == 1 else 'ies'}, "
+            f"MRA2: restickify plan: {n_restickifies} restickif{'y' if n_restickifies == 1 else 'ies'}, "
             f"{total_elements} total elements"
         )
     V.graph.restickify_plan = restickify_plan

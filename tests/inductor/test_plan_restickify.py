@@ -321,6 +321,26 @@ def test_plan_sum_passthrough():
     _verify(S * S)
 
 
+# -- chained ops where intermediate is consumed transposed --------------------
+
+
+def test_plan_chain_transposed_intermediate():
+    """(a.t() + b).t() + c — intermediate buf0 is consumed transposed by buf1.
+
+    buf0 = a.t() + b: conflict. Planner picks the stick that gives buf0 a
+    row-major layout so that when buf1 reads buf0 transposed, the stick aligns
+    with arg2's stick — no second conflict.
+    Total optimal cost = S*S (one restickify for a.t() in buf0's kernel).
+
+    Catches: namespace bug where pruned_state stores kernel-local sympy exprs
+    and fails to predict that buf0's stick, as seen in buf1's kernel (transposed
+    access), conflicts with arg2's stick.
+    """
+    a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
+    _run(lambda a, b, c: (a.t() + b).t() + c, a, b, c)
+    _verify(S * S)
+
+
 # -- two matmuls with wrong inputs added together -----------------------------
 
 
