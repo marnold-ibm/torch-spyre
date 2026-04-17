@@ -29,6 +29,7 @@ from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
 S = 128  # must be a multiple of 64
+T = 64   # side length for 4D tests (all dims equal)
 
 
 @pytest.fixture(autouse=True)
@@ -339,6 +340,49 @@ def test_plan_chain_transposed_intermediate():
     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
     _run(lambda a, b, c: (a.t() + b).t() + c, a, b, c)
     _verify(S * S)
+
+
+# -- 4D tensors: stick on varying dims via transpose(k,3) --------------------
+
+
+def test_plan_4d_one_conflict():
+    """a.transpose(0,3) + b + c + d — one input with stick on dim 0, rest on dim 3."""
+    a, b, c, d = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(4)]
+    _run(lambda a, b, c, d: a.transpose(0, 3) + b + c + d, a, b, c, d)
+    _verify(T**4)
+
+
+def test_plan_4d_mixed_conflicts():
+    """a.transpose(0,3) + b.transpose(1,3) + c.transpose(2,3) + d — each input has stick on a different dim.
+
+    Three inputs have non-matching sticks; optimal picks one and restickifies the other three.
+    Cost = 3 * T**4.
+    """
+    a, b, c, d = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(4)]
+    _run(lambda a, b, c, d: a.transpose(0, 3) + b.transpose(1, 3) + c.transpose(2, 3) + d, a, b, c, d)
+    _verify(3 * T**4)
+
+
+def test_plan_4d_majority_wins():
+    """a.transpose(0,3) + b.transpose(0,3) + c.transpose(0,3) + d — three stick on dim 0, one on dim 3.
+
+    Optimal: keep stick on dim 0, restickify d. Cost = T**4.
+    """
+    a, b, c, d = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(4)]
+    _run(lambda a, b, c, d: a.transpose(0, 3) + b.transpose(0, 3) + c.transpose(0, 3) + d, a, b, c, d)
+    _verify(T**4)
+
+
+def test_plan_4d_chain_transposed_intermediate():
+    """(a.transpose(2,3) + b).transpose(2,3) + c — 4D version of the namespace bug test.
+
+    buf0 = a.transpose(2,3) + b: conflict, stick chosen to avoid restickifying buf0 downstream.
+    buf1 reads buf0 transposed back; planner must propagate buf0's output layout correctly.
+    Optimal cost = T**4 (one restickify for a.transpose(2,3) in buf0's kernel).
+    """
+    a, b, c = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(3)]
+    _run(lambda a, b, c: (a.transpose(2, 3) + b).transpose(2, 3) + c, a, b, c)
+    _verify(T**4)
 
 
 # -- two matmuls with wrong inputs added together -----------------------------
