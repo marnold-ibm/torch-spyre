@@ -36,6 +36,7 @@ from .temp_passes import (
     replace_scalar_with_tensor,
 )
 from . import config
+from .plan_restickify import plan_restickify
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
 from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
@@ -221,6 +222,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        guidance = plan_restickify(operations)
+        propagate_spyre_tensor_layouts(operations, guidance)
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:

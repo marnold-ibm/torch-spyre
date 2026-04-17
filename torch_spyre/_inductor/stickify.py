@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import logging
-from typing import Any
+import math
+import os
+from typing import Any, Optional
 
 
 import sympy
@@ -54,6 +56,9 @@ from .pass_utils import (
 from .views import matching_dim
 
 logger = get_inductor_logger("stickify")
+
+# Set by propagate_spyre_tensor_layouts after each compilation — readable from tests.
+last_restickify_plan: dict[str, list[dict[str, Any]]] = {}
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -228,6 +233,7 @@ def pointwise_layout(
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
     restickify_plan: dict[str, list[dict[str, Any]]],
+    guidance: Optional[dict] = None,
 ) -> FixedTiledLayout:
     data = op.data
     origin_node = next(iter(data.origins))
@@ -319,6 +325,7 @@ def pointwise_layout(
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
         out_coords = host_coordinates(output, output_dep)
 
+
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
         # the indexing expression must be identical.
@@ -333,14 +340,15 @@ def pointwise_layout(
             logger.warning(
                 f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
             )
-            # Arbitrary choice: let arg[0] define the stick variable and restickify all
-            # others that have a conflict.
-            stick_expr = in_device_coords[0][-1]
-            assert stick_expr != 0, (
-                "Expected arg 0 to have non-zero stick indexing expression"
-            )
-            for ic, idc, arg in zip(in_coords[1:], in_device_coords[1:], args[1:]):
-                if idc[-1] != stick_expr:
+            # Use the planned stick expr if available, otherwise fall back to arg[0].
+            # guidance values are device stick exprs (e.g. Mod(d1, 64)) from the
+            # first stickify pass — direct comparison against idc[-1] is valid.
+            guided = guidance.get(op.get_name()) if guidance else None
+            stick_expr = in_device_coords[0][-1] if guided is None else guided
+            # Restickify every arg whose stick doesn't match — iterate ALL args,
+            # not just [1:], since the planned winner may not be arg[0].
+            for ic, idc, arg in zip(in_coords, in_device_coords, args):
+                if idc[-1] != 0 and idc[-1] != stick_expr:
                     schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
 
         # If the indexing and device element size are identical
@@ -542,19 +550,14 @@ def generic_layout(op: Operation) -> FixedTiledLayout:
 
 def propagate_spyre_tensor_layouts(
     operations: list[Operation],
+    guidance: Optional[dict] = None,
 ) -> None:
-    # Convert InputBuffers from FixedLayout to FixedTiledLayouts
+    # Convert InputBuffers from FixedLayout to FixedTiledLayouts.
+    # Guard against double-conversion on the second pass (FixedTiledLayout is
+    # a subclass of FixedLayout, so the isinstance check alone is insufficient).
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
-                stl = real_input.device_tensor_layout()
-                if stl is None:
-                    # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputs to have them.
-                    raise Unsupported(
-                        f"missing device_tensor_layout on graph input {name}"
-                    )
-
                 tb = V.graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
@@ -565,6 +568,15 @@ def propagate_spyre_tensor_layouts(
                         "graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
                     )
                 ptl = tb.data.data.layout
+                if isinstance(ptl, FixedTiledLayout):
+                    continue  # already converted on a prior pass
+                stl = real_input.device_tensor_layout()
+                if stl is None:
+                    # All spyre tensors are created with device layouts.
+                    # Therefore we expect all graph inputs to have them.
+                    raise Unsupported(
+                        f"missing device_tensor_layout on graph input {name}"
+                    )
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported("graph input {name} does not have a FixedLayout")
                 tb.data.data.layout = FixedTiledLayout(
@@ -596,7 +608,7 @@ def propagate_spyre_tensor_layouts(
             output = op.get_layout()
             if isinstance(op.data, Pointwise):
                 op.layout = pointwise_layout(
-                    op, output, output_dep, args, restickify_plan
+                    op, output, output_dep, args, restickify_plan, guidance
                 )
             elif isinstance(op.data, Reduction):
                 op.layout = reduction_layout(
@@ -614,7 +626,21 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 
+    if restickify_plan:
+        n_restickifies = sum(len(v) for v in restickify_plan.values())
+        total_elements = sum(
+            math.prod(int(s) for s in entry["target_layout"].size)
+            for entries in restickify_plan.values()
+            for entry in entries
+        )
+        logger.warning(
+            f"restickify plan: {n_restickifies} restickif{'y' if n_restickifies == 1 else 'ies'}, "
+            f"{total_elements} total elements"
+        )
     V.graph.restickify_plan = restickify_plan
+    if os.getenv("SPYRE_CAPTURE_RESTICKIFY_PLAN"):
+        global last_restickify_plan
+        last_restickify_plan = restickify_plan
 
 
 def propagate_mutation_layouts(
