@@ -15,6 +15,7 @@
 import inspect
 import io
 import logging
+import os
 from typing import Optional, Any, Callable, List
 from abc import abstractmethod
 
@@ -221,9 +222,12 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
-        propagate_spyre_tensor_layouts(operations)
-        guidance = plan_restickify(operations)
-        propagate_spyre_tensor_layouts(operations, guidance)
+        if os.getenv("DISABLE_OPTIMIZE_RESTICKIFY"):
+            propagate_spyre_tensor_layouts(operations)
+        else:
+            propagate_spyre_tensor_layouts(operations, dry_run=True)
+            guidance = plan_restickify(operations)
+            propagate_spyre_tensor_layouts(operations, guidance)
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:

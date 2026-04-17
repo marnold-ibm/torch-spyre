@@ -134,6 +134,8 @@ def _pointwise_output_layout(
     # host_coordinates only needs layout.size and layout.stride — both available
     # on FixedLayout (the output's pre-device-assignment layout).
     out_coords = host_coordinates(layout, out_dep)
+    if chosen_expr is None or not chosen_expr.free_symbols:
+        return None
     out_stick_dim = matching_dim(out_coords, chosen_expr)
     if out_stick_dim is None:
         out_stick_dim = -1

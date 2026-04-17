@@ -234,6 +234,7 @@ def pointwise_layout(
     args: list[SchedNodeArg],
     restickify_plan: dict[str, list[dict[str, Any]]],
     guidance: Optional[dict] = None,
+    dry_run: bool = False,
 ) -> FixedTiledLayout:
     data = op.data
     origin_node = next(iter(data.origins))
@@ -349,10 +350,10 @@ def pointwise_layout(
         stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
         if len(stick_exprs) > 1:
-            # This is a legal PyTorch operation that requires inserting restickify operations.
-            logger.warning(
-                f"MRA2: Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
-            )
+            if not dry_run:
+                logger.warning(
+                    f"MRA2: Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
+                )
             # guidance[op_name] is the winning input buffer name (kernel-independent).
             # Re-derive its stick expr via device_coordinates in *this* kernel's namespace.
             guided_name = guidance.get(op.get_name()) if guidance else None
@@ -393,10 +394,6 @@ def pointwise_layout(
                 get_device_dtype(output.dtype),
             )
 
-            maybe_stick_dim = matching_dim(out_coords, stick_expr)
-            out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
-
-            print ("MRA: Same Layout stick dim:", out_stick_dim)
 
 
         else:
@@ -581,6 +578,7 @@ def generic_layout(op: Operation) -> FixedTiledLayout:
 def propagate_spyre_tensor_layouts(
     operations: list[Operation],
     guidance: Optional[dict] = None,
+    dry_run: bool = False,
 ) -> None:
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts.
     # Guard against double-conversion on the second pass (FixedTiledLayout is
@@ -638,7 +636,7 @@ def propagate_spyre_tensor_layouts(
             output = op.get_layout()
             if isinstance(op.data, Pointwise):
                 op.layout = pointwise_layout(
-                    op, output, output_dep, args, restickify_plan, guidance
+                    op, output, output_dep, args, restickify_plan, guidance, dry_run
                 )
             elif isinstance(op.data, Reduction):
                 op.layout = reduction_layout(
@@ -656,7 +654,7 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 
-    if restickify_plan:
+    if restickify_plan and not dry_run:
         n_restickifies = sum(len(v) for v in restickify_plan.values())
         total_elements = sum(
             math.prod(int(s) for s in entry["target_layout"].size)
