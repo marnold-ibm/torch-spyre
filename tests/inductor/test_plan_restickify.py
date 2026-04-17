@@ -68,28 +68,28 @@ def _verify(expected_cost):
 def test_plan_at_b_c_d():
     """a.t() + b + c + d — one restickify of a.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.t() + b + c + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a.t() + b + c + d).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
 def test_plan_a_bt_c_d():
     """a + b.t() + c + d — one restickify of b.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a + b.t() + c + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a + b.t() + c + d).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
 def test_plan_a_b_ct_d():
     """a + b + c.t() + d — one restickify of c.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a + b + c.t() + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a + b + c.t() + d).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
 def test_plan_a_b_c_dt():
     """a + b + c + d.t() — one restickify of d.t()."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a + b + c + d.t(), a, b, c, d)
+    _run(lambda a, b, c, d: (a + b + c + d.t()).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
@@ -99,28 +99,28 @@ def test_plan_a_b_c_dt():
 def test_plan_a_bt_ct_dt():
     """a + b.t() + c.t() + d.t() — one restickify of a."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a + b.t() + c.t() + d.t(), a, b, c, d)
+    _run(lambda a, b, c, d: (a + b.t() + c.t() + d.t()).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
 def test_plan_at_b_ct_dt():
     """a.t() + b + c.t() + d.t() — one restickify of b."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.t() + b + c.t() + d.t(), a, b, c, d)
+    _run(lambda a, b, c, d: (a.t() + b + c.t() + d.t()).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
 def test_plan_at_bt_c_dt():
     """a.t() + b.t() + c + d.t() — one restickify of c."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.t() + b.t() + c + d.t(), a, b, c, d)
+    _run(lambda a, b, c, d: (a.t() + b.t() + c + d.t()).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
 def test_plan_at_bt_ct_d():
     """a.t() + b.t() + c.t() + d — one restickify of d."""
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.t() + b.t() + c.t() + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a.t() + b.t() + c.t() + d).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
@@ -130,7 +130,7 @@ def test_plan_at_bt_ct_d():
 def test_plan_parens_one_conflict():
     """((a + b) + (c.t() + d)) + (e + f) — conflict only in inner group."""
     a, b, c, d, e, f = [torch.randn((S, S), dtype=torch.float16) for _ in range(6)]
-    _run(lambda a, b, c, d, e, f: ((a + b) + (c.t() + d)) + (e + f), a, b, c, d, e, f)
+    _run(lambda a, b, c, d, e, f: (((a + b) + (c.t() + d)) + (e + f)).contiguous(), a, b, c, d, e, f)
     _verify(S * S)
 
 
@@ -140,21 +140,21 @@ def test_plan_parens_one_conflict():
 def test_plan_matmul_no_cost():
     """a @ b — both inputs satisfy matmul stick constraints, cost = 0."""
     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
-    _run(lambda a, b: a @ b, a, b)
+    _run(lambda a, b: (a @ b).contiguous(), a, b)
     _verify(0)
 
 
 def test_plan_matmul_x_wrong_stick():
     """a.t() @ b — x input needs restickify to move stick to reduction dim."""
     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
-    _run(lambda a, b: a.t() @ b, a, b)
+    _run(lambda a, b: (a.t() @ b).contiguous(), a, b)
     _verify(S * S)
 
 
 def test_plan_matmul_y_wrong_stick():
     """a @ b.t() — y input needs restickify to move stick to generated dim."""
     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
-    _run(lambda a, b: a @ b.t(), a, b)
+    _run(lambda a, b: (a @ b.t()).contiguous(), a, b)
     _verify(S * S)
 
 
@@ -165,7 +165,7 @@ def test_plan_adds_then_matmul_x():
     Total = 2*S*S.
     """
     a, b, c, d, e = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
-    _run(lambda a, b, c, d, e: (a + b.t() + c.t() + d.t()) @ e, a, b, c, d, e)
+    _run(lambda a, b, c, d, e: ((a + b.t() + c.t() + d.t()) @ e).contiguous(), a, b, c, d, e)
     _verify(2 * S * S)
 
 
@@ -176,7 +176,7 @@ def test_plan_adds_then_matmul_y():
     With K=1 greedy may pick d0 upstream, paying extra S*S at the matmul.
     """
     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: a @ (b + c.t()), a, b, c)
+    _run(lambda a, b, c: (a @ (b + c.t())).contiguous(), a, b, c)
     _verify(S * S)
 
 
@@ -186,7 +186,7 @@ def test_plan_adds_then_matmul_y_long_chain():
     Matmul y needs d1 → forced extra S*S. Total = 2*S*S.
     """
     a, b, c, d, e = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
-    _run(lambda a, b, c, d, e: a @ (b + c.t() + d.t() + e.t()), a, b, c, d, e)
+    _run(lambda a, b, c, d, e: (a @ (b + c.t() + d.t() + e.t())).contiguous(), a, b, c, d, e)
     _verify(2 * S * S)
 
 
@@ -195,7 +195,7 @@ def test_plan_matmul_x_and_y_conflict():
     Beam picks d1 for y (no extra matmul cost). Total = 2*S*S.
     """
     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: a.t() @ (b + c.t()), a, b, c)
+    _run(lambda a, b, c: (a.t() @ (b + c.t())).contiguous(), a, b, c)
     _verify(2 * S * S)
 
 
@@ -205,7 +205,7 @@ def test_plan_matmul_then_adds():
     output's stick, so c.t() is restickified. Total = S*S.
     """
     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: (a @ b) + c.t(), a, b, c)
+    _run(lambda a, b, c: ((a @ b) + c.t()).contiguous(), a, b, c)
     _verify(S * S)
 
 
@@ -214,7 +214,7 @@ def test_plan_matmul_then_long_adds():
     Optimal: keep d1, restickify c.t() once. Total = S*S.
     """
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: (a @ b) + c.t() + d.t(), a, b, c, d)
+    _run(lambda a, b, c, d: ((a @ b) + c.t() + d.t()).contiguous(), a, b, c, d)
     _verify(S * S)
 
 
@@ -225,7 +225,7 @@ def test_plan_chained_matmuls():
     Both the plan cost and actual restickify count are 0.
     """
     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: (a @ b) @ c, a, b, c)
+    _run(lambda a, b, c: ((a @ b) @ c).contiguous(), a, b, c)
     _verify(0)
 
 
@@ -241,7 +241,7 @@ def test_plan_two_independent_conflicts():
     Total = 2*S*S.
     """
     a, b, e, f, g = [torch.randn((S, S), dtype=torch.float16) for _ in range(5)]
-    _run(lambda a, b, e, f, g: (a + b.t()) + (e.t() + f.t() + g), a, b, e, f, g)
+    _run(lambda a, b, e, f, g: ((a + b.t()) + (e.t() + f.t() + g)).contiguous(), a, b, e, f, g)
     _verify(2 * S * S)
 
 
@@ -261,7 +261,7 @@ def test_plan_fanout_intermediate():
 
     def fn(a, b, c, d):
         buf = a + b.t()
-        return buf + c + (buf + d.t())
+        return (buf + c + (buf + d.t())).contiguous()
 
     _run(fn, a, b, c, d)
     _verify(2 * S * S)
@@ -282,7 +282,7 @@ def test_plan_diamond():
 
     def fn(a, b):
         buf = a + b.t()
-        return buf + buf
+        return (buf + buf).contiguous()
 
     _run(fn, a, b)
     _verify(S * S)
@@ -301,7 +301,7 @@ def test_plan_matmul_rect_x_wrong_stick():
     M, K, N = 64, 128, 192
     a = torch.randn((M, K), dtype=torch.float16)
     b = torch.randn((M, N), dtype=torch.float16)
-    _run(lambda a, b: a.t() @ b, a, b)
+    _run(lambda a, b: (a.t() @ b).contiguous(), a, b)
     _verify(M * K)
 
 
@@ -318,7 +318,7 @@ def test_plan_sum_passthrough():
     """
     a, b = [torch.randn((S, S), dtype=torch.float16) for _ in range(2)]
     c = torch.randn((S,), dtype=torch.float16)
-    _run(lambda a, b, c: (a + b.t()).sum(0) + c, a, b, c)
+    _run(lambda a, b, c: ((a + b.t()).sum(0) + c).contiguous(), a, b, c)
     _verify(S * S)
 
 
@@ -338,7 +338,7 @@ def test_plan_chain_transposed_intermediate():
     access), conflicts with arg2's stick.
     """
     a, b, c = [torch.randn((S, S), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: (a.t() + b).t() + c, a, b, c)
+    _run(lambda a, b, c: ((a.t() + b).t() + c).contiguous(), a, b, c)
     _verify(S * S)
 
 
@@ -348,7 +348,7 @@ def test_plan_chain_transposed_intermediate():
 def test_plan_4d_one_conflict():
     """a.transpose(0,3) + b + c + d — one input with stick on dim 0, rest on dim 3."""
     a, b, c, d = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.transpose(0, 3) + b + c + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a.transpose(0, 3) + b + c + d).contiguous(), a, b, c, d)
     _verify(T**4)
 
 
@@ -359,7 +359,7 @@ def test_plan_4d_mixed_conflicts():
     Cost = 3 * T**4.
     """
     a, b, c, d = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.transpose(0, 3) + b.transpose(1, 3) + c.transpose(2, 3) + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a.transpose(0, 3) + b.transpose(1, 3) + c.transpose(2, 3) + d).contiguous(), a, b, c, d)
     _verify(3 * T**4)
 
 
@@ -369,7 +369,7 @@ def test_plan_4d_majority_wins():
     Optimal: keep stick on dim 0, restickify d. Cost = T**4.
     """
     a, b, c, d = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: a.transpose(0, 3) + b.transpose(0, 3) + c.transpose(0, 3) + d, a, b, c, d)
+    _run(lambda a, b, c, d: (a.transpose(0, 3) + b.transpose(0, 3) + c.transpose(0, 3) + d).contiguous(), a, b, c, d)
     _verify(T**4)
 
 
@@ -381,7 +381,7 @@ def test_plan_4d_chain_transposed_intermediate():
     Optimal cost = T**4 (one restickify for a.transpose(2,3) in buf0's kernel).
     """
     a, b, c = [torch.randn((T, T, T, T), dtype=torch.float16) for _ in range(3)]
-    _run(lambda a, b, c: (a.transpose(2, 3) + b).transpose(2, 3) + c, a, b, c)
+    _run(lambda a, b, c: ((a.transpose(2, 3) + b).transpose(2, 3) + c).contiguous(), a, b, c)
     _verify(T**4)
 
 
@@ -396,7 +396,7 @@ def test_plan_two_matmuls_wrong_inputs():
     downstream add sees no conflict. Total = 2*S*S.
     """
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: (a.t() @ b) + (c @ d.t()), a, b, c, d)
+    _run(lambda a, b, c, d: ((a.t() @ b) + (c @ d.t())).contiguous(), a, b, c, d)
     _verify(2 * S * S)
 
 
@@ -413,5 +413,5 @@ def test_plan_matmul_both_inputs_upstream_conflict():
     Total optimal = 2*S*S (one restickify per upstream pointwise op).
     """
     a, b, c, d = [torch.randn((S, S), dtype=torch.float16) for _ in range(4)]
-    _run(lambda a, b, c, d: (a + b.t()) @ (c + d.t()), a, b, c, d)
+    _run(lambda a, b, c, d: ((a + b.t()) @ (c + d.t())).contiguous(), a, b, c, d)
     _verify(2 * S * S)
