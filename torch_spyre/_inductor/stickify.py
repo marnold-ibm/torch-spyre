@@ -354,24 +354,16 @@ def pointwise_layout(
                 logger.warning(
                     f"MRA2: Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
                 )
-            # guidance[op_name] is the winning input buffer name (kernel-independent).
-            # Re-derive its stick expr via device_coordinates in *this* kernel's namespace.
             guided_name = guidance.get(op.get_name()) if guidance else None
             if guided_name is not None:
                 guided_arg = next((a for a in args if a.dep.name == guided_name), None)
-                if guided_arg is not None:
-                    guided_idx = args.index(guided_arg)
-                    stick_expr = in_device_coords[guided_idx][-1]
-                    # Winner may not be arg[0] — iterate all args.
-                    for ic, idc, arg in zip(in_coords, in_device_coords, args):
-                        if idc[-1] != 0 and idc[-1] != stick_expr:
-                            schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
-                else:
-                    stick_expr = in_device_coords[0][-1]
-                    for ic, idc, arg in zip(in_coords[1:], in_device_coords[1:], args[1:]):
-                        if idc[-1] != stick_expr:
-                            schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
+                winner_idx = args.index(guided_arg) if guided_arg is not None else 0
+                stick_expr = in_device_coords[winner_idx][-1]
+                for ic, idc, arg in zip(in_coords, in_device_coords, args):
+                    if idc[-1] != 0 and idc[-1] != stick_expr:
+                        schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
             else:
+                # No guidance: identical to main — arg[0] wins, restickify args[1:].
                 stick_expr = in_device_coords[0][-1]
                 assert stick_expr != 0, (
                     "Expected arg 0 to have non-zero stick indexing expression"

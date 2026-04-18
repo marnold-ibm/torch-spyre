@@ -30,6 +30,14 @@ from utils_inductor import _compile_and_run, compare_with_cpu
 DEVICE = torch.device("spyre")
 
 
+@pytest.fixture(autouse=True)
+def disable_inductor_cache(monkeypatch):
+    import torch._inductor.config as inductor_config
+    monkeypatch.setattr(inductor_config, "force_disable_caches", True)
+    yield
+    torch._dynamo.reset_code_caches()
+
+
 def _compare(fn, *args, check_strides=True):
     spyre_result = _compile_and_run(fn, args, DEVICE)
     compare_with_cpu(fn, *args, target=spyre_result, run_eager=False)
