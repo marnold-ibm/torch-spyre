@@ -362,16 +362,23 @@ def pointwise_layout(
                 if guided_arg is not None:
                     guided_idx = args.index(guided_arg)
                     stick_expr = in_device_coords[guided_idx][-1]
+                    # Winner may not be arg[0] — iterate all args.
+                    for ic, idc, arg in zip(in_coords, in_device_coords, args):
+                        if idc[-1] != 0 and idc[-1] != stick_expr:
+                            schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
                 else:
                     stick_expr = in_device_coords[0][-1]
+                    for ic, idc, arg in zip(in_coords[1:], in_device_coords[1:], args[1:]):
+                        if idc[-1] != stick_expr:
+                            schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
             else:
                 stick_expr = in_device_coords[0][-1]
-
-            # Restickify every arg whose stick doesn't match — iterate ALL args,
-            # not just [1:], since the planned winner may not be arg[0].
-            for ic, idc, arg in zip(in_coords, in_device_coords, args):
-                if idc[-1] != 0 and idc[-1] != stick_expr:
-                    schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
+                assert stick_expr != 0, (
+                    "Expected arg 0 to have non-zero stick indexing expression"
+                )
+                for ic, idc, arg in zip(in_coords[1:], in_device_coords[1:], args[1:]):
+                    if idc[-1] != stick_expr:
+                        schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
