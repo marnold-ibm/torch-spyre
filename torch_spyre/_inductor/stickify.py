@@ -326,20 +326,6 @@ def pointwise_layout(
         in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
         out_coords = host_coordinates(output, output_dep)
 
-        print ()
-        print ("MRA: Pointwise aten op:", aten_op)
-        oc = host_coordinates(output, output_dep)
-        for arg in args:
-            ic = host_coordinates(arg.layout, arg.dep)
-            idc = device_coordinates(arg.layout, arg.dep)
-            print ("MRA:", arg)
-            print ("MRA IC:", ic)
-            print ("MRA IDC:", idc)
-            se = idc[-1]
-            print ("MRA: Stick Expr:", se)
-            print ("MRA: Stick Dim: ", matching_dim(ic, se))
-        print ("MRA OC:", oc)
-
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
         # the indexing expression must be identical.
@@ -352,7 +338,7 @@ def pointwise_layout(
         if len(stick_exprs) > 1:
             if not dry_run:
                 logger.warning(
-                    f"MRA2: Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
+                    f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
                 )
             guided_name = guidance.get(op.get_name()) if guidance else None
             if guided_name is not None:
@@ -405,8 +391,6 @@ def pointwise_layout(
                 maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
 
-            print ("MRA: Computed out stick dim:", out_stick_dim)
-
             dim_order = [
                 d
                 for d in range(len(output.size))
@@ -418,7 +402,6 @@ def pointwise_layout(
                 if d != out_stick_dim and out_coords[d] == 0
             ]
             dim_order += [out_stick_dim]
-            print(f"MRA: dim_order={dim_order} output.size={list(output.size)} output.stride={list(output.stride)} stick_expr={stick_expr}")
             stl = SpyreTensorLayout(output.size, output.stride, output.dtype, dim_order)
 
         result = FixedTiledLayout(
@@ -580,37 +563,7 @@ def propagate_spyre_tensor_layouts(
     guidance: Optional[dict] = None,
     dry_run: bool = False,
 ) -> None:
-    # Convert InputBuffers from FixedLayout to FixedTiledLayouts.
-    # Guard against double-conversion on the second pass (FixedTiledLayout is
-    # a subclass of FixedLayout, so the isinstance check alone is insufficient).
-    if len(V.graph.graph_input_names) > 0:
-        for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
-            if isinstance(real_input, torch.Tensor):
-                tb = V.graph.graph_inputs[name]
-                if (
-                    not isinstance(tb, TensorBox)
-                    or not isinstance(tb.data, StorageBox)
-                    or not isinstance(tb.data.data, InputBuffer)
-                ):
-                    raise Unsupported(
-                        "graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
-                    )
-                ptl = tb.data.data.layout
-                if isinstance(ptl, FixedTiledLayout):
-                    continue  # already converted on a prior pass
-                stl = real_input.device_tensor_layout()
-                if stl is None:
-                    # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputs to have them.
-                    raise Unsupported(
-                        f"missing device_tensor_layout on graph input {name}"
-                    )
-                if not isinstance(ptl, FixedLayout):
-                    raise Unsupported("graph input {name} does not have a FixedLayout")
-                tb.data.data.layout = FixedTiledLayout(
-                    ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
-                )
-
+    
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed to convert each output FixedLayout to a FixedTiledLayout.
@@ -662,7 +615,7 @@ def propagate_spyre_tensor_layouts(
             for entry in entries
         )
         logger.warning(
-            f"MRA2: restickify plan: {n_restickifies} restickif{'y' if n_restickifies == 1 else 'ies'}, "
+            f"restickify plan: {n_restickifies} restickif{'y' if n_restickifies == 1 else 'ies'}, "
             f"{total_elements} total elements"
         )
     V.graph.restickify_plan = restickify_plan

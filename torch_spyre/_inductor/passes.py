@@ -222,12 +222,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
-        if os.getenv("DISABLE_OPTIMIZE_RESTICKIFY"):
-            propagate_spyre_tensor_layouts(operations)
-        else:
-            propagate_spyre_tensor_layouts(operations, dry_run=True)
-            guidance = plan_restickify(operations)
-            propagate_spyre_tensor_layouts(operations, guidance)
+        guidance = plan_restickify(operations)
+        propagate_spyre_tensor_layouts(operations, guidance=None)
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:
