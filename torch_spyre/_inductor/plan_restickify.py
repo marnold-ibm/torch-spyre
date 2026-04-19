@@ -214,7 +214,10 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                     se = _buf_stick(dep, layout) if layout is not None else None
                     resolved.append((dep.name, se, elems))
 
-                candidate_exprs = list({se for _, se, _ in resolved if se is not None})
+                candidate_exprs = sorted(
+                    {se for _, se, _ in resolved if se is not None},
+                    key=str,
+                )
 
                 if len(candidate_exprs) <= 1:
                     chosen_expr = candidate_exprs[0] if candidate_exprs else None

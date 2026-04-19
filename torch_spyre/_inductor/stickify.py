@@ -418,6 +418,7 @@ def pointwise_layout(
                 if d != out_stick_dim and out_coords[d] == 0
             ]
             dim_order += [out_stick_dim]
+            print(f"MRA: dim_order={dim_order} output.size={list(output.size)} output.stride={list(output.stride)} stick_expr={stick_expr}")
             stl = SpyreTensorLayout(output.size, output.stride, output.dtype, dim_order)
 
         result = FixedTiledLayout(
