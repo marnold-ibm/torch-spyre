@@ -168,7 +168,13 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                     print(f"  [plan]   no conflict, out_stick={out_stick} total={cost}")
                     new_frontier.append(({**state, op.get_name(): out_stick}, restickifies, cost))
                 else:
-                    for chosen_expr, chosen_dim in candidates.items():
+                    out_range_vars = list(out_dep.ranges.keys())
+                    for chosen_expr in candidates:
+                        # out_stick_dim: which output dim has chosen_expr as its loop variable.
+                        out_stick_dim = next(
+                            (j for j, v in enumerate(out_range_vars) if v in chosen_expr.free_symbols),
+                            None,
+                        )
                         new_restickifies = [
                             f"{dep.name}->{op.get_name()}"
                             for dep, sd, ic, _ in resolved
@@ -180,8 +186,8 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                             if sd is not None and ic[sd] != chosen_expr
                         )
                         total = cost + restickify_cost
-                        print(f"  [plan]   choice=dim{chosen_dim} restickify_cost={restickify_cost} total={total}")
-                        new_frontier.append(({**state, op.get_name(): chosen_dim}, restickifies + new_restickifies, total))
+                        print(f"  [plan]   choice={chosen_expr} out_stick_dim={out_stick_dim} restickify_cost={restickify_cost} total={total}")
+                        new_frontier.append(({**state, op.get_name(): out_stick_dim}, restickifies + new_restickifies, total))
 
             new_frontier.sort(key=lambda x: x[2])
             if len(new_frontier) > K and not _beam_pruned_warned:
