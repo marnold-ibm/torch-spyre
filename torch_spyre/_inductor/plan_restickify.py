@@ -248,6 +248,10 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                 for state, restickifies, cost in frontier
             ]
 
+        print(f"[plan] frontier after {op.get_name()}:")
+        for rank, (state, restickifies, cost) in enumerate(frontier):
+            print(f"  [{rank}] cost={cost} restickifies={restickifies} state={state}")
+
     return frontier
 
 
@@ -269,11 +273,10 @@ def plan_restickify(operations: list[Operation]) -> Optional[State]:
     if not frontier:
         return None
     best_state, best_restickifies, best_cost = frontier[0]
+    # Reconstruct where restickifies would be inserted for the best state.
     print(f"\n[plan] final frontier ({len(frontier)} states):")
     for rank, (state, restickifies, cost) in enumerate(frontier):
         print(f"  [{rank}] cost={cost} restickifies={restickifies} state={state}")
-    print(f"  [plan] best state: total_cost={best_cost}, restickifies={len(best_restickifies)}")
-    for r in best_restickifies:
-        print(f"    restickify: {r}")
+    print(f"  [plan] best: total_cost={best_cost}, restickifies={best_restickifies}")
     print(f"[plan] guidance: {best_state}")
     return best_state if best_state else None
