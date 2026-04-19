@@ -35,12 +35,13 @@ from .constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OP
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .pass_utils import host_coordinates
+from .pass_utils import host_coordinates, device_coordinates
+from .views import matching_dim
 
 logger = get_inductor_logger("plan_restickify")
 
-# A state maps buffer name -> chosen stick variable (or None for no-stick/scalar).
-State = dict[str, Optional[sympy.Symbol]]
+# A state maps buffer name -> chosen host stick dim index (int), or None for no-stick/scalar.
+State = dict[str, Optional[int]]
 # Each frontier entry carries:
 #   full_state  — never pruned; the complete choice history for this path (used as guidance)
 #   pruned_state — entries dropped after last use; used for lookups during beam search
@@ -84,15 +85,6 @@ def convert_input_layouts(operations: list[Operation]) -> None:
                 )
 
 
-def _stick_var(dep: MemoryDep) -> Optional[sympy.Symbol]:
-    """Return the loop variable with coefficient 1 in dep.index (the fastest-moving variable), or None."""
-    index = sympy.expand(dep.index)
-    for var in dep.ranges:
-        if sympy.diff(index, var) == 1:
-            return var
-    return None
-
-
 def _mem_deps(rw) -> list[MemoryDep]:
     return [d for d in rw.reads if isinstance(d, MemoryDep)]
 
@@ -102,10 +94,25 @@ def _buf_elems(name: str) -> int:
     return prod(int(s) for s in buf.get_layout().size) if buf is not None else 0
 
 
-def _planned_stick(
-    dep: MemoryDep, pruned: State
-) -> Optional[sympy.Symbol]:
-    return pruned[dep.name] if dep.name in pruned else _stick_var(dep)
+def _input_stick_dim(dep: MemoryDep) -> Optional[int]:
+    """Return the host stick dim index for a graph input (has FixedTiledLayout).
+
+    Returns None for intermediate buffers whose layout is not yet assigned.
+    """
+    buf = V.graph.get_buffer(dep.name)
+    if buf is None or not isinstance(buf.get_layout(), FixedTiledLayout):
+        return None
+    layout = buf.get_layout()
+    in_coords = host_coordinates(layout, dep)
+    dev_coords = device_coordinates(layout, dep)
+    return matching_dim(in_coords, dev_coords[-1])
+
+
+def _get_stick_dim(dep: MemoryDep, pruned: State) -> Optional[int]:
+    """Return the stick dim for dep: from propagated state if available, else from input layout."""
+    if dep.name in pruned:
+        return pruned[dep.name]
+    return _input_stick_dim(dep)
 
 
 def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) -> Frontier:
@@ -144,25 +151,40 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
             continue
 
         rw = op.get_read_writes()
-        args = [(dep, e) for dep in _mem_deps(rw) if (e := _buf_elems(dep.name)) > 0]
         out_dep = next(iter(rw.writes), None)
+
+        # For each read dep: compute host coords and elem count once (independent of frontier state).
+        reads = []
+        for dep in _mem_deps(rw):
+            buf = V.graph.get_buffer(dep.name)
+            in_coords = host_coordinates(buf.get_layout(), dep)
+            elems = _buf_elems(dep.name)
+            stick_dim = _input_stick_dim(dep)
+            print(f"  [plan]   arg={dep.name} in_coords={in_coords} stick_dim={stick_dim}")
+            reads.append((dep, in_coords, elems))
 
         if isinstance(op.data, Pointwise):
             print(f"[plan] op={op.get_name()} reads={[type(d).__name__ for d in rw.reads]}")
-            for dep, elems in args:
-                print(f"  [plan]   arg={dep.name} dep.index={dep.index} elems={elems}")
 
             new_frontier: Frontier = []
             for full, pruned, cost in frontier:
                 resolved = [
-                    (dep.name, _planned_stick(dep, pruned), elems)
-                    for dep, elems in args
+                    (dep, _get_stick_dim(dep, pruned), in_coords, elems)
+                    for dep, in_coords, elems in reads
                 ]
-                candidate_vars = list({sv for _, sv, _ in resolved if sv is not None})
-                print(f"  [plan]   candidate_vars={candidate_vars}")
 
-                if len(candidate_vars) <= 1:
-                    out_stick = candidate_vars[0] if candidate_vars else None
+                # Conflict detection: two inputs conflict if their stick coord expressions differ.
+                # Use in_coords[stick_dim] to get the expression for comparison.
+                # Map stick coord expr -> dim index; distinct exprs = distinct stick choices.
+                candidates = {
+                    ic[sd]: sd
+                    for _, sd, ic, _ in resolved
+                    if sd is not None
+                }
+                print(f"  [plan]   candidates={candidates}")
+
+                if len(candidates) <= 1:
+                    out_stick = next(iter(candidates.values()), None)
                     print(f"  [plan]   no conflict, out_stick={out_stick} total={cost}")
                     new_frontier.append((
                         {**full, op.get_name(): out_stick},
@@ -170,17 +192,17 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                         cost,
                     ))
                 else:
-                    for chosen_var in candidate_vars:
+                    for chosen_expr, chosen_dim in candidates.items():
                         restickify_cost = sum(
                             elems
-                            for _, sv, elems in resolved
-                            if sv is not None and sv != chosen_var
+                            for _, sd, ic, elems in resolved
+                            if sd is not None and ic[sd] != chosen_expr
                         )
                         total = cost + restickify_cost
-                        print(f"  [plan]   choice={chosen_var} restickify_cost={restickify_cost} total={total}")
+                        print(f"  [plan]   choice=dim{chosen_dim} restickify_cost={restickify_cost} total={total}")
                         new_frontier.append((
-                            {**full, op.get_name(): chosen_var},
-                            {**pruned, op.get_name(): chosen_var},
+                            {**full, op.get_name(): chosen_dim},
+                            {**pruned, op.get_name(): chosen_dim},
                             total,
                         ))
 
@@ -197,89 +219,57 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
             isinstance(op.data, Reduction)
             and op.data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
         ):
-            x_dep, y_dep = args[0][0], args[1][0]
+            (x_dep, x_coords, _), (y_dep, y_coords, _) = reads[0], reads[1]
 
-            # reduction_var: in x.ranges but not in out.ranges (the K dim)
-            # generated_var: last variable in out.ranges (the N/last-col dim)
-            reduction_var = next(
-                (v for v in x_dep.ranges if v not in out_dep.ranges), None
+            # x stick must be on the reduction dim: the x host dim that doesn't appear in out_dep.ranges.
+            x_reduction_dim = next(
+                (j for j, c in enumerate(x_coords)
+                 if len(c.free_symbols) > 0 and c.free_symbols.isdisjoint(out_dep.ranges)),
+                None,
             )
-            generated_var = next(reversed(list(out_dep.ranges.keys())), None)
+            # y stick (and output stick) must be on the generated dim: the y host dim whose
+            # loop var appears in out_dep.ranges but not in x_dep.ranges.
+            y_generated_dim = next(
+                (j for j, c in enumerate(y_coords)
+                 if len(c.free_symbols) > 0
+                 and not c.free_symbols.isdisjoint(out_dep.ranges)
+                 and c.free_symbols.isdisjoint(x_dep.ranges)),
+                None,
+            )
             print(
-                f"[plan] matmul {op.get_name()} reduction_var={reduction_var} generated_var={generated_var}"
+                f"[plan] matmul {op.get_name()} x_reduction_dim={x_reduction_dim} y_generated_dim={y_generated_dim}"
             )
-
-            def _col_var_of_buf(name: str) -> Optional[sympy.Symbol]:
-                """Return the stride-1 variable in this buffer's write dep (producer namespace).
-
-                Used to compare against pruned[name] without crossing kernel namespaces.
-                Returns None for graph inputs (not ComputedBuffers).
-                """
-                buf = V.graph.get_buffer(name)
-                if not isinstance(buf, ComputedBuffer):
-                    return None
-                buf_rw = buf.get_read_writes()
-                out_d = next(iter(buf_rw.writes), None)
-                return _stick_var(out_d) if out_d is not None else None
-
-            x_col_var = _col_var_of_buf(x_dep.name)
-            y_col_var = _col_var_of_buf(y_dep.name)
 
             new_frontier = []
             for full, pruned, cost in frontier:
-                x_planned = _planned_stick(x_dep, pruned)
-                y_planned = _planned_stick(y_dep, pruned)
+                x_planned = _get_stick_dim(x_dep, pruned)
+                y_planned = _get_stick_dim(y_dep, pruned)
 
-                # Determine whether each input needs a forced restickify.
-                #
-                # The challenge: pruned[name] is a sympy Symbol from the *producer*
-                # kernel's namespace, while reduction_var/generated_var are from the
-                # *consumer* (matmul) kernel's namespace.  Direct cross-kernel
-                # comparison is wrong — the symbols are different objects even when
-                # they represent the same logical dimension.
-                #
-                # _col_var_of_buf(name) bridges this by re-deriving the stride-1
-                # variable from the producer's own write dep (same namespace as
-                # pruned[name]).  Comparing pruned[name] against _col_var_of_buf(name)
-                # stays within one kernel's namespace and is sound.
-                #
-                # For graph inputs (col_var is None), _stick_var(dep) and
-                # reduction_var/generated_var are both computed from the matmul dep
-                # (consumer namespace), so direct comparison is valid.
-                if x_col_var is not None:
-                    x_needs_restickify = x_planned != x_col_var
-                else:
-                    x_needs_restickify = reduction_var is not None and x_planned != reduction_var
-
-                if y_col_var is not None:
-                    y_needs_restickify = y_planned != y_col_var
-                else:
-                    y_needs_restickify = generated_var is not None and y_planned != generated_var
+                x_needs_restickify = x_planned != x_reduction_dim
+                y_needs_restickify = y_planned != y_generated_dim
 
                 forced_cost = (
                     (_buf_elems(x_dep.name) if x_needs_restickify else 0)
                     + (_buf_elems(y_dep.name) if y_needs_restickify else 0)
                 )
-
                 print(
-                    f"  [plan]   x_stick={x_planned} y_stick={y_planned} forced_cost={forced_cost} total={cost + forced_cost}"
+                    f"  [plan]   x_stick=dim{x_planned} y_stick=dim{y_planned} forced_cost={forced_cost} total={cost + forced_cost}"
                 )
                 new_frontier.append((
-                    {**full, op.get_name(): generated_var},
-                    {**pruned, op.get_name(): generated_var},
+                    {**full, op.get_name(): y_generated_dim},
+                    {**pruned, op.get_name(): y_generated_dim},
                     cost + forced_cost,
                 ))
 
             frontier = sorted(new_frontier, key=lambda x: x[2])
 
         else:
-            # Other non-pointwise ops: output stick is fixed by op semantics, no cost.
-            out_stick = _stick_var(out_dep) if out_dep is not None else None
-            print(f"[plan] passthrough {op.get_name()} out_stick={out_stick}")
+            # Other non-pointwise ops: layout not yet assigned, propagate None.
+            print(f"[plan] passthrough {op.get_name()}")
             frontier = [
                 (
-                    {**full, op.get_name(): out_stick},
-                    {**pruned, op.get_name(): out_stick},
+                    {**full, op.get_name(): None},
+                    {**pruned, op.get_name(): None},
                     cost,
                 )
                 for full, pruned, cost in frontier
@@ -315,6 +305,8 @@ def plan_restickify(operations: list[Operation]) -> Optional[State]:
     best_full, _pruned, best_cost = frontier[0]
     # Reconstruct where restickifies would be inserted for the best state.
     print(f"\n[plan] final frontier ({len(frontier)} states):")
+    for rank, (full, _, cost) in enumerate(frontier):
+        print(f"  [{rank}] cost={cost} state={full}")
     restickifies = []
     for op in operations:
         if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
@@ -324,7 +316,7 @@ def plan_restickify(operations: list[Operation]) -> Optional[State]:
         for dep in rw.reads:
             if not isinstance(dep, MemoryDep):
                 continue
-            sv = best_full.get(dep.name) if dep.name in best_full else _stick_var(dep)
+            sv = best_full.get(dep.name) if dep.name in best_full else _input_stick_dim(dep)
             if sv is None:
                 continue
             if op_stick is not None and sv != op_stick:
