@@ -168,13 +168,9 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                     print(f"  [plan]   no conflict, out_stick={out_stick} total={cost}")
                     new_frontier.append(({**state, op.get_name(): out_stick}, restickifies, cost))
                 else:
-                    out_range_vars = list(out_dep.ranges.keys())
+                    out_coords = host_coordinates(op.get_layout(), out_dep)
                     for chosen_expr in candidates:
-                        # out_stick_dim: which output dim has chosen_expr as its loop variable.
-                        out_stick_dim = next(
-                            (j for j, v in enumerate(out_range_vars) if v in chosen_expr.free_symbols),
-                            None,
-                        )
+                        out_stick_dim = matching_dim(out_coords, chosen_expr)
                         new_restickifies = [
                             f"{dep.name}->{op.get_name()}"
                             for dep, sd, ic, _ in resolved
