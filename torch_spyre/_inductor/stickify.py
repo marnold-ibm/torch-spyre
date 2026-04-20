@@ -459,6 +459,11 @@ def reduction_layout(
                 f"{data.reduction_type}: failed to map stick_dims to host coords"
             )
 
+        print ("MRA: x_coords", x_coords)
+        print ("MRA: y_coords", y_coords)
+        print ("MRA: out_coords", out_coords)
+        print ("MRA: x_stick_dim", x_stick_dim, "y_stick_dim", y_stick_dim)
+
         # Hardware stick constraints (DF16):
         #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
         #   Input2 (y): stick on generated_dim (the y coord that appears in output)

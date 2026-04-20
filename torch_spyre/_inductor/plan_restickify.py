@@ -232,41 +232,26 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
             isinstance(op.data, Reduction)
             and op.data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
         ):
-            (x_dep, x_coords, _), (y_dep, y_coords, _) = reads[0], reads[1]
+            (x_dep, x_coords, x_elems), (y_dep, y_coords, y_elems) = reads[0], reads[1]
 
-            # x stick must be on the reduction dim: the x host dim that doesn't appear in out_dep.ranges.
-            x_reduction_dim = next(
-                (j for j, c in enumerate(x_coords)
-                 if len(c.free_symbols) > 0 and c.free_symbols.isdisjoint(out_dep.ranges)),
-                None,
-            )
-            # y stick (and output stick) must be on the generated dim: the y host dim whose
-            # loop var appears in out_dep.ranges but not in x_dep.ranges.
-            y_generated_dim = next(
-                (j for j, c in enumerate(y_coords)
-                 if len(c.free_symbols) > 0
-                 and not c.free_symbols.isdisjoint(out_dep.ranges)
-                 and c.free_symbols.isdisjoint(x_dep.ranges)),
-                None,
-            )
-            print(
-                f"[plan] matmul {op.get_name()} x_reduction_dim={x_reduction_dim} y_generated_dim={y_generated_dim}"
-            )
+            x_required = next(j for j, c in enumerate(x_coords) if c not in out_coords)
+            y_required = y_coords.index(out_coords[-1])
+            out_stick = len(out_coords) - 1
 
             for entry in frontier.entries:
                 state, _, _ = entry
                 x_planned = frontier.stick_dim(x_dep, state)
                 y_planned = frontier.stick_dim(y_dep, state)
                 needs_restick = (
-                    ([f"{x_dep.name}->{op.get_name()}"] if x_planned != x_reduction_dim else [])
-                    + ([f"{y_dep.name}->{op.get_name()}"] if y_planned != y_generated_dim else [])
+                    ([f"{x_dep.name}->{op.get_name()}"] if x_planned != x_required else [])
+                    + ([f"{y_dep.name}->{op.get_name()}"] if y_planned != y_required else [])
                 )
                 forced_cost = (
-                    (_buf_elems(x_dep.name) if x_planned != x_reduction_dim else 0)
-                    + (_buf_elems(y_dep.name) if y_planned != y_generated_dim else 0)
+                    (x_elems if x_planned != x_required else 0)
+                    + (y_elems if y_planned != y_required else 0)
                 )
-                print(f"  [plan]   x_stick=dim{x_planned} y_stick=dim{y_planned} forced_cost={forced_cost}")
-                frontier.append(entry, y_generated_dim, needs_restick, forced_cost)
+                print(f"  [plan] matmul {op.get_name()} x_required={x_required} y_required={y_required} forced_cost={forced_cost}")
+                frontier.append(entry, out_stick, needs_restick, forced_cost)
 
         else:
             # Other non-pointwise ops: propagate stick dim from first read dep.
