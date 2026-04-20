@@ -199,9 +199,9 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
             reads.append((dep, in_coords, elems))
 
         frontier.add_buf(op)
+        out_coords = host_coordinates(op.get_layout(), out_dep)
 
         if isinstance(op.data, Pointwise):
-            out_coords = host_coordinates(op.get_layout(), out_dep)
             for entry in frontier.entries:
                 state, _, _ = entry
                 stick_exprs = {
@@ -269,10 +269,14 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                 frontier.append(entry, y_generated_dim, needs_restick, forced_cost)
 
         else:
-            # Other non-pointwise ops: layout not yet assigned, propagate None.
+            # Other non-pointwise ops: propagate stick dim from first read dep.
             print(f"[plan] passthrough {op.get_name()}")
             for entry in frontier.entries:
-                frontier.append(entry, None)
+                state, _, _ = entry
+                dep, in_coords, _ = reads[0]
+                sd = frontier.stick_dim(dep, state)
+                out_stick = matching_dim(out_coords, in_coords[sd]) if sd is not None else None
+                frontier.append(entry, out_stick)
 
         frontier.trim(op.get_name())
         frontier.mark_dead([name for name, lu in last_use.items() if lu == i])
