@@ -223,7 +223,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         guidance = plan_restickify(operations)
-        propagate_spyre_tensor_layouts(operations, guidance=None)
+        propagate_spyre_tensor_layouts(operations, guidance=guidance)
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:

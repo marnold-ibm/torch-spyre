@@ -234,7 +234,6 @@ def pointwise_layout(
     args: list[SchedNodeArg],
     restickify_plan: dict[str, list[dict[str, Any]]],
     guidance: Optional[dict] = None,
-    dry_run: bool = False,
 ) -> FixedTiledLayout:
     data = op.data
     origin_node = next(iter(data.origins))
@@ -336,17 +335,29 @@ def pointwise_layout(
         stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
         if len(stick_exprs) > 1:
-            if not dry_run:
-                logger.warning(
-                    f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
+            logger.warning(
+                f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
+            )
+            host_stick_dim = guidance.get(op.get_name()) if guidance else None
+            print(f"[stickify] pointwise conflict {op.get_name()} host_stick_dim={host_stick_dim}")
+            for i, (ic, idc, arg) in enumerate(zip(in_coords, in_device_coords, args)):
+                arg_host_stick = matching_dim(ic, idc[-1])
+                print(f"  [stickify]   arg[{i}]={arg.dep.name} ic={ic} idc[-1]={idc[-1]} arg_host_stick={arg_host_stick}")
+            if host_stick_dim is not None:
+                # Find the winning arg: the one whose host coord at host_stick_dim matches
+                # the chosen stick expression. That arg's device stick expr becomes the target.
+                # Winner: the arg whose coord at host_stick_dim matches the output coord there.
+                winner = next(
+                    (i for i, ic in enumerate(in_coords)
+                     if ic[host_stick_dim] == out_coords[host_stick_dim]),
+                    0,
                 )
-            guided_name = guidance.get(op.get_name()) if guidance else None
-            if guided_name is not None:
-                guided_arg = next((a for a in args if a.dep.name == guided_name), None)
-                winner_idx = args.index(guided_arg) if guided_arg is not None else 0
-                stick_expr = in_device_coords[winner_idx][-1]
+                print(f"  [stickify]   out_coords={out_coords} out_coords[{host_stick_dim}]={out_coords[host_stick_dim]}")
+                stick_expr = in_device_coords[winner][-1]
+                print(f"  [stickify]   winner=arg[{winner}] stick_expr={stick_expr}")
                 for ic, idc, arg in zip(in_coords, in_device_coords, args):
                     if idc[-1] != 0 and idc[-1] != stick_expr:
+                        print(f"  [stickify]   restickifying {arg.dep.name} -> {stick_expr}")
                         schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
             else:
                 # No guidance: identical to main — arg[0] wins, restickify args[1:].
@@ -561,7 +572,6 @@ def generic_layout(op: Operation) -> FixedTiledLayout:
 def propagate_spyre_tensor_layouts(
     operations: list[Operation],
     guidance: Optional[dict] = None,
-    dry_run: bool = False,
 ) -> None:
     
     # Operations are in topological order (guaranteed by GraphLowering).
@@ -589,7 +599,7 @@ def propagate_spyre_tensor_layouts(
             output = op.get_layout()
             if isinstance(op.data, Pointwise):
                 op.layout = pointwise_layout(
-                    op, output, output_dep, args, restickify_plan, guidance, dry_run
+                    op, output, output_dep, args, restickify_plan, guidance
                 )
             elif isinstance(op.data, Reduction):
                 op.layout = reduction_layout(
@@ -607,7 +617,7 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 
-    if restickify_plan and not dry_run:
+    if restickify_plan:
         n_restickifies = sum(len(v) for v in restickify_plan.values())
         total_elements = sum(
             math.prod(int(s) for s in entry["target_layout"].size)
