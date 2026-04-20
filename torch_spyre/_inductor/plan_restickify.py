@@ -21,6 +21,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
+    MultiOutput,
     Operation,
     Pointwise,
     Reduction,
@@ -54,6 +55,7 @@ class Frontier:
         self.entries: list[FrontierEntry] = [((), [], 0)]
         self._staged: list[FrontierEntry] = []
         self._beam_pruned_warned = False
+        self._passthrough_stick: dict[str, Optional[int]] = {}
         self._live: set[str] = set()
         self.max_live: int = 0
 
@@ -90,6 +92,11 @@ class Frontier:
     def best(self) -> FrontierEntry:
         return self.entries[0]
 
+    def add_passthrough(self, op: Operation, stick: Optional[int]) -> None:
+        self._passthrough_stick[op.get_name()] = stick
+        self._live.add(op.get_name())
+        self.max_live = max(self.max_live, len(self._live))
+
     def stick_dim(self, dep: MemoryDep, state: State) -> Optional[int]:
         """Return the host stick dim for a dep's buffer.
 
@@ -103,11 +110,16 @@ class Frontier:
             dev_coords = device_coordinates(layout, dep)
             return matching_dim(in_coords, dev_coords[-1])
         idx = self._buf_idx.get(dep.name, -1)
-        return state[idx] if idx >= 0 else None
+        if idx >= 0:
+            return state[idx]
+        if dep.name in self._passthrough_stick:
+            return self._passthrough_stick[dep.name]
+        raise AssertionError(f"stick_dim: no stick recorded for buffer {dep.name!r}")
 
     def mark_dead(self, names: list[str]) -> None:
         for name in names:
             self._live.discard(name)
+            self._passthrough_stick.pop(name, None)
 
     def guidance(self) -> dict[str, Optional[int]]:
         best_state, _, _ = self.best()
@@ -181,6 +193,10 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
     print(f"[plan] analyze_stick_conflicts: {len(operations)} operations")
     for i, op in enumerate(operations):
         print(f"[plan] visiting {op.get_name()} type={type(op).__name__} data={type(getattr(op, 'data', None)).__name__}")
+        if isinstance(op, MultiOutput):
+            print(f"[plan] multioutput {op.get_name()} -> None")
+            frontier.add_passthrough(op, None)
+            continue
         if not isinstance(op, ComputedBuffer):
             continue
 
@@ -212,7 +228,8 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                 print(f"  [plan]   candidates={stick_exprs}")
 
                 if len(stick_exprs) <= 1:
-                    out_stick = matching_dim(out_coords, next(iter(stick_exprs), None))
+                    expr = next(iter(stick_exprs), None)
+                    out_stick = matching_dim(out_coords, expr) if expr is not None else None
                     print(f"  [plan]   no conflict, out_stick={out_stick}")
                     frontier.append(entry, out_stick)
                 else:
