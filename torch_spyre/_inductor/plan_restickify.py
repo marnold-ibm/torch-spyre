@@ -40,8 +40,8 @@ from .views import matching_dim
 
 logger = get_inductor_logger("plan_restickify")
 
-# A state maps buffer name -> chosen host stick dim index (int), or None for no-stick/scalar.
-State = dict[str, Optional[int]]
+# State is a tuple of chosen host stick dim indices, parallel to buf_names.
+State = tuple[Optional[int], ...]
 # Each frontier entry is (state, restickifies, cost).
 FrontierEntry = tuple[State, list[str], int]
 Frontier = list[FrontierEntry]
@@ -91,23 +91,40 @@ def _buf_elems(name: str) -> int:
     return prod(int(s) for s in buf.get_layout().size) if buf is not None else 0
 
 
-def _buf_stick_dim(name: str) -> Optional[int]:
-    """Return the host stick dim of a buffer from its layout alone.
+def _get_stick_dim(dep: MemoryDep, buf_names: list[str], state: State) -> Optional[int]:
+    """Return the host stick dim for a buffer.
 
-    Returns None for buffers without FixedTiledLayout (intermediates, not yet assigned).
+    For graph inputs (FixedTiledLayout): derive from device_coordinates via matching_dim.
+    For intermediates: look up from propagated beam state.
     """
-    buf = V.graph.get_buffer(name)
-    if buf is None or not isinstance(buf.get_layout(), FixedTiledLayout):
-        return None
-    return buf.get_layout().device_layout.dim_map[-1]
+    buf = V.graph.get_buffer(dep.name)
+    if buf is not None and isinstance(buf.get_layout(), FixedTiledLayout):
+        layout = buf.get_layout()
+        in_coords = host_coordinates(layout, dep)
+        dev_coords = device_coordinates(layout, dep)
+        return matching_dim(in_coords, dev_coords[-1])
+    idx = buf_names.index(dep.name) if dep.name in buf_names else -1
+    return state[idx] if idx >= 0 else None
 
 
-def _get_stick_dim(name: str, state: State) -> Optional[int]:
-    """Return the stick dim for a buffer: from layout if available, else from propagated state."""
-    dim = _buf_stick_dim(name)
-    if dim is not None:
-        return dim
-    return state.get(name)
+def _extend(
+    entry: FrontierEntry,
+    stick_dim: Optional[int],
+    new_restickifies: list[str] = [],
+    extra_cost: int = 0,
+) -> FrontierEntry:
+    state, restickifies, cost = entry
+    return (state + (stick_dim,), restickifies + new_restickifies, cost + extra_cost)
+
+
+def _beam_trim(frontier: Frontier, K: int, op_name: str, warned: bool) -> tuple[Frontier, bool]:
+    frontier.sort(key=lambda e: e[2])
+    if len(frontier) > K and not warned:
+        warned = True
+        logger.warning(
+            f"plan_restickify: beam pruned from {len(frontier)} to {K} at {op_name} — consider increasing BEAM_WIDTH"
+        )
+    return frontier[:K], warned
 
 
 def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) -> Frontier:
@@ -123,7 +140,8 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
 
     Returns frontier sorted by cost ascending.
     """
-    frontier: Frontier = [({}, [], 0)]
+    buf_names: list[str] = []
+    frontier: Frontier = [((), [], 0)]
     _beam_pruned_warned = False
 
     print(f"[plan] analyze_stick_conflicts: {len(operations)} operations")
@@ -141,57 +159,42 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
             buf = V.graph.get_buffer(dep.name)
             in_coords = host_coordinates(buf.get_layout(), dep)
             elems = _buf_elems(dep.name)
-            stick_dim = _buf_stick_dim(dep.name)
-            print(f"  [plan]   arg={dep.name} in_coords={in_coords} stick_dim={stick_dim}")
+            layout = buf.get_layout()
+            input_stick_dim = matching_dim(in_coords, device_coordinates(layout, dep)[-1]) if isinstance(layout, FixedTiledLayout) else None
+            print(f"  [plan]   arg={dep.name} in_coords={in_coords} input_stick_dim={input_stick_dim}")
             reads.append((dep, in_coords, elems))
 
         if isinstance(op.data, Pointwise):
-            print(f"[plan] op={op.get_name()} reads={[type(d).__name__ for d in rw.reads]}")
-
+            buf_names.append(op.get_name())
+            out_coords = host_coordinates(op.get_layout(), out_dep)
             new_frontier: Frontier = []
-            for state, restickifies, cost in frontier:
-                resolved = [
-                    (dep, _get_stick_dim(dep.name, state), in_coords, elems)
+            for entry in frontier:
+                state, _, _ = entry
+                stick_exprs = {
+                    in_coords[sd]
                     for dep, in_coords, elems in reads
-                ]
-
-                # Map stick coord expr -> dim index; distinct exprs = distinct stick choices.
-                candidates = {
-                    ic[sd]: sd
-                    for _, sd, ic, _ in resolved
-                    if sd is not None
+                    if (sd := _get_stick_dim(dep, buf_names, state)) is not None
                 }
-                print(f"  [plan]   candidates={candidates}")
+                print(f"  [plan]   candidates={stick_exprs}")
 
-                if len(candidates) <= 1:
-                    out_stick = next(iter(candidates.values()), None)
-                    print(f"  [plan]   no conflict, out_stick={out_stick} total={cost}")
-                    new_frontier.append(({**state, op.get_name(): out_stick}, restickifies, cost))
+                if len(stick_exprs) <= 1:
+                    out_stick = matching_dim(out_coords, next(iter(stick_exprs), None))
+                    print(f"  [plan]   no conflict, out_stick={out_stick}")
+                    new_frontier.append(_extend(entry, out_stick))
                 else:
-                    out_coords = host_coordinates(op.get_layout(), out_dep)
-                    for chosen_expr in candidates:
-                        out_stick_dim = matching_dim(out_coords, chosen_expr)
-                        new_restickifies = [
-                            f"{dep.name}->{op.get_name()}"
-                            for dep, sd, ic, _ in resolved
-                            if sd is not None and ic[sd] != chosen_expr
-                        ]
-                        restickify_cost = sum(
-                            elems
-                            for _, sd, ic, elems in resolved
-                            if sd is not None and ic[sd] != chosen_expr
-                        )
-                        total = cost + restickify_cost
-                        print(f"  [plan]   choice={chosen_expr} out_stick_dim={out_stick_dim} restickify_cost={restickify_cost} total={total}")
-                        new_frontier.append(({**state, op.get_name(): out_stick_dim}, restickifies + new_restickifies, total))
+                    for stick_expr in stick_exprs:
+                        needs_restick = []
+                        restickify_cost = 0
+                        for dep, in_coords, elems in reads:
+                            sd = _get_stick_dim(dep, buf_names, state)
+                            if sd is not None and in_coords[sd] != stick_expr:
+                                needs_restick.append(f"{dep.name}->{op.get_name()}")
+                                restickify_cost += elems
+                        out_stick_dim = matching_dim(out_coords, stick_expr)
+                        print(f"  [plan]   choice={stick_expr} out_stick_dim={out_stick_dim} cost={restickify_cost}")
+                        new_frontier.append(_extend(entry, out_stick_dim, needs_restick, restickify_cost))
 
-            new_frontier.sort(key=lambda x: x[2])
-            if len(new_frontier) > K and not _beam_pruned_warned:
-                _beam_pruned_warned = True
-                logger.warning(
-                    f"plan_restickify: beam pruned from {len(new_frontier)} to {K} at {op.get_name()} — consider increasing BEAM_WIDTH"
-                )
-            frontier = new_frontier[:K]
+            frontier, _beam_pruned_warned = _beam_trim(new_frontier, K, op.get_name(), _beam_pruned_warned)
             print(f"  [plan]   frontier size={len(frontier)}, costs={[c for _,_,c in frontier]}")
 
         elif (
@@ -219,42 +222,39 @@ def analyze_stick_conflicts(operations: list[Operation], K: int = BEAM_WIDTH) ->
                 f"[plan] matmul {op.get_name()} x_reduction_dim={x_reduction_dim} y_generated_dim={y_generated_dim}"
             )
 
+            buf_names.append(op.get_name())
             new_frontier = []
-            for state, restickifies, cost in frontier:
-                x_planned = _get_stick_dim(x_dep.name, state)
-                y_planned = _get_stick_dim(y_dep.name, state)
-
-                x_needs_restickify = x_planned != x_reduction_dim
-                y_needs_restickify = y_planned != y_generated_dim
-
-                new_restickifies = (
-                    ([f"{x_dep.name}->{op.get_name()}"] if x_needs_restickify else [])
-                    + ([f"{y_dep.name}->{op.get_name()}"] if y_needs_restickify else [])
+            for entry in frontier:
+                state, _, _ = entry
+                x_planned = _get_stick_dim(x_dep, buf_names, state)
+                y_planned = _get_stick_dim(y_dep, buf_names, state)
+                losers = (
+                    ([f"{x_dep.name}->{op.get_name()}"] if x_planned != x_reduction_dim else [])
+                    + ([f"{y_dep.name}->{op.get_name()}"] if y_planned != y_generated_dim else [])
                 )
                 forced_cost = (
-                    (_buf_elems(x_dep.name) if x_needs_restickify else 0)
-                    + (_buf_elems(y_dep.name) if y_needs_restickify else 0)
+                    (_buf_elems(x_dep.name) if x_planned != x_reduction_dim else 0)
+                    + (_buf_elems(y_dep.name) if y_planned != y_generated_dim else 0)
                 )
-                print(
-                    f"  [plan]   x_stick=dim{x_planned} y_stick=dim{y_planned} forced_cost={forced_cost} total={cost + forced_cost}"
-                )
-                new_frontier.append(({**state, op.get_name(): y_generated_dim}, restickifies + new_restickifies, cost + forced_cost))
+                print(f"  [plan]   x_stick=dim{x_planned} y_stick=dim{y_planned} forced_cost={forced_cost}")
+                new_frontier.append(_extend(entry, y_generated_dim, losers, forced_cost))
 
-            frontier = sorted(new_frontier, key=lambda x: x[2])
+            frontier = sorted(new_frontier, key=lambda e: e[2])
 
         else:
             # Other non-pointwise ops: layout not yet assigned, propagate None.
+            buf_names.append(op.get_name())
             print(f"[plan] passthrough {op.get_name()}")
-            frontier = [
-                ({**state, op.get_name(): None}, restickifies, cost)
-                for state, restickifies, cost in frontier
-            ]
+            frontier = [_extend(entry, None) for entry in frontier]
 
+        print()
         print(f"[plan] frontier after {op.get_name()}:")
+        print(f"  Buf names: {buf_names}")
         for rank, (state, restickifies, cost) in enumerate(frontier):
             print(f"  [{rank}] cost={cost} restickifies={restickifies} state={state}")
+        print()
 
-    return frontier
+    return buf_names, frontier
 
 
 def plan_restickify(operations: list[Operation]) -> Optional[State]:
@@ -268,17 +268,18 @@ def plan_restickify(operations: list[Operation]) -> Optional[State]:
     has no pointwise ops.
     """
     convert_input_layouts(operations)
-    frontier = analyze_stick_conflicts(operations)
+    buf_names, frontier = analyze_stick_conflicts(operations)
     if os.getenv("SPYRE_CAPTURE_RESTICKIFY_PLAN"):
         global last_frontier
         last_frontier = frontier
     if not frontier:
         return None
     best_state, best_restickifies, best_cost = frontier[0]
-    # Reconstruct where restickifies would be inserted for the best state.
+    guidance = dict(zip(buf_names, best_state))
     print(f"\n[plan] final frontier ({len(frontier)} states):")
     for rank, (state, restickifies, cost) in enumerate(frontier):
-        print(f"  [{rank}] cost={cost} restickifies={restickifies} state={state}")
+        print(f"  [{rank}] cost={cost} restickifies={restickifies} state={dict(zip(buf_names, state))}")
     print(f"  [plan] best: total_cost={best_cost}, restickifies={best_restickifies}")
-    print(f"[plan] guidance: {best_state}")
-    return best_state if best_state else None
+    print()
+    print(f"[plan] guidance: {guidance}")
+    return guidance if guidance else None

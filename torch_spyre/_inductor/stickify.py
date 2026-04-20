@@ -346,13 +346,13 @@ def pointwise_layout(
             if host_stick_dim is not None:
                 # Find the winning arg: the one whose host coord at host_stick_dim matches
                 # the chosen stick expression. That arg's device stick expr becomes the target.
-                # Winner: the arg whose coord at host_stick_dim matches the output coord there.
+                # Winner: the arg whose device stick expr maps to host_stick_dim in output coords.
+                print(f"  [stickify]   out_coords={out_coords} out_coords[{host_stick_dim}]={out_coords[host_stick_dim]}")
                 winner = next(
-                    (i for i, ic in enumerate(in_coords)
-                     if ic[host_stick_dim] == out_coords[host_stick_dim]),
+                    (i for i, idc in enumerate(in_device_coords)
+                     if matching_dim(out_coords, idc[-1]) == host_stick_dim),
                     0,
                 )
-                print(f"  [stickify]   out_coords={out_coords} out_coords[{host_stick_dim}]={out_coords[host_stick_dim]}")
                 stick_expr = in_device_coords[winner][-1]
                 print(f"  [stickify]   winner=arg[{winner}] stick_expr={stick_expr}")
                 for ic, idc, arg in zip(in_coords, in_device_coords, args):
