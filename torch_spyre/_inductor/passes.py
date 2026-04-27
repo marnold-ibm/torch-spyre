@@ -36,7 +36,12 @@ from .temp_passes import (
     replace_scalar_with_tensor,
 )
 from . import config
-from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
+from .stickify import (
+    collapse_layouts,
+    propagate_mutation_layouts,
+    propagate_spyre_tensor_layouts,
+    schedule_restickify_pass,
+)
 from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
@@ -221,6 +226,11 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        collapse_layouts(operations)
+        schedule_restickify_pass(operations)
+        from torch._inductor.virtualized import V
+        from .stickify import _format_restickify_plan
+        _format_restickify_plan(getattr(V.graph, "restickify_plan", {}))
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:

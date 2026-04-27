@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, NamedTuple, TypeVar, Union
+from typing import Callable, NamedTuple, Optional, TypeVar, Union
 
 
 import sympy
@@ -34,7 +34,8 @@ from .views import compute_coordinates
 
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
-    layout: FixedTiledLayout
+    layout: "Optional[FixedTiledLayout]"
+    layouts: "list[FixedTiledLayout]"
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
@@ -42,10 +43,13 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     for arg in n.read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-            res.append(SchedNodeArg(arg, layout))
+            if hasattr(buf, "layouts"):
+                res.append(SchedNodeArg(arg, None, list(buf.layouts)))
+            else:
+                layout = buf.get_layout()
+                if not isinstance(layout, FixedTiledLayout):
+                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+                res.append(SchedNodeArg(arg, layout, [layout]))
     return res
 
 
@@ -94,10 +98,15 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     for arg in read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-            res.append(SchedNodeArg(arg, layout))
+            if hasattr(buf, "layouts"):
+                print(f"MRA get_mem_deps_from_rw: {arg.name} has layouts: {buf.layouts}")
+                res.append(SchedNodeArg(arg, None, list(buf.layouts)))
+            else:
+                layout = buf.get_layout()
+                if not isinstance(layout, FixedTiledLayout):
+                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+                print(f"MRA get_mem_deps_from_rw: {arg.name} using get_layout: {layout}")
+                res.append(SchedNodeArg(arg, layout, [layout]))
     return res
 
 
