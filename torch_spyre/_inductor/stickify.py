@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from typing import Any
 import math
 
 import sympy
@@ -120,7 +119,6 @@ def _iter_var_id(stick_expr) -> int:
 
 
 _MAX_COST = math.inf
-
 
 class RestickCost:
     """Thin 2-D cost table for one input arg.
@@ -229,7 +227,7 @@ def _build_restick_costs(
                     rc.set(in_iv, out_iv, 0, layout)
                 else:
                     tgt = compute_restickify_target_layout(
-                        arg.dep, layout, out_expr, ic, idc
+                        layout, out_expr, ic, idc
                     )
                     if tgt is not None:
                         cost = 1
@@ -241,7 +239,6 @@ def _build_restick_costs(
 
 
 def compute_restickify_target_layout(
-    dep: MemoryDep,
     layout: FixedTiledLayout,
     target_stick_expr,
     ic: list,
@@ -298,32 +295,12 @@ def _record_restickify(
     )
 
 
-def schedule_restickify(
-    op: Operation,
-    dep: MemoryDep,
-    layout: FixedTiledLayout,
-    target_stick_expr,
-    ic: list,
-    idc: list,
-    restickify_plan: dict,
-) -> FixedTiledLayout:
-    """Schedule a restickify of arg so that its stick aligns with target_stick_expr for op."""
-    target_layout = compute_restickify_target_layout(dep, layout, target_stick_expr, ic, idc)
-    assert target_layout is not None, (
-        f"schedule_restickify: infeasible restickify to {target_stick_expr} "
-        f"ic={ic} idc={idc}"
-    )
-    _record_restickify(op, dep.name, target_layout, restickify_plan)
-    return target_layout
-
-
 def first_arg_pointwise_layout(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     dep: MemoryDep,
     layout: FixedTiledLayout,
-    restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> FixedTiledLayout:
     data = op.data
     origin_node = next(iter(data.origins))
@@ -415,7 +392,6 @@ def pointwise_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
-    restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> list[FixedTiledLayout]:
     data = op.data
     origin_node = next(iter(data.origins))
@@ -426,7 +402,7 @@ def pointwise_layouts(
     if len(args) == 1 or aten_op == spyreop.layernormnorm.default:
         return [
             first_arg_pointwise_layout(
-                op, output, output_dep, args[0].dep, layout, restickify_plan
+                op, output, output_dep, args[0].dep, layout
             )
             for layout in args[0].layouts
         ]
@@ -534,7 +510,6 @@ def first_arg_reduction_layout(
     output_dep: MemoryDep,
     dep: MemoryDep,
     layout: FixedTiledLayout,
-    restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> FixedTiledLayout:
     data = op.data
     if data.reduction_type == "exx2":
@@ -589,14 +564,13 @@ def reduction_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
-    restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> list[FixedTiledLayout]:
     data = op.data
 
     if len(args) == 1:
         return [
             first_arg_reduction_layout(
-                op, output, output_dep, args[0].dep, layout, restickify_plan
+                op, output, output_dep, args[0].dep, layout
             )
             for layout in args[0].layouts
         ]
@@ -756,8 +730,6 @@ def propagate_spyre_tensor_layouts(
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed to convert each output FixedLayout to a FixedTiledLayout.
-    restickify_plan: dict[str, list[dict[str, Any]]] = {}
-
     it = iter(operations)
     for op in it:
         if op.is_no_op():
@@ -777,13 +749,9 @@ def propagate_spyre_tensor_layouts(
             args = get_mem_deps_from_rw(rw)
             output = op.get_layout()
             if isinstance(op.data, Pointwise):
-                op.layouts = pointwise_layouts(
-                    op, output, output_dep, args, restickify_plan
-                )
+                op.layouts = pointwise_layouts(op, output, output_dep, args)
             elif isinstance(op.data, Reduction):
-                op.layouts = reduction_layouts(
-                    op, output, output_dep, args, restickify_plan
-                )
+                op.layouts = reduction_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
@@ -795,8 +763,6 @@ def propagate_spyre_tensor_layouts(
             logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")
-
-    V.graph.restickify_plan = restickify_plan
 
 
 def propagate_mutation_layouts(
@@ -823,7 +789,7 @@ def propagate_mutation_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
             output = n.node.get_layout()
-            n.node.layout = next(iter(pointwise_layouts(n.node, output, output_dep, args, {})))
+            n.node.layout = next(iter(pointwise_layouts(n.node, output, output_dep, args)))
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
