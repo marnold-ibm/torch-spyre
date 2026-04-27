@@ -14,7 +14,7 @@
 
 import logging
 from typing import Any
-
+import math
 
 import sympy
 import torch
@@ -119,7 +119,7 @@ def _iter_var_id(stick_expr) -> int:
     return int(name[i + 1:])
 
 
-_MAX_COST = 2**63 - 1  # sentinel: infeasible
+_MAX_COST = math.inf
 
 
 class RestickCost:
@@ -833,16 +833,18 @@ def propagate_mutation_layouts(
 
 
 def _cost_for_out(rc: "RestickCost", out_iv: int) -> int:
-    """Cost for rc's arg to reach out_iv, respecting any already-committed in iter var."""
+    """Cost for rc's arg to reach out_iv, using the actual read-dep stick iv."""
     if rc.has_no_stick:
         return 0
     buf = V.graph.get_buffer(rc.dep.name)
-    chosen_in_iv = getattr(buf, "chosen_stick_iv", None)
-    if chosen_in_iv is None:
+    if not hasattr(buf, "layout"):
         return rc.min_cost_for_out(out_iv)
-    if chosen_in_iv >= len(rc._cost) or out_iv >= len(rc._cost[chosen_in_iv]):
+    in_iv = _iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
+    if in_iv == -1:
+        return rc.min_cost_for_out(out_iv)
+    if in_iv >= len(rc._cost) or out_iv >= len(rc._cost[in_iv]):
         return _MAX_COST
-    return rc._cost[chosen_in_iv][out_iv]
+    return rc._cost[in_iv][out_iv]
 
 
 def collapse_layouts(operations: list) -> None:
@@ -940,7 +942,7 @@ def schedule_restickify_pass(operations: list) -> None:
                 else getattr(op, "chosen_stick_iv", None)
             )
             buf = V.graph.get_buffer(rc.dep.name)
-            in_iv = getattr(buf, "chosen_stick_iv", None)
+            in_iv = _iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
             cost, tgt = rc.cost_and_target(in_iv, out_iv)
             print(
                 f"    arg={rc.dep.name} in_iv=iv{in_iv} required_out_iv=iv{rc.required_out_iv} "
@@ -957,13 +959,10 @@ def schedule_restickify_pass(operations: list) -> None:
                 f"arg={rc.dep.name} in_iv={in_iv} -> out_iv={out_iv} "
                 f"op={op.get_name()} cost={cost}"
             )
-            src_iv = in_iv if in_iv is not None else _iter_var_id(
-                device_coordinates(buf.get_layout(), rc.dep)[-1]
-            )
-            print(f"    -> scheduling restickify iv{src_iv} -> iv{out_iv}")
+            print(f"    -> scheduling restickify iv{in_iv} -> iv{out_iv}")
             logger.warning(
                 f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
-                f"iv{src_iv} -> iv{out_iv} "
+                f"iv{in_iv} -> iv{out_iv} "
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
             )
             _record_restickify(op, rc.dep.name, tgt, restickify_plan)
