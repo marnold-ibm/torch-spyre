@@ -162,7 +162,7 @@ class RestickCost:
     This is NOT a tensor dimension index.
 
     required_out_iv:
-      None = use op.chosen_stick_iv (decided by collapse_layouts, for pointwise)
+      None = use op.chosen_stick_iv (decided by select_restickify_locations, for pointwise)
       int  = pinned to a specific iter var (for matmul, each arg has its own)
     """
 
@@ -197,7 +197,7 @@ class RestickCost:
                     )
         return "\n".join(lines)
 
-    def min_cost_for_out(self, out_iv: int) -> int:
+    def min_cost_for_out(self, out_iv: int) -> float:
         """Minimum cost across all in iter vars to reach out_iv."""
         if self.has_no_stick:
             return 0

@@ -40,6 +40,7 @@ from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
+from .optimize_restickify import select_restickify_locations
 from .insert_restickify import insert_restickify, schedule_restickify_pass
 from .core_division import core_division_planning
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
@@ -224,7 +225,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
-        collapse_layouts(operations)
+        select_restickify_locations(operations)
         schedule_restickify_pass(operations)
         from torch._inductor.virtualized import V
         from .insert_restickify import _format_restickify_plan

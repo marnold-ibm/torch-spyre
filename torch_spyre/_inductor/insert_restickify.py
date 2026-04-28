@@ -188,7 +188,7 @@ def insert_restickify(operations: list[Operation]) -> None:
 def schedule_restickify_pass(operations: list) -> None:
     """Populate V.graph.restickify_plan from op.arg_restick_costs.
 
-    Called after collapse_layouts has set op.layout and op.chosen_stick_iv on
+    Called after select_restickify_locations has set op.layout and op.chosen_stick_iv on
     every op.  For each arg whose committed stick differs from the required
     output stick, records a restickify entry.
     """
