@@ -104,7 +104,7 @@ def restickify_stride_map(
     return new_stride_map
 
 
-def _build_restick_costs(
+def build_restick_costs(
     args: "list[SchedNodeArg]",
     stick_exprs: set,
 ) -> "list[RestickCost]":
@@ -339,7 +339,7 @@ def pointwise_layouts(
 
         # Build RestickCost tables: one per arg, indexed [initer_var_id][outiter_var_id].
         if stick_exprs:
-            arg_restick_costs = _build_restick_costs(args, stick_exprs)
+            arg_restick_costs = build_restick_costs(args, stick_exprs)
 
             print(f"MRA RestickCost tables for {op.get_name()}:")
             for i, (rc, arg) in enumerate(zip(arg_restick_costs, args)):
@@ -569,9 +569,9 @@ def reduction_layouts(
                 f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
             )
 
-        x_rc = _build_restick_costs([x], {reduction_coord})[0]
+        x_rc = build_restick_costs([x], {reduction_coord})[0]
         x_rc.required_out_iv = iter_var_id(reduction_coord)
-        y_rc = _build_restick_costs([y], {generated_coord})[0]
+        y_rc = build_restick_costs([y], {generated_coord})[0]
         y_rc.required_out_iv = iter_var_id(generated_coord)
         op.arg_restick_costs = [x_rc, y_rc]
 
