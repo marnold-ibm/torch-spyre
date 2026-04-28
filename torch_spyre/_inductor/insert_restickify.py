@@ -14,7 +14,10 @@
 
 import torch
 
+from .constants import MAX_RESTICK_COST
+from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
+from .pass_utils import device_coordinates, iter_var_id
 from torch._inductor.ir import ComputedBuffer, Operation, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -22,6 +25,18 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 logger = get_inductor_logger("insert_restickify")
+
+
+def _record_restickify(
+    op: Operation,
+    dep_name: str,
+    target_layout: FixedTiledLayout,
+    restickify_plan: dict,
+) -> None:
+    """Append a restickify entry to restickify_plan."""
+    restickify_plan.setdefault(op.get_name(), []).append(
+        {"arg_name": dep_name, "target_layout": target_layout}
+    )
 
 
 class NameSwapHandler(WrapperHandler):
@@ -167,4 +182,72 @@ def insert_restickify(operations: list[Operation]) -> None:
         if isinstance(op, ComputedBuffer) and op.get_name() in restickify_plan:
             insert_restickify_on_node_inputs(
                 op, restickify_plan[op.get_name()], operations
+            )
+
+
+def schedule_restickify_pass(operations: list) -> None:
+    """Populate V.graph.restickify_plan from op.arg_restick_costs.
+
+    Called after collapse_layouts has set op.layout and op.chosen_stick_iv on
+    every op.  For each arg whose committed stick differs from the required
+    output stick, records a restickify entry.
+    """
+    restickify_plan = getattr(V.graph, "restickify_plan", {})
+    print()
+    print("=== In schedule_restickify_pass ===")
+
+    for op in operations:
+        costs = getattr(op, "arg_restick_costs", None)
+        if not costs:
+            continue
+        print(
+            f"  op={op.get_name()} chosen_stick_iv=iv{getattr(op, 'chosen_stick_iv', None)}"
+        )
+        for rc in costs:
+            out_iv = (
+                rc.required_out_iv
+                if rc.required_out_iv is not None
+                else getattr(op, "chosen_stick_iv", None)
+            )
+            buf = V.graph.get_buffer(rc.dep.name)
+            in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
+            cost, tgt = rc.cost_and_target(in_iv, out_iv)
+            print(
+                f"    arg={rc.dep.name} in_iv=iv{in_iv} required_out_iv=iv{rc.required_out_iv} "
+                f"out_iv=iv{out_iv} cost={cost} tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
+            )
+            if out_iv is None:
+                print("    -> skip (out_iv is None)")
+                continue
+            if cost == 0:
+                print("    -> no restickify needed (cost=0)")
+                continue
+            assert tgt is not None and cost < MAX_RESTICK_COST, (
+                f"schedule_restickify_pass: inviable restickify for "
+                f"arg={rc.dep.name} in_iv={in_iv} -> out_iv={out_iv} "
+                f"op={op.get_name()} cost={cost}"
+            )
+            print(f"    -> scheduling restickify iv{in_iv} -> iv{out_iv}")
+            logger.warning(
+                f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
+                f"iv{in_iv} -> iv{out_iv} "
+                f"target_stride_map={list(tgt.device_layout.stride_map)}"
+            )
+            _record_restickify(op, rc.dep.name, tgt, restickify_plan)
+
+    V.graph.restickify_plan = restickify_plan
+
+
+def _format_restickify_plan(restickify_plan: dict) -> None:
+    print()
+    print("=== restickify_plan (entering insert_restickify) ===")
+    if not restickify_plan:
+        print("  (empty)")
+        return
+    for consumer_name, entries in restickify_plan.items():
+        for e in entries:
+            print(
+                f"  consumer={consumer_name} arg={e['arg_name']} "
+                f"target_stride_map={list(e['target_layout'].device_layout.stride_map)} "
+                f"target_device_size={list(e['target_layout'].device_layout.device_size)}"
             )

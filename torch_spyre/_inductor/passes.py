@@ -36,13 +36,11 @@ from .temp_passes import (
     replace_scalar_with_tensor,
 )
 from . import config
-from .stickify import (
-    collapse_layouts,
+from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
-    schedule_restickify_pass,
 )
-from .insert_restickify import insert_restickify
+from .insert_restickify import insert_restickify, schedule_restickify_pass
 from .core_division import core_division_planning
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
@@ -229,7 +227,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         collapse_layouts(operations)
         schedule_restickify_pass(operations)
         from torch._inductor.virtualized import V
-        from .stickify import _format_restickify_plan
+        from .insert_restickify import _format_restickify_plan
+
         _format_restickify_plan(getattr(V.graph, "restickify_plan", {}))
         insert_restickify(operations)
         core_division_planning(operations)
