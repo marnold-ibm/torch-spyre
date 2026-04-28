@@ -64,12 +64,6 @@ class EdgeCostMap:
                     )
         return "\n".join(lines)
 
-    def min_cost_for_out(self, out_iv: int) -> int:
-        """Minimum cost across all in iter vars to reach out_iv."""
-        if self.has_no_stick:
-            return 0
-        return min(row[out_iv] for row in self._cost)
-
     def best_target_for_out(self, out_iv: int):
         """Returns (cost, target_layout) for cheapest transition to out_iv."""
         if self.has_no_stick:
@@ -81,6 +75,14 @@ class EdgeCostMap:
                 best_cost = row[out_iv]
                 best_tgt = trow[out_iv]
         return best_cost, best_tgt
+
+    def cost(self, in_iv: int, out_iv: int) -> int:
+        """Cost for in_iv -> out_iv transition."""
+        if self.has_no_stick:
+            return 0
+        if in_iv >= len(self._cost) or out_iv >= len(self._cost[in_iv]):
+            return INF
+        return self._cost[in_iv][out_iv]
 
     def cost_and_target(self, in_iv: "int | None", out_iv: int):
         """Returns (cost, target_layout) for in_iv -> out_iv.
@@ -110,7 +112,7 @@ class RestickNodeCost(abc.ABC):
 class AllSameNode(RestickNodeCost):
 
     def cost_for_out(self, out_iv: int) -> int:
-        in_edge_costs = [rc.min_cost_for_out(out_iv) for rc in self.edge_costs]
+        in_edge_costs = [rc.cost(out_iv, out_iv) for rc in self.edge_costs]
         return INF if INF in in_edge_costs else sum(in_edge_costs)
 
 
@@ -124,7 +126,10 @@ class FixedInOutNode(RestickNodeCost):
     def cost_for_out(self, out_iv: int) -> int:
         if out_iv != self.required_out_iv:
             return INF
-        in_edge_costs = [rc.min_cost_for_out(out_iv) for rc in self.edge_costs]
+        in_edge_costs = [
+            rc.cost(in_iv, out_iv)
+            for rc, in_iv in zip(self.edge_costs, self.required_in_iv)
+        ]
         return INF if INF in in_edge_costs else sum(in_edge_costs)
 
 
