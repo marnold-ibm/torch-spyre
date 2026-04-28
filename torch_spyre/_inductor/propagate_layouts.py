@@ -44,7 +44,6 @@ from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP, MAX_RESTICK_COST
 from .ir import FixedTiledLayout
 from .pass_utils import (
-    RestickCost,
     SchedNodeArg,
     concretize_expr,
     get_mem_deps_from_rw,
@@ -52,6 +51,7 @@ from .pass_utils import (
     device_coordinates,
     iter_var_id,
 )
+from .optimize_restickify import EdgeCostMap, AllSameNode, FixedOutNode
 from .views import matching_dim
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -104,11 +104,30 @@ def restickify_stride_map(
     return new_stride_map
 
 
-def build_restick_costs(
+def _make_identity_write_dep(layout: FixedTiledLayout) -> MemoryDep:
+    """Synthetic write dep with identity index in the layout's device coordinates.
+
+    device_coordinates only needs dep.index and dep.ranges.  This constructs
+    the identity index — sum(sym_i * stride_map_i) with ranges {sym_i: device_size_i}
+    — which is what the upstream node's write dep looks like for its output buffer.
+    Used for InputBuffers which do not implement get_read_writes().
+    """
+    dl = layout.device_layout
+    syms = tuple(sympy.Symbol(f"_w{i}") for i in range(len(dl.device_size)))
+    index = sum(s * int(m) for s, m in zip(syms, dl.stride_map))
+    return MemoryDep("_synthetic", index, syms, tuple(int(sz) for sz in dl.device_size))
+
+
+def build_edge_restick_costs(
     args: "list[SchedNodeArg]",
     stick_exprs: set,
-) -> "list[RestickCost]":
-    """Build one RestickCost per arg for the given candidate output sticks."""
+) -> "list[EdgeCostMap]":
+    """Build one EdgeCostMap per arg for the given candidate output sticks.
+
+    All IV indices in the cost table are in THIS NODE's iteration variable
+    namespace.  upstream_out_iv_to_local_in_iv translates from the upstream
+    buffer's output IV namespace into this node's in_iv row index.
+    """
     alliter_var_ids: set[int] = {iter_var_id(e) for e in stick_exprs}
     for arg in args:
         for layout in arg.layouts:
@@ -116,16 +135,28 @@ def build_restick_costs(
             alliter_var_ids.add(iter_var_id(idc[-1]))
     n = max(alliter_var_ids) + 1 if alliter_var_ids else 1
 
-    result: list[RestickCost] = []
+    result: list[EdgeCostMap] = []
     for arg in args:
-        rc = RestickCost(arg.dep, n)
+        rc = EdgeCostMap(arg.dep, n)
+        # Build upstream write dep for IV namespace translation.
+        upstream_buf = V.graph.get_buffer(arg.dep.name)
         for layout in arg.layouts:
             ic = host_coordinates(layout, arg.dep)
             idc = device_coordinates(layout, arg.dep)
-            in_iv = iter_var_id(idc[-1])
-            if in_iv == -1:
+            local_in_iv = iter_var_id(idc[-1])
+            if local_in_iv == -1:
                 rc.mark_no_stick()
                 continue
+            # Translate: upstream output IV (upstream's namespace) → local in_iv.
+            if isinstance(upstream_buf, ComputedBuffer):
+                upstream_write_dep = next(iter(upstream_buf.get_read_writes().writes))
+            else:
+                upstream_write_dep = _make_identity_write_dep(layout)
+            upstream_out_iv = iter_var_id(device_coordinates(layout, upstream_write_dep)[-1])
+            if 0 <= upstream_out_iv < n:
+                rc.upstream_out_iv_to_local_in_iv[upstream_out_iv] = local_in_iv
+
+            in_iv = local_in_iv
             rc.set(in_iv, in_iv, 0, layout)  # staying on same iter var is always free
             for out_expr in stick_exprs:
                 out_iv = iter_var_id(out_expr)
@@ -307,7 +338,7 @@ def pointwise_layouts(
             for layout in args[0].layouts
         ]
     else:
-        # len(args) > 1, not layernormnorm
+        # Standard multi-input pointwise 
 
         print("MRA: ARGS:")
         for i, arg in enumerate(args):
@@ -337,13 +368,13 @@ def pointwise_layouts(
                 f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
             )
 
-        # Build RestickCost tables: one per arg, indexed [initer_var_id][outiter_var_id].
+        # Build EdgeCostMap tables: one per arg, indexed [initer_var_id][outiter_var_id].
         if stick_exprs:
-            arg_restick_costs = build_restick_costs(args, stick_exprs)
+            edge_costs = build_edge_restick_costs(args, stick_exprs)
 
-            print(f"MRA RestickCost tables for {op.get_name()}:")
-            for i, (rc, arg) in enumerate(zip(arg_restick_costs, args)):
-                print(f"  arg {i} ({rc.dep.name}):")
+            print(f"MRA EdgeCostMap tables for {op.get_name()}:")
+            for i, (rc, arg) in enumerate(zip(edge_costs, args)):
+                print(f"  arg {i} ({arg.dep.name}):")
                 print(rc.format_table())
 
             viable_sticks = [
@@ -351,7 +382,7 @@ def pointwise_layouts(
                 for e in stick_exprs
                 if all(
                     rc.min_cost_for_out(iter_var_id(e)) < MAX_RESTICK_COST
-                    for rc in arg_restick_costs
+                    for rc in edge_costs
                 )
             ]
             if not viable_sticks:
@@ -361,7 +392,8 @@ def pointwise_layouts(
                     f"stick_exprs={stick_exprs}"
                 )
 
-            op.arg_restick_costs = arg_restick_costs
+            op.arg_restick_costs = edge_costs
+            op.restick_cost_fn = AllSameNode(edge_costs)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -569,16 +601,17 @@ def reduction_layouts(
                 f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
             )
 
-        x_rc = build_restick_costs([x], {reduction_coord})[0]
+        x_rc = build_edge_restick_costs([x], {reduction_coord})[0]
         x_rc.required_out_iv = iter_var_id(reduction_coord)
-        y_rc = build_restick_costs([y], {generated_coord})[0]
+        y_rc = build_edge_restick_costs([y], {generated_coord})[0]
         y_rc.required_out_iv = iter_var_id(generated_coord)
         op.arg_restick_costs = [x_rc, y_rc]
+        op.restick_cost_fn = FixedOutNode([x_rc, y_rc], iter_var_id(generated_coord))
 
-        print(f"MRA RestickCost tables for {op.get_name()}:")
-        print(f"  x ({x_rc.dep.name}) required_out_iv=iv{x_rc.required_out_iv}:")
+        print(f"MRA EdgeCostmap tables for {op.get_name()}:")
+        print(f"  x ({x.dep.name}) required_out_iv=iv{x_rc.required_out_iv}:")
         print(x_rc.format_table())
-        print(f"  y ({y_rc.dep.name}) required_out_iv=iv{y_rc.required_out_iv}:")
+        print(f"  y ({y.dep.name}) required_out_iv=iv{y_rc.required_out_iv}:")
         print(y_rc.format_table())
 
         x_req_iv = x_rc.required_out_iv
@@ -619,6 +652,23 @@ def reduction_layouts(
         return [result_layout]
 
 
+def _stamp_out_ivs(layouts: "list[FixedTiledLayout]", output_dep: "MemoryDep") -> None:
+    """Stamp layout.out_iv on each candidate layout.
+
+    out_iv is the iteration variable index of the stick in this node's output,
+    in this node's IV namespace.  Pre-computed here so optimize_restickify.py
+    can read it without calling device_coordinates.
+    Skips layouts where output_dep is not a MemoryDep (e.g. StarDep).
+    """
+    if not isinstance(output_dep, MemoryDep):
+        for layout in layouts:
+            layout.out_iv = -1
+        return
+    for layout in layouts:
+        idc = device_coordinates(layout, output_dep)
+        layout.out_iv = iter_var_id(idc[-1])
+
+
 def generic_layout(op: Operation) -> FixedTiledLayout:
     output: FixedLayout = op.get_layout()
     # Concretize for C++ SpyreTensorLayout constructor.
@@ -657,6 +707,8 @@ def propagate_spyre_tensor_layouts(
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported("graph input {name} does not have a FixedLayout")
                 ftl = FixedTiledLayout(ptl.device, ptl.dtype, ptl.size, ptl.stride, stl)
+                write_dep = _make_identity_write_dep(ftl)
+                ftl.out_iv = iter_var_id(device_coordinates(ftl, write_dep)[-1])
                 print("Created FixedTiledLayout for Input:", name)
                 print(ftl)
                 tb.layouts = {ftl}
@@ -668,6 +720,7 @@ def propagate_spyre_tensor_layouts(
     for op in it:
         if op.is_no_op():
             op.layouts = [generic_layout(op)]
+            _stamp_out_ivs(op.layouts, next(iter(op.get_read_writes().writes)))
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 # Mutation ops (e.g. spyre.overwrite) must keep their
@@ -688,11 +741,14 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = reduction_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
+            if hasattr(op, "layouts"):
+                _stamp_out_ivs(op.layouts, output_dep)
         elif isinstance(op, FallbackKernel):
             op = next(it, None)
             if not isinstance(op, MultiOutput):
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             op.layouts = [generic_layout(op)]
+            _stamp_out_ivs(op.layouts, next(iter(op.get_read_writes().writes)))
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

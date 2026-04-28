@@ -192,6 +192,23 @@ def test_4d_x_plus_transpose13(tensors_4d):
     _compare(lambda a, x: x + a.transpose(1, 3), a, x)
 
 
+# View + unsqueeze tests
+
+
+def test_view_unsqueeze_add():
+    d0, d1, d2, d3, d4 = 2, 3, 4, 2, 64
+    a = torch.randn((1, d0, d1 * d3 * d4), dtype=torch.float16) * 0.1
+    b = torch.randn((1, d0, d1 * d3 * d4), dtype=torch.float16) * 0.1
+    c = torch.randn((1, d0, d2, d3, d4), dtype=torch.float16) * 0.1
+
+    def func(a, b, c):
+        x = a + b
+        z = x.view(1, d0, d1, d3, d4)
+        return z.unsqueeze(2) + c.unsqueeze(3)
+
+    _compare(func, a, b, c)
+
+
 # Expand tests
 SIZES_EXPAND = [(128, 256)]
 

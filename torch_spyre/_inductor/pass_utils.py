@@ -27,7 +27,6 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.constants import MAX_RESTICK_COST as _MAX_RESTICK_COST
 
 from .ir import FixedTiledLayout
 from .views import compute_coordinates
@@ -151,84 +150,6 @@ def iter_var_id(stick_expr) -> int:
     while i >= 0 and name[i].isdigit():
         i -= 1
     return int(name[i + 1 :])
-
-
-class RestickCost:
-    """Thin 2-D cost table for one input arg.
-
-    Indexed [in_iv][out_iv] where iv = iteration variable index:
-      the numeric suffix N of the loop variable dN whose Mod(dN,64) is the stick.
-      e.g. Mod(d2,64) -> iv=2.
-    This is NOT a tensor dimension index.
-
-    required_out_iv:
-      None = use op.chosen_stick_iv (decided by select_restickify_locations, for pointwise)
-      int  = pinned to a specific iter var (for matmul, each arg has its own)
-    """
-
-    def __init__(self, dep: "MemoryDep", n: int, required_out_iv: "int | None" = None):
-        self.dep = dep
-        self.required_out_iv = required_out_iv
-        self.has_no_stick = False  # True for scalar/broadcast args (no real stick)
-        self._cost = [[_MAX_RESTICK_COST] * n for _ in range(n)]
-        self._target: list[list] = [[None] * n for _ in range(n)]
-
-    def mark_no_stick(self) -> None:
-        """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
-        self.has_no_stick = True
-
-    def set(self, in_iv: int, out_iv: int, cost: int, target) -> None:
-        """in_iv, out_iv are iteration variable indices (NOT tensor dim indices)."""
-        self._cost[in_iv][out_iv] = cost
-        self._target[in_iv][out_iv] = target
-
-    def format_table(self) -> str:
-        if self.has_no_stick:
-            return "    (no stick — compatible with any output at zero cost)"
-        lines = []
-        for in_iv, (row, trow) in enumerate(zip(self._cost, self._target)):
-            for out_iv, (cost, tgt) in enumerate(zip(row, trow)):
-                if cost == _MAX_RESTICK_COST:
-                    lines.append(f"    iv{in_iv}->iv{out_iv} = MAX (infeasible)")
-                else:
-                    lines.append(
-                        f"    iv{in_iv}->iv{out_iv} = {cost}"
-                        f"  target_stride_map={list(tgt.device_layout.stride_map)}"
-                    )
-        return "\n".join(lines)
-
-    def min_cost_for_out(self, out_iv: int) -> float:
-        """Minimum cost across all in iter vars to reach out_iv."""
-        if self.has_no_stick:
-            return 0
-        return min(row[out_iv] for row in self._cost)
-
-    def best_target_for_out(self, out_iv: int):
-        """Returns (cost, target_layout) for cheapest transition to out_iv."""
-        if self.has_no_stick:
-            return 0, None
-        best_cost = _MAX_RESTICK_COST
-        best_tgt = None
-        for row, trow in zip(self._cost, self._target):
-            if row[out_iv] < best_cost:
-                best_cost = row[out_iv]
-                best_tgt = trow[out_iv]
-        return best_cost, best_tgt
-
-    def cost_and_target(self, in_iv: "int | None", out_iv: int):
-        """Returns (cost, target_layout) for in_iv -> out_iv.
-
-        in_iv=None: input's committed iter var unknown, falls back to best_target_for_out.
-        has_no_stick args always return (0, None).
-        Both in_iv and out_iv are iteration variable indices (NOT tensor dim indices).
-        """
-        if self.has_no_stick:
-            return 0, None
-        if in_iv is None:
-            return self.best_target_for_out(out_iv)
-        if in_iv >= len(self._cost) or out_iv >= len(self._cost[in_iv]):
-            return _MAX_RESTICK_COST, None
-        return self._cost[in_iv][out_iv], self._target[in_iv][out_iv]
 
 
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:

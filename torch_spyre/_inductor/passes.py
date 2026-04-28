@@ -40,8 +40,8 @@ from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
-from .optimize_restickify import select_restickify_locations
-from .insert_restickify import insert_restickify, schedule_restickify_pass
+from .optimize_restickify import optimize_restickify_locations
+from .insert_restickify import insert_restickify, finalize_layouts
 from .core_division import core_division_planning
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
@@ -225,12 +225,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
-        select_restickify_locations(operations)
-        schedule_restickify_pass(operations)
-        from torch._inductor.virtualized import V
-        from .insert_restickify import _format_restickify_plan
-
-        _format_restickify_plan(getattr(V.graph, "restickify_plan", {}))
+        optimize_restickify_locations(operations)
+        finalize_layouts(operations)
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:

@@ -185,18 +185,49 @@ def insert_restickify(operations: list[Operation]) -> None:
             )
 
 
-def schedule_restickify_pass(operations: list) -> None:
-    """Populate V.graph.restickify_plan from op.arg_restick_costs.
+def finalize_layouts(operations: list) -> None:
+    """Commit chosen layouts and populate V.graph.restickify_plan.
 
-    Called after select_restickify_locations has set op.layout and op.chosen_stick_iv on
-    every op.  For each arg whose committed stick differs from the required
-    output stick, records a restickify entry.
+    Called after optimize_restickify_locations has set op.chosen_layout and
+    op.chosen_stick_iv on every op.  For each op:
+      1. Assigns op.layout from op.chosen_layout and stamps op.committed_out_iv.
+      2. For each arg whose committed stick differs from the required output
+         stick, records a restickify entry in V.graph.restickify_plan.
+
+    Also commits layouts for graph input TensorBoxes that carry op.layouts sets
+    from propagate_spyre_tensor_layouts.
     """
+    from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
+
+    # Commit layouts for graph inputs.
+    for name in V.graph.graph_input_names:
+        tb = V.graph.graph_inputs[name]
+        if (
+            isinstance(tb, TensorBox)
+            and isinstance(tb.data, StorageBox)
+            and isinstance(tb.data.data, InputBuffer)
+            and hasattr(tb, "layouts")
+        ):
+            chosen = next(iter(tb.layouts))
+            tb.data.data.layout = chosen
+            tb.data.data.committed_out_iv = chosen.out_iv
+            del tb.layouts
+
     restickify_plan = getattr(V.graph, "restickify_plan", {})
     print()
-    print("=== In schedule_restickify_pass ===")
+    print("=== In finalize_layouts ===")
 
     for op in operations:
+        # Commit chosen layout.
+        chosen = getattr(op, "chosen_layout", None)
+        if chosen is not None:
+            op.layout = chosen
+            op.committed_out_iv = chosen.out_iv
+            del op.chosen_layout
+            if hasattr(op, "layouts"):
+                del op.layouts
+
+        # Populate restickify_plan for ops that need edge restickifies.
         costs = getattr(op, "arg_restick_costs", None)
         if not costs:
             continue
@@ -223,7 +254,7 @@ def schedule_restickify_pass(operations: list) -> None:
                 print("    -> no restickify needed (cost=0)")
                 continue
             assert tgt is not None and cost < MAX_RESTICK_COST, (
-                f"schedule_restickify_pass: inviable restickify for "
+                f"finalize_layouts: inviable restickify for "
                 f"arg={rc.dep.name} in_iv={in_iv} -> out_iv={out_iv} "
                 f"op={op.get_name()} cost={cost}"
             )
