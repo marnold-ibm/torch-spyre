@@ -30,26 +30,15 @@ class EdgeCostMap:
       e.g. Mod(d2,64) -> iv=2.
     This is NOT a tensor dimension index.
 
-    upstream_out_iv_to_local_in_iv translates from the upstream buffer's output
-    IV namespace into this node's in_iv row index.  Indexed by upstream IV;
-    value is the corresponding in_iv in this node's namespace; -1 = unmapped.
-
-    required_out_iv (optional, set after construction):
-      None = use op.chosen_stick_iv (decided by select_restickify_locations, for pointwise)
-      int  = pinned to a specific iter var (for matmul, each arg has its own)
     """
 
     def __init__(self, dep: "MemoryDep", n: int):
         # dep is kept for IR passes (insert_restickify) that need the buffer name
         # and read index.  Cost optimization code does not and should not use it
         self.dep = dep
-        self.required_out_iv: "int | None" = None
         self.has_no_stick = False  # True for scalar/broadcast args (no real stick)
         self._cost = [[INF] * n for _ in range(n)]
         self._target: list[list] = [[None] * n for _ in range(n)]
-        # Indexed by upstream buffer's output IV (upstream's namespace).
-        # Value is the in_iv row index in this node's namespace. -1 = unmapped.
-        self.upstream_out_iv_to_local_in_iv: list[int] = [-1] * n
 
     def mark_no_stick(self) -> None:
         """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
@@ -109,25 +98,6 @@ class EdgeCostMap:
         return self._cost[in_iv][out_iv], self._target[in_iv][out_iv]
 
 
-def edge_cost_for_out(rc: "EdgeCostMap", upstream_committed_iv: int, out_iv: int) -> int:
-    """Cost for rc's arg to reach out_iv.
-
-    upstream_committed_iv: the chosen output IV of the upstream buffer, in the
-        upstream buffer's IV namespace.  Pass -1 if unknown (falls back to
-        minimum cost across all input IVs).
-    out_iv: target output IV of this node, in this node's IV namespace.
-    rc.upstream_out_iv_to_local_in_iv translates between the two namespaces.
-    """
-    if rc.has_no_stick:
-        return 0
-    if upstream_committed_iv < 0 or upstream_committed_iv >= len(rc.upstream_out_iv_to_local_in_iv):
-        return rc.min_cost_for_out(out_iv)
-    in_iv = rc.upstream_out_iv_to_local_in_iv[upstream_committed_iv]
-    if in_iv == -1:
-        return rc.min_cost_for_out(out_iv)
-    return rc.cost_and_target(in_iv, out_iv)[0]
-
-
 class RestickNodeCost(abc.ABC):
 
     def __init__(self, edge_costs):
@@ -139,41 +109,22 @@ class RestickNodeCost(abc.ABC):
 
 class AllSameNode(RestickNodeCost):
 
-    def cost_for_out(self, out_iv: int, upstream_committed_ivs: "list[int] | None" = None) -> int:
-        """Cost to produce output at out_iv.
-
-        upstream_committed_ivs: per-edge upstream output IV (upstream's namespace),
-            or None/-1 entries when unknown (falls back to min cost across all IVs).
-        """
-        if upstream_committed_ivs is None:
-            upstream_committed_ivs = [-1] * len(self.edge_costs)
-        in_edge_costs = [
-            edge_cost_for_out(rc, committed_iv, out_iv)
-            for rc, committed_iv in zip(self.edge_costs, upstream_committed_ivs)
-        ]
+    def cost_for_out(self, out_iv: int) -> int:
+        in_edge_costs = [rc.min_cost_for_out(out_iv) for rc in self.edge_costs]
         return INF if INF in in_edge_costs else sum(in_edge_costs)
 
 
-class FixedOutNode(RestickNodeCost):
+class FixedInOutNode(RestickNodeCost):
 
-    def __init__(self, edge_costs, required_out_iv: int):
+    def __init__(self, edge_costs, required_out_iv: int, required_in_iv: "list[int]"):
         super().__init__(edge_costs)
         self.required_out_iv = required_out_iv
+        self.required_in_iv = required_in_iv
 
-    def cost_for_out(self, out_iv: int, upstream_committed_ivs: "list[int] | None" = None) -> int:
-        """Cost to produce output at out_iv.
-
-        upstream_committed_ivs: per-edge upstream output IV (upstream's namespace),
-            or None/-1 entries when unknown (falls back to min cost across all IVs).
-        """
+    def cost_for_out(self, out_iv: int) -> int:
         if out_iv != self.required_out_iv:
             return INF
-        if upstream_committed_ivs is None:
-            upstream_committed_ivs = [-1] * len(self.edge_costs)
-        in_edge_costs = [
-            edge_cost_for_out(rc, committed_iv, out_iv)
-            for rc, committed_iv in zip(self.edge_costs, upstream_committed_ivs)
-        ]
+        in_edge_costs = [rc.min_cost_for_out(out_iv) for rc in self.edge_costs]
         return INF if INF in in_edge_costs else sum(in_edge_costs)
 
 

@@ -51,7 +51,7 @@ from .pass_utils import (
     device_coordinates,
     iter_var_id,
 )
-from .optimize_restickify import EdgeCostMap, AllSameNode, FixedOutNode
+from .optimize_restickify import EdgeCostMap, AllSameNode, FixedInOutNode
 from .views import matching_dim
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -125,8 +125,7 @@ def build_edge_restick_costs(
     """Build one EdgeCostMap per arg for the given candidate output sticks.
 
     All IV indices in the cost table are in THIS NODE's iteration variable
-    namespace.  upstream_out_iv_to_local_in_iv translates from the upstream
-    buffer's output IV namespace into this node's in_iv row index.
+    namespace.
     """
     alliter_var_ids: set[int] = {iter_var_id(e) for e in stick_exprs}
     for arg in args:
@@ -138,8 +137,6 @@ def build_edge_restick_costs(
     result: list[EdgeCostMap] = []
     for arg in args:
         rc = EdgeCostMap(arg.dep, n)
-        # Build upstream write dep for IV namespace translation.
-        upstream_buf = V.graph.get_buffer(arg.dep.name)
         for layout in arg.layouts:
             ic = host_coordinates(layout, arg.dep)
             idc = device_coordinates(layout, arg.dep)
@@ -147,14 +144,6 @@ def build_edge_restick_costs(
             if local_in_iv == -1:
                 rc.mark_no_stick()
                 continue
-            # Translate: upstream output IV (upstream's namespace) → local in_iv.
-            if isinstance(upstream_buf, ComputedBuffer):
-                upstream_write_dep = next(iter(upstream_buf.get_read_writes().writes))
-            else:
-                upstream_write_dep = _make_identity_write_dep(layout)
-            upstream_out_iv = iter_var_id(device_coordinates(layout, upstream_write_dep)[-1])
-            if 0 <= upstream_out_iv < n:
-                rc.upstream_out_iv_to_local_in_iv[upstream_out_iv] = local_in_iv
 
             in_iv = local_in_iv
             rc.set(in_iv, in_iv, 0, layout)  # staying on same iter var is always free
@@ -602,20 +591,21 @@ def reduction_layouts(
             )
 
         x_rc = build_edge_restick_costs([x], {reduction_coord})[0]
-        x_rc.required_out_iv = iter_var_id(reduction_coord)
         y_rc = build_edge_restick_costs([y], {generated_coord})[0]
-        y_rc.required_out_iv = iter_var_id(generated_coord)
+        x_req_iv = iter_var_id(reduction_coord)
+        y_req_iv = iter_var_id(generated_coord)
         op.arg_restick_costs = [x_rc, y_rc]
-        op.restick_cost_fn = FixedOutNode([x_rc, y_rc], iter_var_id(generated_coord))
+        op.restick_cost_fn = FixedInOutNode(
+            [x_rc, y_rc],
+            required_out_iv=y_req_iv,
+            required_in_iv=[x_req_iv, y_req_iv],
+        )
 
         print(f"MRA EdgeCostmap tables for {op.get_name()}:")
-        print(f"  x ({x.dep.name}) required_out_iv=iv{x_rc.required_out_iv}:")
+        print(f"  x ({x.dep.name}) required_in_iv=iv{x_req_iv}:")
         print(x_rc.format_table())
-        print(f"  y ({y.dep.name}) required_out_iv=iv{y_rc.required_out_iv}:")
+        print(f"  y ({y.dep.name}) required_in_iv=iv{y_req_iv}:")
         print(y_rc.format_table())
-
-        x_req_iv = x_rc.required_out_iv
-        y_req_iv = y_rc.required_out_iv
         if x_rc.min_cost_for_out(x_req_iv) >= MAX_RESTICK_COST:
             raise Unsupported(
                 f"{data.reduction_type}: x arg cannot reach required stick iv{x_req_iv}"

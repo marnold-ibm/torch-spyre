@@ -231,20 +231,23 @@ def finalize_layouts(operations: list) -> None:
         costs = getattr(op, "arg_restick_costs", None)
         if not costs:
             continue
+        cost_fn = op.restick_cost_fn
+        chosen_stick_iv = getattr(op, "chosen_stick_iv", None)
         print(
-            f"  op={op.get_name()} chosen_stick_iv=iv{getattr(op, 'chosen_stick_iv', None)}"
+            f"  op={op.get_name()} chosen_stick_iv=iv{chosen_stick_iv}"
         )
-        for rc in costs:
-            out_iv = (
-                rc.required_out_iv
-                if rc.required_out_iv is not None
-                else getattr(op, "chosen_stick_iv", None)
+        for i, rc in enumerate(costs):
+            required_in_iv = (
+                cost_fn.required_in_iv[i]
+                if hasattr(cost_fn, "required_in_iv")
+                else None
             )
+            out_iv = required_in_iv if required_in_iv is not None else chosen_stick_iv
             buf = V.graph.get_buffer(rc.dep.name)
             in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
             cost, tgt = rc.cost_and_target(in_iv, out_iv)
             print(
-                f"    arg={rc.dep.name} in_iv=iv{in_iv} required_out_iv=iv{rc.required_out_iv} "
+                f"    arg={rc.dep.name} in_iv=iv{in_iv} required_in_iv=iv{required_in_iv} "
                 f"out_iv=iv{out_iv} cost={cost} tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
             )
             if out_iv is None:
