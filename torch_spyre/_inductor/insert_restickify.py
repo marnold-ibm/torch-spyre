@@ -172,7 +172,7 @@ def insert_restickify(operations: list[Operation]) -> None:
     and splices the necessary ComputedBuffer nodes into the operations list
     in-place.  No scheduler state is touched.
     """
-    restickify_plan = getattr(V.graph, "restickify_plan", {})
+    restickify_plan = V.graph.restickify_plan
     if not restickify_plan:
         return
 
@@ -186,16 +186,15 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
-    """Commit chosen layouts and populate V.graph.restickify_plan.
+    """Commit chosen layouts and build V.graph.restickify_plan.
 
-    Called after optimize_restickify_locations has set op.stick_decisions (or
-    op.chosen_layout for ops without a cost function) on every op.  For each op:
-      1. Assigns op.layout from the chosen layout and stamps op.committed_out_iv.
-      2. For each arg whose committed stick differs from the required output
-         stick, records a restickify entry in V.graph.restickify_plan.
+    Called after optimize_restickify_locations. For each op:
+      1. Assigns op.layout from stick_decisions (or op.chosen_layout for ops
+         without a cost function) and stamps op.committed_out_iv.
+      2. For each arg that needs a stick conversion, records an entry in
+         V.graph.restickify_plan for insert_restickify to act on.
 
-    Also commits layouts for graph input TensorBoxes that carry op.layouts sets
-    from propagate_spyre_tensor_layouts.
+    Also commits layouts for graph input TensorBoxes.
     """
     from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
 
@@ -218,25 +217,25 @@ def finalize_layouts(operations: list) -> None:
     print("=== In finalize_layouts ===")
 
     for op in operations:
-        # Commit chosen layout.
         decisions = getattr(op, "stick_decisions", None)
-        chosen = decisions["chosen_layout"] if decisions else getattr(op, "chosen_layout", None)
+        costs = getattr(op, "arg_restick_costs", None)
+        chosen_layout = getattr(op, "chosen_layout", None)
+        for attr in ("layouts", "restick_cost_fn", "arg_restick_costs", "stick_decisions",
+                     "chosen_layout"):
+            if hasattr(op, attr):
+                delattr(op, attr)
+
+        # Commit chosen layout.
+        chosen = decisions["chosen_layout"] if decisions else chosen_layout
         if chosen is not None:
             op.layout = chosen
             op.committed_out_iv = chosen.out_iv
-            if hasattr(op, "chosen_layout"):
-                del op.chosen_layout
-            if hasattr(op, "layouts"):
-                del op.layouts
 
         # Populate restickify_plan for ops that need edge restickifies.
-        costs = getattr(op, "arg_restick_costs", None)
-        if not costs or not decisions:
+        if not decisions:
             continue
-        out_iv = decisions["out_iv"]
-        arg_in_ivs = decisions["arg_in_ivs"]
-        print(f"  op={op.get_name()} out_iv=iv{out_iv}")
-        for rc, required_in_iv in zip(costs, arg_in_ivs):
+        print(f"  op={op.get_name()} out_iv=iv{decisions['out_iv']}")
+        for rc, required_in_iv in zip(costs, decisions["arg_in_ivs"]):
             buf = V.graph.get_buffer(rc.dep.name)
             in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
             tgt = rc.target(in_iv, required_in_iv)
