@@ -14,12 +14,10 @@
 
 
 import abc
-import torch
-
-from .constants import MAX_RESTICK_COST as INF
-
+import math
 from torch._inductor.virtualized import V
 
+INF = math.inf
 
 class EdgeCostMap:
     """Thin 2-D cost table for one input arg.
@@ -44,7 +42,7 @@ class EdgeCostMap:
         """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
         self.has_no_stick = True
 
-    def set_cost_and_target(self, in_iv: int, out_iv: int, cost: int, target) -> None:
+    def set_cost_and_target(self, in_iv: int, out_iv: int, cost: float, target) -> None:
         """in_iv, out_iv are iteration variable indices (NOT tensor dim indices)."""
         self._cost[in_iv][out_iv] = cost
         self._target[in_iv][out_iv] = target
@@ -126,13 +124,13 @@ class FixedInOutNode(RestickNodeCost):
         return list(self.required_in_iv)
 
 
-class PassthroughNode(RestickNodeCost):
+# class PassthroughNode(RestickNodeCost):
 
-    def __init__(self):
-        pass
+#     def __init__(self):
+#         pass
 
-    def cost_for_out(self, out_iv: int) -> int:
-        return 0
+#     def cost_for_out(self, out_iv: int) -> int:
+#         return 0
 
 
 def record_stick_decisions(op, cost_fn, chosen_layout, out_iv: int) -> None:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+import math
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
@@ -20,8 +20,6 @@ MATMUL_REDUCTION_OP = "matmul"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
 DEVICE_NAME = "spyre"
-
-MAX_RESTICK_COST = sys.maxsize
 
 
 SEGMENT_OFFSETS = [

@@ -218,10 +218,9 @@ def finalize_layouts(operations: list) -> None:
 
     for op in operations:
         decisions = getattr(op, "stick_decisions", None)
-        costs = getattr(op, "arg_restick_costs", None)
+        cost_fn = getattr(op, "restick_cost_fn", None)
         chosen_layout = getattr(op, "chosen_layout", None)
-        for attr in ("layouts", "restick_cost_fn", "arg_restick_costs", "stick_decisions",
-                     "chosen_layout"):
+        for attr in ("layouts", "restick_cost_fn", "stick_decisions", "chosen_layout"):
             if hasattr(op, attr):
                 delattr(op, attr)
 
@@ -235,7 +234,9 @@ def finalize_layouts(operations: list) -> None:
         if not decisions:
             continue
         print(f"  op={op.get_name()} out_iv=iv{decisions['out_iv']}")
-        for rc, required_in_iv in zip(costs, decisions["arg_in_ivs"]):
+        if cost_fn is None:
+            continue
+        for rc, required_in_iv in zip(cost_fn.edge_costs, decisions["arg_in_ivs"]):
             buf = V.graph.get_buffer(rc.dep.name)
             in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
             tgt = rc.target(in_iv, required_in_iv)

@@ -379,7 +379,6 @@ def pointwise_layouts(
                     f"stick_exprs={stick_exprs}"
                 )
 
-            op.arg_restick_costs = edge_costs
             op.restick_cost_fn = AllSameNode(edge_costs)
 
         # If the indexing and device element size are identical
@@ -592,7 +591,6 @@ def reduction_layouts(
         y_rc = build_edge_restick_costs([y], {generated_coord})[0]
         x_req_iv = iter_var_id(reduction_coord)
         y_req_iv = iter_var_id(generated_coord)
-        op.arg_restick_costs = [x_rc, y_rc]
         op.restick_cost_fn = FixedInOutNode(
             [x_rc, y_rc],
             required_out_iv=y_req_iv,
