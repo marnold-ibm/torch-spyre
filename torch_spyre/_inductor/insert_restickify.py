@@ -17,6 +17,7 @@ from collections import defaultdict
 
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
+from .optimize_restickify import FixedInOutNode
 from .pass_utils import device_coordinates, iter_var_id
 from torch._inductor.ir import ComputedBuffer, Operation, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
@@ -236,21 +237,27 @@ def finalize_layouts(operations: list) -> None:
         print(f"  op={op.get_name()} out_iv=iv{decisions['out_iv']}")
         if cost_fn is None:
             continue
-        for rc, required_in_iv in zip(cost_fn.edge_costs, decisions["arg_in_ivs"]):
+        out_iv = decisions["out_iv"]
+        required_in_ivs = (
+            cost_fn.required_in_iv
+            if isinstance(cost_fn, FixedInOutNode)
+            else [out_iv] * len(cost_fn.edge_costs)
+        )
+        for rc, req_iv in zip(cost_fn.edge_costs, required_in_ivs):
             buf = V.graph.get_buffer(rc.dep.name)
             in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
-            tgt = rc.target(in_iv, required_in_iv)
+            tgt = rc.target(in_iv, req_iv)
             print(
-                f"    arg={rc.dep.name} in_iv=iv{in_iv} required_in_iv=iv{required_in_iv} "
+                f"    arg={rc.dep.name} in_iv=iv{in_iv} required_in_iv=iv{req_iv} "
                 f"tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
             )
             if tgt is None:
                 print("    -> no restickify needed")
                 continue
-            print(f"    -> scheduling restickify iv{in_iv} -> iv{required_in_iv}")
+            print(f"    -> scheduling restickify iv{in_iv} -> iv{req_iv}")
             logger.warning(
                 f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
-                f"iv{in_iv} -> iv{required_in_iv} "
+                f"iv{in_iv} -> iv{req_iv} "
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
             )
             _record_restickify(op, rc.dep.name, tgt, restickify_plan)

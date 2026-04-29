@@ -138,6 +138,8 @@ def build_edge_restick_costs(
     result: list[EdgeCostMap] = []
     for arg in args:
         rc = EdgeCostMap(arg.dep, n)
+        # Build upstream write dep for IV namespace translation.
+        upstream_buf = V.graph.get_buffer(arg.dep.name)
         for layout in arg.layouts:
             ic = host_coordinates(layout, arg.dep)
             idc = device_coordinates(layout, arg.dep)
@@ -147,6 +149,24 @@ def build_edge_restick_costs(
                 continue
 
             in_iv = local_in_iv
+            # Translate upstream buffer's output IV namespace → local in_iv.
+            # For ComputedBuffers, the write dep uses the upstream's loop vars.
+            # For InputBuffers, there is no upstream op — the input's stick IV
+            # is already in this node's loop var namespace, so upstream_out_iv
+            # equals local_in_iv directly.
+            if isinstance(upstream_buf, ComputedBuffer):
+                upstream_write_dep = next(iter(upstream_buf.get_read_writes().writes))
+                upstream_out_iv = iter_var_id(device_coordinates(layout, upstream_write_dep)[-1])
+            else:
+                # InputBuffer: no upstream op; the input's stick IV is already
+                # in this node's loop var namespace.  Also fix layout.out_iv
+                # which was stamped using _make_identity_write_dep (_w symbols)
+                # and therefore got the device dim index instead of the loop var index.
+                upstream_out_iv = local_in_iv
+                layout.out_iv = local_in_iv
+            if 0 <= upstream_out_iv < n:
+                rc.upstream_out_iv_to_local_in_iv[upstream_out_iv] = in_iv
+
             rc.set_cost_and_target(in_iv, in_iv, 0, layout)  # staying on same iter var is always free
             for out_expr in stick_exprs:
                 out_iv = iter_var_id(out_expr)
@@ -214,6 +234,59 @@ def compute_restickify_target_layout(
     return FixedTiledLayout(
         layout.device, layout.dtype, layout.size, layout.stride, stl
     )
+
+
+def _collect_stick_exprs(args: "list[SchedNodeArg]") -> set:
+    exprs = set()
+    for arg in args:
+        for layout in arg.layouts:
+            idc = device_coordinates(layout, arg.dep)
+            if idc[-1] != 0:
+                exprs.add(idc[-1])
+    return exprs
+
+
+def _attach_all_same_cost_fn(
+    op: Operation, args: "list[SchedNodeArg]", stick_exprs: set
+) -> None:
+    """Build and attach an AllSameNode cost function to op.
+
+    No-op when stick_exprs is empty (scalar/broadcast-only args).
+    Raises Unsupported if no stick is viable for all args.
+    """
+    print(f"MRA _attach_all_same_cost_fn ({op.get_name()}): stick_exprs={stick_exprs}")
+    if not stick_exprs:
+        print(f"MRA _attach_all_same_cost_fn ({op.get_name()}): no stick exprs, skipping")
+        return
+    for i, arg in enumerate(args):
+        for layout in arg.layouts:
+            ic = host_coordinates(layout, arg.dep)
+            idc = device_coordinates(layout, arg.dep)
+            dl = layout.device_layout
+            print(
+                f"MRA   arg {i} ({arg.dep.name}): host_coords={ic} device_coords={idc}"
+                f" stick_iv=iv{iter_var_id(idc[-1])}"
+                f" device_size={list(dl.device_size)} stride_map={list(dl.stride_map)}"
+            )
+    edge_costs = build_edge_restick_costs(args, stick_exprs)
+    print(f"MRA EdgeCostMap tables for {op.get_name()}:")
+    for i, (rc, arg) in enumerate(zip(edge_costs, args)):
+        print(f"  arg {i} ({arg.dep.name}):")
+        print(rc.format_table())
+    viable_sticks = [
+        e
+        for e in stick_exprs
+        if all(rc.feasible_for_out(iter_var_id(e)) for rc in edge_costs)
+    ]
+    print(f"MRA   viable_sticks={viable_sticks}")
+    if not viable_sticks:
+        raise Unsupported(
+            f"_attach_all_same_cost_fn ({op.get_name()}): no viable stick — "
+            f"every candidate stick is infeasible for at least one arg. "
+            f"stick_exprs={stick_exprs}"
+        )
+    op.restick_cost_fn = AllSameNode(edge_costs)
+    print(f"MRA   attached AllSameNode to {op.get_name()}")
 
 
 def first_arg_pointwise_layout(
@@ -322,11 +395,21 @@ def pointwise_layouts(
     print()
     print(f"MRA:  ====== In Pointwise ({op.get_name()})  ======")
 
-    if len(args) == 1 or aten_op == spyreop.layernormnorm.default:
-        return [
+    if aten_op == spyreop.layernormnorm.default:
+        layouts = [
             first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
             for layout in args[0].layouts
         ]
+        _attach_all_same_cost_fn(op, args[:1], _collect_stick_exprs(args[:1]))
+        return layouts
+
+    if len(args) == 1:
+        layouts = [
+            first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
+            for layout in args[0].layouts
+        ]
+        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args))
+        return layouts
     else:
         # Standard multi-input pointwise 
 
@@ -336,20 +419,12 @@ def pointwise_layouts(
                 ic = host_coordinates(layout, arg.dep)
                 idc = device_coordinates(layout, arg.dep)
                 print(
-                    f"MRA: arg {i} layout: host_coords={ic} device_coords={idc} stick_dim={matching_dim(ic, idc[-1])}"
+                    f"MRA: arg {i} layout: host_coords={ic} device_coords={idc}"
                 )
         print("MRA: out_coords:", host_coordinates(output, output_dep))
         print()
 
-        # Stick compatability check.
-        # For all tensors whose stick dimension is being iterated over,
-        # the indexing expression must be identical.
-        stick_exprs = set()
-        for arg in args:
-            for layout in arg.layouts:
-                idc = device_coordinates(layout, arg.dep)
-                if idc[-1] != 0:
-                    stick_exprs.add(idc[-1])
+        stick_exprs = _collect_stick_exprs(args)
         print("MRA: stick_exprs (from all layouts):", stick_exprs)
         stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
@@ -358,28 +433,7 @@ def pointwise_layouts(
                 f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
             )
 
-        # Build EdgeCostMap tables: one per arg, indexed [initer_var_id][outiter_var_id].
-        if stick_exprs:
-            edge_costs = build_edge_restick_costs(args, stick_exprs)
-
-            print(f"MRA EdgeCostMap tables for {op.get_name()}:")
-            for i, (rc, arg) in enumerate(zip(edge_costs, args)):
-                print(f"  arg {i} ({arg.dep.name}):")
-                print(rc.format_table())
-
-            viable_sticks = [
-                e
-                for e in stick_exprs
-                if all(rc.feasible_for_out(iter_var_id(e)) for rc in edge_costs)
-            ]
-            if not viable_sticks:
-                raise Unsupported(
-                    f"pointwise_layouts ({op.get_name()}): no viable stick — "
-                    f"every candidate stick is infeasible for at least one arg. "
-                    f"stick_exprs={stick_exprs}"
-                )
-
-            op.restick_cost_fn = AllSameNode(edge_costs)
+        _attach_all_same_cost_fn(op, args, stick_exprs)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -402,7 +456,8 @@ def pointwise_layouts(
                 can_use_same_layout = False
 
         results: list[FixedTiledLayout] = []
-        for stick_expr in stick_exprs if stick_exprs else {None}:
+        # Sort stick exprs for determinism
+        for stick_expr in sorted(stick_exprs, key=str) if stick_exprs else [None]:
             if can_use_same_layout:
                 template_stl = next(iter(args[0].layouts)).device_layout
                 stl = SpyreTensorLayout(
@@ -505,11 +560,32 @@ def reduction_layouts(
 ) -> list[FixedTiledLayout]:
     data = op.data
 
+    print()
+    print(f"MRA:  ====== In Reduction ({op.get_name()})  ======")
+    print(f"MRA reduction_layouts ({op.get_name()}) output_dep: index={output_dep.index} ranges={output_dep.ranges}")
+    print(f"MRA reduction_layouts ({op.get_name()}) args[0].dep: index={args[0].dep.index} ranges={args[0].dep.ranges}")
+
     if len(args) == 1:
-        return [
-            first_arg_reduction_layout(op, output, output_dep, args[0].dep, layout)
-            for layout in args[0].layouts
-        ]
+        layouts = []
+        for layout in args[0].layouts:
+            dl = layout.device_layout
+            idc = device_coordinates(layout, args[0].dep)
+            print(
+                f"MRA reduction_layouts ({op.get_name()}) input layout:"
+                f" device_size={list(dl.device_size)} stride_map={list(dl.stride_map)}"
+                f" stick_iv=iv{iter_var_id(idc[-1])}"
+            )
+            out_layout = first_arg_reduction_layout(op, output, output_dep, args[0].dep, layout)
+            out_dl = out_layout.device_layout
+            out_idc = device_coordinates(out_layout, output_dep)
+            print(
+                f"MRA reduction_layouts ({op.get_name()}) output layout:"
+                f" device_size={list(out_dl.device_size)} stride_map={list(out_dl.stride_map)}"
+                f" stick_iv=iv{iter_var_id(out_idc[-1])}"
+            )
+            layouts.append(out_layout)
+        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args))
+        return layouts
     else:
         # matmul/bmm
         assert data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP), (

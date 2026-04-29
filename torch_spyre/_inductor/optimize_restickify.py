@@ -19,6 +19,7 @@ from torch._inductor.virtualized import V
 
 INF = math.inf
 
+
 class EdgeCostMap:
     """Thin 2-D cost table for one input arg.
 
@@ -37,6 +38,10 @@ class EdgeCostMap:
         self.has_no_stick = False  # True for scalar/broadcast args (no real stick)
         self._cost = [[INF] * n for _ in range(n)]
         self._target: list[list] = [[None] * n for _ in range(n)]
+        # Translates from the upstream buffer's output IV namespace into this
+        # node's in_iv row index.  Indexed by upstream IV; value is the
+        # corresponding local in_iv; None = unmapped.
+        self.upstream_out_iv_to_local_in_iv: "list[int | None]" = [None] * n
 
     def mark_no_stick(self) -> None:
         """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
@@ -67,22 +72,26 @@ class EdgeCostMap:
             return True
         return any(row[out_iv] < INF for row in self._cost)
 
-    def cost(self, in_iv: int, out_iv: int) -> int:
-        """Cost for in_iv -> out_iv transition."""
+    def local_in_iv(self, upstream_iv: int) -> int:
+        """Translate upstream committed IV to this node's local in_iv."""
+        assert not self.has_no_stick
+        result = self.upstream_out_iv_to_local_in_iv[upstream_iv]
+        assert result is not None, (
+            f"upstream IV {upstream_iv} not in map {self.upstream_out_iv_to_local_in_iv}"
+        )
+        return result
+
+    def cost(self, in_iv: int, out_iv: int) -> float:
+        """Cost for local in_iv -> out_iv transition."""
         if self.has_no_stick:
             return 0
-        if in_iv >= len(self._cost) or out_iv >= len(self._cost[in_iv]):
-            return INF
         return self._cost[in_iv][out_iv]
 
     def target(self, in_iv: int, out_iv: int):
         """Target layout for in_iv -> out_iv, or None if no restickify needed."""
         if self.has_no_stick or in_iv == out_iv:
             return None
-        if in_iv >= len(self._target) or out_iv >= len(self._target[in_iv]):
-            return None
         return self._target[in_iv][out_iv]
-
 
 
 class RestickNodeCost(abc.ABC):
@@ -91,17 +100,16 @@ class RestickNodeCost(abc.ABC):
         self.edge_costs = edge_costs
 
     @abc.abstractmethod
-    def cost_for_out(self, out_iv: int) -> int: ...
+    def cost(self, upstream_ivs: "list[int]", out_iv: int) -> float: ...
 
 
 class AllSameNode(RestickNodeCost):
 
-    def cost_for_out(self, out_iv: int) -> int:
-        in_edge_costs = [rc.cost(out_iv, out_iv) for rc in self.edge_costs]
-        return INF if INF in in_edge_costs else sum(in_edge_costs)
-
-    def arg_in_ivs(self, out_iv: int) -> "list[int]":
-        return [out_iv] * len(self.edge_costs)
+    def cost(self, upstream_ivs: "list[int]", out_iv: int) -> float:
+        return sum(
+            rc.cost(rc.local_in_iv(uiv), out_iv)
+            for rc, uiv in zip(self.edge_costs, upstream_ivs)
+        )
 
 
 class FixedInOutNode(RestickNodeCost):
@@ -111,33 +119,20 @@ class FixedInOutNode(RestickNodeCost):
         self.required_out_iv = required_out_iv
         self.required_in_iv = required_in_iv
 
-    def cost_for_out(self, out_iv: int) -> int:
+    def cost(self, upstream_ivs: "list[int]", out_iv: int) -> float:
         if out_iv != self.required_out_iv:
             return INF
-        in_edge_costs = [
-            rc.cost(in_iv, out_iv)
-            for rc, in_iv in zip(self.edge_costs, self.required_in_iv)
-        ]
-        return INF if INF in in_edge_costs else sum(in_edge_costs)
-
-    def arg_in_ivs(self, out_iv: int) -> "list[int]":
-        return list(self.required_in_iv)
+        return sum(
+            rc.cost(rc.local_in_iv(uiv), req_iv)
+            for rc, uiv, req_iv in zip(self.edge_costs, upstream_ivs, self.required_in_iv)
+        )
 
 
-# class PassthroughNode(RestickNodeCost):
-
-#     def __init__(self):
-#         pass
-
-#     def cost_for_out(self, out_iv: int) -> int:
-#         return 0
-
-
-def record_stick_decisions(op, cost_fn, chosen_layout, out_iv: int) -> None:
+def record_stick_decisions(op, chosen_layout, out_iv: int, upstream_ivs: "list[int]") -> None:
     op.stick_decisions = {
         "chosen_layout": chosen_layout,
         "out_iv": out_iv,
-        "arg_in_ivs": cost_fn.arg_in_ivs(out_iv),
+        "arg_upstream_ivs": upstream_ivs,
     }
 
 
@@ -146,57 +141,50 @@ def optimize_restickify_locations(operations: list) -> None:
     always_choose_first_arg_stick(operations)
 
 
-def propagate_passthrough(op) -> "FixedTiledLayout":
-    """Pick the best layout for a node with no restick_cost_fn.
-
-    If there is only one candidate, return it directly.  With multiple
-    candidates, forward-propagate: choose the layout whose output stick iv
-    matches the committed_out_iv of the first input arg.  Fall back to
-    layouts[0] if no match is found.
-    """
-    if len(op.layouts) == 1:
-        return op.layouts[0]
-
-    for read_dep in op.get_read_writes().reads:
-        buf = V.graph.get_buffer(read_dep.name)
-        in_iv = getattr(buf, "committed_out_iv", None)
-        if in_iv is None or in_iv == -1:
-            continue
-        for layout in op.layouts:
-            if layout.out_iv == in_iv:
-                return layout
-        break  # only match against first valid input arg
-    return op.layouts[0]
-
-
 def always_choose_first_arg_stick(operations: list) -> None:
     """
         Choose where to put restickiy
         Replicate braindead algorithm of always using first arg's stick
     """
 
+    from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
+
     print()
     print("=== In Collapse Layouts ===")
 
-    for op in operations:
-        if not hasattr(op, "layouts"):
-            continue
+    # Commit graph inputs first so all upstreams have committed_out_iv.
+    for name in V.graph.graph_input_names:
+        tb = V.graph.graph_inputs[name]
+        if (
+            isinstance(tb, TensorBox)
+            and isinstance(tb.data, StorageBox)
+            and isinstance(tb.data.data, InputBuffer)
+            and hasattr(tb, "layouts")
+        ):
+            chosen = next(iter(tb.layouts))
+            tb.data.data.layout = chosen
+            # get_buffer() returns the TensorBox for graph inputs, so set
+            # committed_out_iv on both the TensorBox and inner InputBuffer.
+            tb.data.data.committed_out_iv = chosen.out_iv
+            tb.committed_out_iv = chosen.out_iv
+            del tb.layouts
 
-        if not hasattr(op, "restick_cost_fn"):
-            chosen = propagate_passthrough(op)
-            print(
-                f"MRA select_restickify_locations ({op.get_name()}): "
-                f"no cost_fn, picked: {chosen}"
-            )
-            op.chosen_layout = chosen
-            continue
+    for op in operations:
+        assert hasattr(op, "layouts"), f"{op.get_name()} has no layouts - must handle"
+        assert hasattr(op, "restick_cost_fn"), f"{op.get_name()} has layouts but no restick_cost_fn - must handle"
 
         cost_fn = op.restick_cost_fn
+        upstream_ivs = [
+            V.graph.get_buffer(rc.dep.name).committed_out_iv
+            if not rc.has_no_stick else -1
+            for rc in cost_fn.edge_costs
+        ]
         chosen = op.layouts[0]
         out_iv = chosen.out_iv
-        cost = cost_fn.cost_for_out(out_iv)
+        cost = cost_fn.cost(upstream_ivs, out_iv)
         print(
             f"MRA select_restickify_locations ({op.get_name()}): "
-            f"stick=iv{out_iv} cost={cost} (first-arg layout)"
+            f"stick=iv{out_iv} cost={cost} upstream_ivs={upstream_ivs}"
         )
-        record_stick_decisions(op, cost_fn, chosen, out_iv)
+        op.committed_out_iv = out_iv
+        record_stick_decisions(op, chosen, out_iv, upstream_ivs)
