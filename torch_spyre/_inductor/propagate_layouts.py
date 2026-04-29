@@ -41,7 +41,7 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP, MAX_RESTICK_COST
+from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -124,6 +124,7 @@ def build_edge_restick_costs(
 ) -> "list[EdgeCostMap]":
     """Build one EdgeCostMap per arg for the given candidate output sticks.
 
+    Tables are indexed by iteration_variable index (eg, d0 --> 0)
     All IV indices in the cost table are in THIS NODE's iteration variable
     namespace.
     """
@@ -146,18 +147,18 @@ def build_edge_restick_costs(
                 continue
 
             in_iv = local_in_iv
-            rc.set(in_iv, in_iv, 0, layout)  # staying on same iter var is always free
+            rc.set_cost_and_target(in_iv, in_iv, 0, layout)  # staying on same iter var is always free
             for out_expr in stick_exprs:
                 out_iv = iter_var_id(out_expr)
                 if in_iv == out_iv:
-                    rc.set(in_iv, out_iv, 0, layout)
+                    rc.set_cost_and_target(in_iv, out_iv, 0, layout)
                 else:
                     tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
                     if tgt is not None:
                         cost = 1
                         for s in layout.size:
                             cost *= concretize_expr(s)
-                        rc.set(in_iv, out_iv, cost, tgt)
+                        rc.set_cost_and_target(in_iv, out_iv, cost, tgt)
         result.append(rc)
     return result
 
@@ -369,10 +370,7 @@ def pointwise_layouts(
             viable_sticks = [
                 e
                 for e in stick_exprs
-                if all(
-                    rc.min_cost_for_out(iter_var_id(e)) < MAX_RESTICK_COST
-                    for rc in edge_costs
-                )
+                if all(rc.feasible_for_out(iter_var_id(e)) for rc in edge_costs)
             ]
             if not viable_sticks:
                 raise Unsupported(
@@ -606,11 +604,11 @@ def reduction_layouts(
         print(x_rc.format_table())
         print(f"  y ({y.dep.name}) required_in_iv=iv{y_req_iv}:")
         print(y_rc.format_table())
-        if x_rc.min_cost_for_out(x_req_iv) >= MAX_RESTICK_COST:
+        if not x_rc.feasible_for_out(x_req_iv):
             raise Unsupported(
                 f"{data.reduction_type}: x arg cannot reach required stick iv{x_req_iv}"
             )
-        if y_rc.min_cost_for_out(y_req_iv) >= MAX_RESTICK_COST:
+        if not y_rc.feasible_for_out(y_req_iv):
             raise Unsupported(
                 f"{data.reduction_type}: y arg cannot reach required stick iv{y_req_iv}"
             )

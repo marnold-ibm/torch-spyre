@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import torch
+from collections import defaultdict
 
-from .constants import MAX_RESTICK_COST
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import device_coordinates, iter_var_id
@@ -34,7 +34,7 @@ def _record_restickify(
     restickify_plan: dict,
 ) -> None:
     """Append a restickify entry to restickify_plan."""
-    restickify_plan.setdefault(op.get_name(), []).append(
+    restickify_plan[op.get_name()].append(
         {"arg_name": dep_name, "target_layout": target_layout}
     )
 
@@ -188,9 +188,9 @@ def insert_restickify(operations: list[Operation]) -> None:
 def finalize_layouts(operations: list) -> None:
     """Commit chosen layouts and populate V.graph.restickify_plan.
 
-    Called after optimize_restickify_locations has set op.chosen_layout and
-    op.chosen_stick_iv on every op.  For each op:
-      1. Assigns op.layout from op.chosen_layout and stamps op.committed_out_iv.
+    Called after optimize_restickify_locations has set op.stick_decisions (or
+    op.chosen_layout for ops without a cost function) on every op.  For each op:
+      1. Assigns op.layout from the chosen layout and stamps op.committed_out_iv.
       2. For each arg whose committed stick differs from the required output
          stick, records a restickify entry in V.graph.restickify_plan.
 
@@ -213,58 +213,44 @@ def finalize_layouts(operations: list) -> None:
             tb.data.data.committed_out_iv = chosen.out_iv
             del tb.layouts
 
-    restickify_plan = getattr(V.graph, "restickify_plan", {})
+    restickify_plan = defaultdict(list)
     print()
     print("=== In finalize_layouts ===")
 
     for op in operations:
         # Commit chosen layout.
-        chosen = getattr(op, "chosen_layout", None)
+        decisions = getattr(op, "stick_decisions", None)
+        chosen = decisions["chosen_layout"] if decisions else getattr(op, "chosen_layout", None)
         if chosen is not None:
             op.layout = chosen
             op.committed_out_iv = chosen.out_iv
-            del op.chosen_layout
+            if hasattr(op, "chosen_layout"):
+                del op.chosen_layout
             if hasattr(op, "layouts"):
                 del op.layouts
 
         # Populate restickify_plan for ops that need edge restickifies.
         costs = getattr(op, "arg_restick_costs", None)
-        if not costs:
+        if not costs or not decisions:
             continue
-        cost_fn = op.restick_cost_fn
-        chosen_stick_iv = getattr(op, "chosen_stick_iv", None)
-        print(
-            f"  op={op.get_name()} chosen_stick_iv=iv{chosen_stick_iv}"
-        )
-        for i, rc in enumerate(costs):
-            required_in_iv = (
-                cost_fn.required_in_iv[i]
-                if hasattr(cost_fn, "required_in_iv")
-                else None
-            )
-            out_iv = required_in_iv if required_in_iv is not None else chosen_stick_iv
+        out_iv = decisions["out_iv"]
+        arg_in_ivs = decisions["arg_in_ivs"]
+        print(f"  op={op.get_name()} out_iv=iv{out_iv}")
+        for rc, required_in_iv in zip(costs, arg_in_ivs):
             buf = V.graph.get_buffer(rc.dep.name)
             in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
-            cost, tgt = rc.cost_and_target(in_iv, out_iv)
+            tgt = rc.target(in_iv, required_in_iv)
             print(
                 f"    arg={rc.dep.name} in_iv=iv{in_iv} required_in_iv=iv{required_in_iv} "
-                f"out_iv=iv{out_iv} cost={cost} tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
+                f"tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
             )
-            if out_iv is None:
-                print("    -> skip (out_iv is None)")
+            if tgt is None:
+                print("    -> no restickify needed")
                 continue
-            if cost == 0:
-                print("    -> no restickify needed (cost=0)")
-                continue
-            assert tgt is not None and cost < MAX_RESTICK_COST, (
-                f"finalize_layouts: inviable restickify for "
-                f"arg={rc.dep.name} in_iv={in_iv} -> out_iv={out_iv} "
-                f"op={op.get_name()} cost={cost}"
-            )
-            print(f"    -> scheduling restickify iv{in_iv} -> iv{out_iv}")
+            print(f"    -> scheduling restickify iv{in_iv} -> iv{required_in_iv}")
             logger.warning(
                 f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
-                f"iv{in_iv} -> iv{out_iv} "
+                f"iv{in_iv} -> iv{required_in_iv} "
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
             )
             _record_restickify(op, rc.dep.name, tgt, restickify_plan)

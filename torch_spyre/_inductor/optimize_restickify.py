@@ -44,7 +44,7 @@ class EdgeCostMap:
         """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
         self.has_no_stick = True
 
-    def set(self, in_iv: int, out_iv: int, cost: int, target) -> None:
+    def set_cost_and_target(self, in_iv: int, out_iv: int, cost: int, target) -> None:
         """in_iv, out_iv are iteration variable indices (NOT tensor dim indices)."""
         self._cost[in_iv][out_iv] = cost
         self._target[in_iv][out_iv] = target
@@ -64,17 +64,10 @@ class EdgeCostMap:
                     )
         return "\n".join(lines)
 
-    def best_target_for_out(self, out_iv: int):
-        """Returns (cost, target_layout) for cheapest transition to out_iv."""
+    def feasible_for_out(self, out_iv: int) -> bool:
         if self.has_no_stick:
-            return 0, None
-        best_cost = INF
-        best_tgt = None
-        for row, trow in zip(self._cost, self._target):
-            if row[out_iv] < best_cost:
-                best_cost = row[out_iv]
-                best_tgt = trow[out_iv]
-        return best_cost, best_tgt
+            return True
+        return any(row[out_iv] < INF for row in self._cost)
 
     def cost(self, in_iv: int, out_iv: int) -> int:
         """Cost for in_iv -> out_iv transition."""
@@ -84,20 +77,14 @@ class EdgeCostMap:
             return INF
         return self._cost[in_iv][out_iv]
 
-    def cost_and_target(self, in_iv: "int | None", out_iv: int):
-        """Returns (cost, target_layout) for in_iv -> out_iv.
+    def target(self, in_iv: int, out_iv: int):
+        """Target layout for in_iv -> out_iv, or None if no restickify needed."""
+        if self.has_no_stick or in_iv == out_iv:
+            return None
+        if in_iv >= len(self._target) or out_iv >= len(self._target[in_iv]):
+            return None
+        return self._target[in_iv][out_iv]
 
-        in_iv=None: input's committed iter var unknown, falls back to best_target_for_out.
-        has_no_stick args always return (0, None).
-        Both in_iv and out_iv are iteration variable indices (NOT tensor dim indices).
-        """
-        if self.has_no_stick:
-            return 0, None
-        if in_iv is None:
-            return self.best_target_for_out(out_iv)
-        if in_iv >= len(self._cost) or out_iv >= len(self._cost[in_iv]):
-            return INF, None
-        return self._cost[in_iv][out_iv], self._target[in_iv][out_iv]
 
 
 class RestickNodeCost(abc.ABC):
@@ -114,6 +101,9 @@ class AllSameNode(RestickNodeCost):
     def cost_for_out(self, out_iv: int) -> int:
         in_edge_costs = [rc.cost(out_iv, out_iv) for rc in self.edge_costs]
         return INF if INF in in_edge_costs else sum(in_edge_costs)
+
+    def arg_in_ivs(self, out_iv: int) -> "list[int]":
+        return [out_iv] * len(self.edge_costs)
 
 
 class FixedInOutNode(RestickNodeCost):
@@ -132,6 +122,9 @@ class FixedInOutNode(RestickNodeCost):
         ]
         return INF if INF in in_edge_costs else sum(in_edge_costs)
 
+    def arg_in_ivs(self, out_iv: int) -> "list[int]":
+        return list(self.required_in_iv)
+
 
 class PassthroughNode(RestickNodeCost):
 
@@ -142,13 +135,20 @@ class PassthroughNode(RestickNodeCost):
         return 0
 
 
-def optimize_restickify_locations(operations: list) -> None:
+def record_stick_decisions(op, cost_fn, chosen_layout, out_iv: int) -> None:
+    op.stick_decisions = {
+        "chosen_layout": chosen_layout,
+        "out_iv": out_iv,
+        "arg_in_ivs": cost_fn.arg_in_ivs(out_iv),
+    }
 
-    # Dumb, for now
+
+def optimize_restickify_locations(operations: list) -> None:
+    # Dumb implemntation for now
     always_choose_first_arg_stick(operations)
 
 
-def _pick_layout_for_skipped_node(op) -> "FixedTiledLayout":
+def propagate_passthrough(op) -> "FixedTiledLayout":
     """Pick the best layout for a node with no restick_cost_fn.
 
     If there is only one candidate, return it directly.  With multiple
@@ -185,7 +185,7 @@ def always_choose_first_arg_stick(operations: list) -> None:
             continue
 
         if not hasattr(op, "restick_cost_fn"):
-            chosen = _pick_layout_for_skipped_node(op)
+            chosen = propagate_passthrough(op)
             print(
                 f"MRA select_restickify_locations ({op.get_name()}): "
                 f"no cost_fn, picked: {chosen}"
@@ -201,13 +201,4 @@ def always_choose_first_arg_stick(operations: list) -> None:
             f"MRA select_restickify_locations ({op.get_name()}): "
             f"stick=iv{out_iv} cost={cost} (first-arg layout)"
         )
-        op.chosen_layout = chosen
-
-        # Mark chosen stick IV for finalize_layouts
-        if hasattr(op, "arg_restick_costs"):
-            op.chosen_stick_iv = out_iv
-            print(
-                f"MRA: Node ({op.get_name()}): "
-                f"chosen_stick_iv=iv{op.chosen_stick_iv} "
-                f"stride_map={list(chosen.device_layout.stride_map)}"
-            )
+        record_stick_decisions(op, cost_fn, chosen, out_iv)
