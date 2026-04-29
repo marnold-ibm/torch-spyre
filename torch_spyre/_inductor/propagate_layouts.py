@@ -158,10 +158,6 @@ def build_edge_restick_costs(
                 upstream_write_dep = next(iter(upstream_buf.get_read_writes().writes))
                 upstream_out_iv = iter_var_id(device_coordinates(layout, upstream_write_dep)[-1])
             else:
-                # InputBuffer: no upstream op; the input's stick IV is already
-                # in this node's loop var namespace.  Also fix layout.out_iv
-                # which was stamped using _make_identity_write_dep (_w symbols)
-                # and therefore got the device dim index instead of the loop var index.
                 upstream_out_iv = local_in_iv
                 layout.out_iv = local_in_iv
             if 0 <= upstream_out_iv < n:
@@ -794,10 +790,13 @@ def propagate_spyre_tensor_layouts(
                 # AllSameNode so the stick propagates through unchanged.
                 rw = op.get_read_writes()
                 args = get_mem_deps_from_rw(rw)
+                print(f"MRA mutation op ({op.get_name()}) args:")
+                for arg in args:
+                    print(f"  dep={arg.dep.name} layouts={list(arg.layouts)}")
                 stick_exprs = _collect_stick_exprs(args)
                 if stick_exprs:
                     _attach_all_same_cost_fn(op, args, stick_exprs)
-                target_buf = V.graph.get_buffer(op.layout.real_name)
+                target_buf = op.layout.target
                 op.layouts = list(target_buf.layouts) if hasattr(target_buf, "layouts") else [generic_layout(op)]
                 _stamp_out_ivs(op.layouts, next(iter(rw.writes)))
                 continue
