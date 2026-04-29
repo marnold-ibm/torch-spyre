@@ -170,13 +170,12 @@ def always_choose_first_arg_stick(operations: list) -> None:
             del tb.layouts
 
     for op in operations:
-        assert hasattr(op, "layouts"), f"{op.get_name()} has no layouts - must handle"
-        assert hasattr(op, "restick_cost_fn"), f"{op.get_name()} has layouts but no restick_cost_fn - must handle"
+        assert hasattr(op, "layouts"), f"{op.get_name()} has no layouts"
+        assert hasattr(op, "restick_cost_fn"), f"{op.get_name()} has layouts but no restick_cost_fn"
 
         cost_fn = op.restick_cost_fn
         upstream_ivs = [
             V.graph.get_buffer(rc.dep.name).committed_out_iv
-            if not rc.has_no_stick else -1
             for rc in cost_fn.edge_costs
         ]
         chosen = op.layouts[0]

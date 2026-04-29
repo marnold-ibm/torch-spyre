@@ -582,8 +582,13 @@ def reduction_layouts(
                 f"MRA reduction_layouts ({op.get_name()}) output layout:"
                 f" device_size={list(out_dl.device_size)} stride_map={list(out_dl.stride_map)}"
                 f" stick_iv=iv{iter_var_id(out_idc[-1])}"
+                f" out_coords={out_idc}"
             )
-            layouts.append(out_layout)
+            # Not considering stick reductions yet
+            if iter_var_id(out_idc[-1]) != -1:
+                layouts.append(out_layout)
+            else:
+                print(f"MRA reduction_layouts ({op.get_name()}) dropping no-stick output (stick on reduction dim)")
         _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args))
         return layouts
     else:
@@ -785,12 +790,16 @@ def propagate_spyre_tensor_layouts(
             _stamp_out_ivs(op.layouts, next(iter(op.get_read_writes().writes)))
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # Mutation ops (e.g. spyre.overwrite) must keep their
-                # MutationLayoutSHOULDREMOVE so the scheduler correctly
-                # treats them as in-place writes to the target buffer.
-                # Their FixedTiledLayout is assigned later in
-                # propagate_mutation_layouts, after the scheduler has
-                # set up mutation tracking.
+                # Mutation ops write into an existing buffer. Give them an
+                # AllSameNode so the stick propagates through unchanged.
+                rw = op.get_read_writes()
+                args = get_mem_deps_from_rw(rw)
+                stick_exprs = _collect_stick_exprs(args)
+                if stick_exprs:
+                    _attach_all_same_cost_fn(op, args, stick_exprs)
+                target_buf = V.graph.get_buffer(op.layout.real_name)
+                op.layouts = list(target_buf.layouts) if hasattr(target_buf, "layouts") else [generic_layout(op)]
+                _stamp_out_ivs(op.layouts, next(iter(rw.writes)))
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
