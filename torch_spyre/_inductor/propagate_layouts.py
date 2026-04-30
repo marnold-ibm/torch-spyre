@@ -104,46 +104,6 @@ def restickify_stride_map(
     return new_stride_map
 
 
-
-def build_edge_restick_costs(
-    args: "list[SchedNodeArg]",
-    out_key_by_expr: "dict",
-) -> "list[EdgeCostMap]":
-    """Build one EdgeCostMap per arg for the given candidate output sticks.
-
-    out_key_by_expr maps each stick_expr to the LayoutKey of the output layout
-    that uses that stick.  This ensures out_key is the output buffer's key,
-    not the input's post-restickify key — which would be ambiguous when two
-    inputs have the same device_layout but different sticks.
-    """
-    result: list[EdgeCostMap] = []
-    for arg in args:
-        rc = EdgeCostMap(arg.dep)
-        for layout in arg.layouts:
-            ic = host_coordinates(layout, arg.dep)
-            idc = device_coordinates(layout, arg.dep)
-            if iter_var_id(idc[-1]) == -1:
-                rc.mark_no_stick()
-                continue
-
-            in_key = LayoutKey.from_stl(layout.device_layout)
-            print(f"MRA build_edge_restick_costs: arg={arg.dep.name} idc={idc} stick=idc[-1]={idc[-1]} in_key={list(in_key.stride_map)}")
-            for out_expr, out_key in out_key_by_expr.items():
-                if out_expr == idc[-1]:
-                    print(f"MRA build_edge_restick_costs:   out_expr={out_expr} same stick -> out_key={list(out_key.stride_map)} cost=0")
-                    rc.set_cost_and_target(in_key, out_key, 0, None)
-                else:
-                    tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
-                    print(f"MRA build_edge_restick_costs:   out_expr={out_expr} tgt={None if tgt is None else list(tgt.device_layout.stride_map)}")
-                    if tgt is not None:
-                        cost = 1
-                        for s in layout.size:
-                            cost *= concretize_expr(s)
-                        rc.set_cost_and_target(in_key, out_key, cost, tgt)
-        result.append(rc)
-    return result
-
-
 def compute_restickify_target_layout(
     layout: FixedTiledLayout,
     target_stick_expr,
@@ -197,6 +157,45 @@ def compute_restickify_target_layout(
     )
 
 
+def build_edge_restick_costs(
+    args: "list[SchedNodeArg]",
+    out_key_by_expr: "dict",
+) -> "list[EdgeCostMap]":
+    """Build one EdgeCostMap per arg for the given candidate output sticks.
+
+    out_key_by_expr maps each stick_expr to the LayoutKey of the output layout
+    that uses that stick.  This ensures out_key is the output buffer's key,
+    not the input's post-restickify key — which would be ambiguous when two
+    inputs have the same device_layout but different sticks.
+    """
+    result: list[EdgeCostMap] = []
+    for arg in args:
+        rc = EdgeCostMap(arg.dep)
+        for layout in arg.layouts:
+            ic = host_coordinates(layout, arg.dep)
+            idc = device_coordinates(layout, arg.dep)
+            if iter_var_id(idc[-1]) == -1:
+                rc.mark_no_stick()
+                continue
+
+            in_key = LayoutKey.from_stl(layout.device_layout)
+            print(f"MRA build_edge_restick_costs: arg={arg.dep.name} idc={idc} stick=idc[-1]={idc[-1]} in_key={list(in_key.stride_map)}")
+            for out_expr, out_key in out_key_by_expr.items():
+                if out_expr == idc[-1]:
+                    print(f"MRA build_edge_restick_costs:   out_expr={out_expr} same stick -> out_key={list(out_key.stride_map)} cost=0")
+                    rc.set_cost_and_target(in_key, out_key, 0, None)
+                else:
+                    tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
+                    print(f"MRA build_edge_restick_costs:   out_expr={out_expr} tgt={None if tgt is None else list(tgt.device_layout.stride_map)}")
+                    if tgt is not None:
+                        cost = 1
+                        for s in layout.size:
+                            cost *= concretize_expr(s)
+                        rc.set_cost_and_target(in_key, out_key, cost, tgt)
+        result.append(rc)
+    return result
+
+
 def _collect_stick_exprs(args: "list[SchedNodeArg]") -> set:
     exprs = set()
     for arg in args:
@@ -211,13 +210,12 @@ def _attach_all_same_cost_fn(
     op: Operation,
     args: "list[SchedNodeArg]",
     stick_exprs: set,
-    out_key_by_expr: "dict | None" = None,
+    out_key_by_expr: "dict",
 ) -> None:
     """Build and attach an AllSameNode cost function to op.
 
     out_key_by_expr maps each stick_expr to the LayoutKey of the output layout
-    for that stick.  If None, out_key is derived from compute_restickify_target_layout
-    (valid only for single-stick callers where no ambiguity exists).
+    for that stick.
 
     No-op when stick_exprs is empty (scalar/broadcast-only args).
     Raises Unsupported if no stick is viable for all args.
@@ -236,21 +234,6 @@ def _attach_all_same_cost_fn(
                 f" stick_iv=iv{iter_var_id(idc[-1])}"
                 f" device_size={list(dl.device_size)} stride_map={list(dl.stride_map)}"
             )
-    if out_key_by_expr is None:
-        # Single-stick callers: derive out_key from first arg's target layout.
-        # Safe because there's no multi-stick ambiguity in these cases.
-        first_arg = args[0]
-        first_layout = next(iter(first_arg.layouts))
-        ic = host_coordinates(first_layout, first_arg.dep)
-        idc = device_coordinates(first_layout, first_arg.dep)
-        out_key_by_expr = {}
-        for out_expr in stick_exprs:
-            if out_expr == idc[-1]:
-                out_key_by_expr[out_expr] = LayoutKey.from_stl(first_layout.device_layout)
-            else:
-                tgt = compute_restickify_target_layout(first_layout, out_expr, ic, idc)
-                if tgt is not None:
-                    out_key_by_expr[out_expr] = LayoutKey.from_stl(tgt.device_layout)
     edge_costs = build_edge_restick_costs(args, out_key_by_expr)
     print(f"MRA EdgeCostMap tables for {op.get_name()}:")
     for i, (rc, arg) in enumerate(zip(edge_costs, args)):
@@ -382,12 +365,16 @@ def pointwise_layouts(
     print(f"MRA:  ====== In Pointwise ({op.get_name()})  ======")
 
     if aten_op == spyreop.layernormnorm.default:
-        # Handled separately because layernorm only cares about the stick being first arg
+        # Handled separately because layernorm only cares about the stick of the first arg.
         layouts = [
             first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
             for layout in args[0].layouts
         ]
-        _attach_all_same_cost_fn(op, args[:1], _collect_stick_exprs(args[:1]))
+        out_key_by_expr = {
+            device_coordinates(in_layout, args[0].dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
+            for in_layout, out_layout in zip(args[0].layouts, layouts)
+        }
+        _attach_all_same_cost_fn(op, args[:1], _collect_stick_exprs(args[:1]), out_key_by_expr)
         return layouts
 
     if len(args) == 1:
@@ -404,16 +391,16 @@ def pointwise_layouts(
     else:
         # Standard multi-input pointwise 
 
-        print("MRA: ARGS:")
-        for i, arg in enumerate(args):
-            for layout in arg.layouts:
-                ic = host_coordinates(layout, arg.dep)
-                idc = device_coordinates(layout, arg.dep)
-                print(
-                    f"MRA: arg {i} layout: host_coords={ic} device_coords={idc}"
-                )
-        print("MRA: out_coords:", host_coordinates(output, output_dep))
-        print()
+        # print("MRA: ARGS:")
+        # for i, arg in enumerate(args):
+        #     for layout in arg.layouts:
+        #         ic = host_coordinates(layout, arg.dep)
+        #         idc = device_coordinates(layout, arg.dep)
+        #         print(
+        #             f"MRA: arg {i} layout: host_coords={ic} device_coords={idc}"
+        #         )
+        # print("MRA: out_coords:", host_coordinates(output, output_dep))
+        # print()
 
         stick_exprs = _collect_stick_exprs(args)
         print("MRA: stick_exprs (from all layouts):", stick_exprs)
