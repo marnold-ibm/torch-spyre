@@ -17,8 +17,7 @@ from collections import defaultdict
 
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .optimize_restickify import FixedInOutNode
-from .pass_utils import device_coordinates, iter_var_id
+from .optimize_restickify import FixedInOutNode, LayoutKey
 from torch._inductor.ir import ComputedBuffer, Operation, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -174,9 +173,12 @@ def insert_restickify(operations: list[Operation]) -> None:
     in-place.  No scheduler state is touched.
     """
     restickify_plan = V.graph.restickify_plan
+    print(f"MRA insert_restickify: plan id={id(restickify_plan)} keys={list(restickify_plan.keys())}")
     if not restickify_plan:
         return
 
+    op_names = [op.get_name() for op in operations if isinstance(op, ComputedBuffer)]
+    print(f"MRA insert_restickify: ComputedBuffer names={op_names}")
     for op in list(
         operations
     ):  # copy since insert_restickify_on_node_inputs mutates operations
@@ -191,7 +193,7 @@ def finalize_layouts(operations: list) -> None:
 
     Called after optimize_restickify_locations. For each op:
       1. Assigns op.layout from stick_decisions (or op.chosen_layout for ops
-         without a cost function) and stamps op.committed_out_iv.
+         without a cost function) and stamps op.committed_layout.
       2. For each arg that needs a stick conversion, records an entry in
          V.graph.restickify_plan for insert_restickify to act on.
 
@@ -210,7 +212,7 @@ def finalize_layouts(operations: list) -> None:
         ):
             chosen = next(iter(tb.layouts))
             tb.data.data.layout = chosen
-            tb.data.data.committed_out_iv = chosen.out_iv
+            tb.data.data.committed_layout = LayoutKey.from_stl(chosen.device_layout)
             del tb.layouts
 
     restickify_plan = defaultdict(list)
@@ -229,40 +231,42 @@ def finalize_layouts(operations: list) -> None:
         chosen = decisions["chosen_layout"] if decisions else chosen_layout
         if chosen is not None:
             op.layout = chosen
-            op.committed_out_iv = chosen.out_iv
+            op.committed_layout = LayoutKey.from_stl(chosen.device_layout)
 
         # Populate restickify_plan for ops that need edge restickifies.
         if not decisions:
             continue
-        print(f"  op={op.get_name()} out_iv=iv{decisions['out_iv']}")
+        out_key = decisions["out_key"]
+        print(f"  op={op.get_name()} out_key={list(out_key.stride_map)}")
         if cost_fn is None:
             continue
-        out_iv = decisions["out_iv"]
-        required_in_ivs = (
-            cost_fn.required_in_iv
+        required_in_keys = (
+            cost_fn.required_in_keys
             if isinstance(cost_fn, FixedInOutNode)
-            else [out_iv] * len(cost_fn.edge_costs)
+            else [out_key] * len(cost_fn.edge_costs)
         )
-        for rc, req_iv in zip(cost_fn.edge_costs, required_in_ivs):
+        for rc, req_key in zip(cost_fn.edge_costs, required_in_keys):
             buf = V.graph.get_buffer(rc.dep.name)
-            in_iv = iter_var_id(device_coordinates(buf.get_layout(), rc.dep)[-1])
-            tgt = rc.target(in_iv, req_iv)
+            in_key = LayoutKey.from_stl(buf.get_layout().device_layout)
+            tgt = rc.target(in_key, req_key)
             print(
-                f"    arg={rc.dep.name} in_iv=iv{in_iv} required_in_iv=iv{req_iv} "
+                f"    arg={rc.dep.name} in_key={list(in_key.stride_map)} "
+                f"req_key={list(req_key.stride_map)} "
                 f"tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
             )
             if tgt is None:
                 print("    -> no restickify needed")
                 continue
-            print(f"    -> scheduling restickify iv{in_iv} -> iv{req_iv}")
+            print(f"    -> scheduling restickify {list(in_key.stride_map)} -> {list(req_key.stride_map)}")
             logger.warning(
                 f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
-                f"iv{in_iv} -> iv{req_iv} "
+                f"{list(in_key.stride_map)} -> {list(req_key.stride_map)} "
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
             )
             _record_restickify(op, rc.dep.name, tgt, restickify_plan)
 
     V.graph.restickify_plan = restickify_plan
+    print(f"MRA finalize_layouts: set restickify_plan id={id(V.graph.restickify_plan)} keys={list(restickify_plan.keys())}")
 
 
 def _format_restickify_plan(restickify_plan: dict) -> None:

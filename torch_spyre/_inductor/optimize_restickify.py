@@ -15,83 +15,91 @@
 
 import abc
 import math
+from dataclasses import dataclass
+from typing import Any
+
 from torch._inductor.virtualized import V
+from torch_spyre._C import SpyreTensorLayout
 
 INF = math.inf
+
+
+@dataclass(frozen=True)
+class LayoutKey:
+    device_size: tuple[int, ...]
+    stride_map: tuple[int, ...]
+
+    @staticmethod
+    def from_stl(stl: SpyreTensorLayout) -> "LayoutKey":
+        return LayoutKey(tuple(stl.device_size), tuple(stl.stride_map))
 
 
 class EdgeCostMap:
     """Thin 2-D cost table for one input arg.
 
-    Cost table indexed [in_iv][out_iv] where both iv indices are in THIS NODE's
-    iteration variable namespace — NOT the upstream buffer's namespace.
-      iv = numeric suffix N of loop variable dN whose Mod(dN,64) is the stick.
-      e.g. Mod(d2,64) -> iv=2.
-    This is NOT a tensor dimension index.
-
+    Cost table indexed [in_key][out_key] where both keys are LayoutKeys
+    (device_size, stride_map) — stable across all nodes in the graph.
     """
 
-    def __init__(self, dep: "MemoryDep", n: int):
+    def __init__(self, dep: "MemoryDep"):
         # dep is kept for IR passes (insert_restickify) that need the buffer name
         # and read index.  Cost optimization code does not and should not use it
         self.dep = dep
         self.has_no_stick = False  # True for scalar/broadcast args (no real stick)
-        self._cost = [[INF] * n for _ in range(n)]
-        self._target: list[list] = [[None] * n for _ in range(n)]
-        # Translates from the upstream buffer's output IV namespace into this
-        # node's in_iv row index.  Indexed by upstream IV; value is the
-        # corresponding local in_iv; None = unmapped.
-        self.upstream_out_iv_to_local_in_iv: "list[int | None]" = [None] * n
+        self._cost: dict[LayoutKey, dict[LayoutKey, float]] = {}
+        self._target: dict[LayoutKey, dict[LayoutKey, Any]] = {}
 
     def mark_no_stick(self) -> None:
         """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
         self.has_no_stick = True
 
-    def set_cost_and_target(self, in_iv: int, out_iv: int, cost: float, target) -> None:
-        """in_iv, out_iv are iteration variable indices (NOT tensor dim indices)."""
-        self._cost[in_iv][out_iv] = cost
-        self._target[in_iv][out_iv] = target
+    def set_cost_and_target(
+        self, in_key: LayoutKey, out_key: LayoutKey, cost: float, target
+    ) -> None:
+        self._cost.setdefault(in_key, {})[out_key] = cost
+        self._target.setdefault(in_key, {})[out_key] = target
 
     def format_table(self) -> str:
         if self.has_no_stick:
             return "    (no stick — compatible with any output at zero cost)"
         lines = []
-        for in_iv, (row, trow) in enumerate(zip(self._cost, self._target)):
-            for out_iv, (cost, tgt) in enumerate(zip(row, trow)):
+        for in_key, row in self._cost.items():
+            trow = self._target.get(in_key, {})
+            for out_key, cost in row.items():
+                tgt = trow.get(out_key)
                 if cost == INF:
-                    lines.append(f"    iv{in_iv}->iv{out_iv} = MAX (infeasible)")
+                    lines.append(
+                        f"    {list(in_key.stride_map)}->{list(out_key.stride_map)} = MAX (infeasible)"
+                    )
                 else:
                     lines.append(
-                        f"    iv{in_iv}->iv{out_iv} = {cost}"
-                        f"  target_stride_map={list(tgt.device_layout.stride_map)}"
+                        f"    {list(in_key.stride_map)}->{list(out_key.stride_map)} = {cost}"
+                        + (
+                            f"  target_stride_map={list(tgt.device_layout.stride_map)}"
+                            if tgt is not None
+                            else ""
+                        )
                     )
         return "\n".join(lines)
 
-    def feasible_for_out(self, out_iv: int) -> bool:
+    def feasible_for_out(self, out_key: LayoutKey) -> bool:
         if self.has_no_stick:
             return True
-        return any(row[out_iv] < INF for row in self._cost)
-
-    def local_in_iv(self, upstream_iv: int) -> int:
-        """Translate upstream committed IV to this node's local in_iv."""
-        assert not self.has_no_stick
-        result = self.upstream_out_iv_to_local_in_iv[upstream_iv]
-        assert result is not None, (
-            f"upstream IV {upstream_iv} not in map {self.upstream_out_iv_to_local_in_iv}"
+        return any(
+            out_key in row and row[out_key] < INF for row in self._cost.values()
         )
-        return result
 
-    def cost(self, in_iv: int, out_iv: int) -> float:
-        """Cost for local in_iv -> out_iv transition."""
+    def cost(self, in_key: LayoutKey, out_key: LayoutKey) -> float:
+        """Cost for in_key -> out_key transition."""
         if self.has_no_stick:
             return 0
-        return self._cost[in_iv][out_iv]
+        return self._cost.get(in_key, {}).get(out_key, INF)
 
-    def target(self, in_iv: int, out_iv: int):
-        """Target layout for in_iv -> out_iv, or None if no restickify needed."""
-        if self.has_no_stick or in_iv == out_iv:
+    def target(self, in_key: LayoutKey, out_key: LayoutKey):
+        """Target layout for in_key -> out_key, or None if no restickify needed."""
+        if self.has_no_stick:
             return None
-        return self._target[in_iv][out_iv]
+        return self._target.get(in_key, {}).get(out_key)
 
 
 class RestickNodeCost(abc.ABC):
@@ -100,39 +108,47 @@ class RestickNodeCost(abc.ABC):
         self.edge_costs = edge_costs
 
     @abc.abstractmethod
-    def cost(self, upstream_ivs: "list[int]", out_iv: int) -> float: ...
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float: ...
 
 
 class AllSameNode(RestickNodeCost):
 
-    def cost(self, upstream_ivs: "list[int]", out_iv: int) -> float:
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
         return sum(
-            rc.cost(rc.local_in_iv(uiv), out_iv)
-            for rc, uiv in zip(self.edge_costs, upstream_ivs)
+            rc.cost(lk, out_key) for rc, lk in zip(self.edge_costs, in_layouts)
         )
 
 
 class FixedInOutNode(RestickNodeCost):
 
-    def __init__(self, edge_costs, required_out_iv: int, required_in_iv: "list[int]"):
+    def __init__(
+        self,
+        edge_costs,
+        required_out_key: LayoutKey,
+        required_in_keys: "list[LayoutKey]",
+    ):
         super().__init__(edge_costs)
-        self.required_out_iv = required_out_iv
-        self.required_in_iv = required_in_iv
+        self.required_out_key = required_out_key
+        self.required_in_keys = required_in_keys
 
-    def cost(self, upstream_ivs: "list[int]", out_iv: int) -> float:
-        if out_iv != self.required_out_iv:
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
+        if out_key != self.required_out_key:
             return INF
         return sum(
-            rc.cost(rc.local_in_iv(uiv), req_iv)
-            for rc, uiv, req_iv in zip(self.edge_costs, upstream_ivs, self.required_in_iv)
+            rc.cost(lk, req_key)
+            for rc, lk, req_key in zip(
+                self.edge_costs, in_layouts, self.required_in_keys
+            )
         )
 
 
-def record_stick_decisions(op, chosen_layout, out_iv: int, upstream_ivs: "list[int]") -> None:
+def record_stick_decisions(
+    op, chosen_layout, out_key: LayoutKey, in_layouts: "list[LayoutKey]"
+) -> None:
     op.stick_decisions = {
         "chosen_layout": chosen_layout,
-        "out_iv": out_iv,
-        "arg_upstream_ivs": upstream_ivs,
+        "out_key": out_key,
+        "arg_in_layouts": in_layouts,
     }
 
 
@@ -152,7 +168,7 @@ def always_choose_first_arg_stick(operations: list) -> None:
     print()
     print("=== In Collapse Layouts ===")
 
-    # Commit graph inputs first so all upstreams have committed_out_iv.
+    # Commit graph inputs first so all upstreams have committed_layout.
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if (
@@ -161,12 +177,13 @@ def always_choose_first_arg_stick(operations: list) -> None:
             and isinstance(tb.data.data, InputBuffer)
             and hasattr(tb, "layouts")
         ):
+            print(f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(l.device_layout).stride_map) for l in tb.layouts]}")
             chosen = next(iter(tb.layouts))
             tb.data.data.layout = chosen
-            # get_buffer() returns the TensorBox for graph inputs, so set
-            # committed_out_iv on both the TensorBox and inner InputBuffer.
-            tb.data.data.committed_out_iv = chosen.out_iv
-            tb.committed_out_iv = chosen.out_iv
+            committed = LayoutKey.from_stl(chosen.device_layout)
+            tb.data.data.committed_layout = committed
+            tb.committed_layout = committed
+            print(f"MRA input committed: {name} -> {list(committed.stride_map)}")
             del tb.layouts
 
     for op in operations:
@@ -174,16 +191,19 @@ def always_choose_first_arg_stick(operations: list) -> None:
         assert hasattr(op, "restick_cost_fn"), f"{op.get_name()} has layouts but no restick_cost_fn"
 
         cost_fn = op.restick_cost_fn
-        upstream_ivs = [
-            V.graph.get_buffer(rc.dep.name).committed_out_iv
-            for rc in cost_fn.edge_costs
-        ]
+        in_layouts = []
+        for rc in cost_fn.edge_costs:
+            buf = V.graph.get_buffer(rc.dep.name)
+            has_cl = hasattr(buf, "committed_layout")
+            lk = buf.committed_layout if has_cl else LayoutKey.from_stl(buf.get_layout().device_layout)
+            print(f"MRA in_layout: arg={rc.dep.name} has_committed={has_cl} layout={list(lk.stride_map)}")
+            in_layouts.append(lk)
         chosen = op.layouts[0]
-        out_iv = chosen.out_iv
-        cost = cost_fn.cost(upstream_ivs, out_iv)
+        out_key = LayoutKey.from_stl(chosen.device_layout)
+        cost = cost_fn.cost(in_layouts, out_key)
         print(
             f"MRA select_restickify_locations ({op.get_name()}): "
-            f"stick=iv{out_iv} cost={cost} upstream_ivs={upstream_ivs}"
+            f"stick={list(out_key.stride_map)} cost={cost} in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
         )
-        op.committed_out_iv = out_iv
-        record_stick_decisions(op, chosen, out_iv, upstream_ivs)
+        op.committed_layout = out_key
+        record_stick_decisions(op, chosen, out_key, in_layouts)
