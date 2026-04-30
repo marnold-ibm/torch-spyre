@@ -236,6 +236,39 @@ def test_expand_yt_expand_plus_x(tensors_expand):
     )
 
 
+# Expand + transpose tests: b.unsqueeze(0 or 1).expand(s,s) forces layout
+# choice because the expand side cannot always be restickified — the optimizer
+# must choose the a.t() side's stick instead.
+
+
+def test_expand_unsqueeze0_expand_plus_at():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(lambda a, b: b.unsqueeze(0).expand(s, s) + a.t(), a, b, check_strides=False)
+
+
+def test_expand_at_plus_unsqueeze0_expand():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(lambda a, b: a.t() + b.unsqueeze(0).expand(s, s), a, b)
+
+
+def test_expand_unsqueeze1_expand_plus_at():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(lambda a, b: b.unsqueeze(1).expand(s, s) + a.t(), a, b, check_strides=False)
+
+
+def test_expand_at_plus_unsqueeze1_expand():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(lambda a, b: a.t() + b.unsqueeze(1).expand(s, s), a, b)
+
+
 # 2-arg tests with size-1
 SIZES_4D_SIZE1 = [(128, 256)]
 

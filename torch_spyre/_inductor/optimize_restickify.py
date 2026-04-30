@@ -215,6 +215,8 @@ def greedy_local_min_cost(operations: list) -> None:
             # (they keep MutationLayoutSHOULDREMOVE for the scheduler).
             from torch._inductor.ir import MutationLayoutSHOULDREMOVE
             if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                # TODO: This is not safe. we don't know that there aren't other choices flowing in that we must match 
+                # ie, if the layout A flows in we need to pick layout B that aligns with it, using the cost function and/or viability
                 op.layout = op.layouts[0]
                 op.committed_layout = LayoutKey.from_stl(op.layouts[0].device_layout)
             continue
@@ -223,20 +225,39 @@ def greedy_local_min_cost(operations: list) -> None:
         in_layouts = []
         for rc in cost_fn.edge_costs:
             buf = V.graph.get_buffer(rc.dep.name)
-            has_cl = hasattr(buf, "committed_layout")
-            lk = buf.committed_layout if has_cl else LayoutKey.from_stl(buf.get_layout().device_layout)
-            print(f"MRA in_layout: arg={rc.dep.name} has_committed={has_cl} layout={list(lk.stride_map)}")
+            assert hasattr(buf, "committed_layout"), (
+                f"buffer {rc.dep.name} has no committed_layout — "
+                "topological order violated or input not committed"
+            )
+            lk = buf.committed_layout
+            print(f"MRA in_layout: arg={rc.dep.name} layout={list(lk.stride_map)}")
             in_layouts.append(lk)
-        chosen = op.layouts[0]
-        out_key = LayoutKey.from_stl(chosen.device_layout)
-        cost = cost_fn.cost(in_layouts, out_key)
+        out_layout_keys = [LayoutKey.from_stl(ol.device_layout) for ol in op.layouts]
+        assert out_layout_keys, (
+            f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
+        )
+        layout = None
+        out_key = None
+        best_cost = float("inf")
+        for out_layout, out_layout_key in zip(op.layouts, out_layout_keys):
+            out_layout_cost = cost_fn.cost(in_layouts, out_layout_key)
+            print(
+                f"MRA candidate ({op.get_name()}): "
+                f"stick={list(out_layout_key.stride_map)} cost={out_layout_cost}"
+            )
+            if out_layout_cost < best_cost:
+                best_cost = out_layout_cost
+                layout = out_layout
+                out_key = out_layout_key
+
         print(
             f"MRA select_restickify_locations ({op.get_name()}): "
-            f"stick={list(out_key.stride_map)} cost={cost} in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
+            f"stick={list(out_key.stride_map)} cost={best_cost} "
+            f"in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
         )
         from torch._inductor.ir import MutationLayoutSHOULDREMOVE
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            op.layout = chosen
+            op.layout = layout
         op.committed_layout = out_key
         record_stick_decisions(op, out_key, in_layouts)
 
