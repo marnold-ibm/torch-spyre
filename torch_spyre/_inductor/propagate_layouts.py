@@ -848,16 +848,22 @@ def propagate_mutation_layouts(
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
+        print(f"MRA propagate_mutation_layouts: node={n.node.get_name()} layout={type(n.node.layout).__name__}")
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
+        print(f"MRA propagate_mutation_layouts: processing mutation op {n.node.get_name()}")
         if isinstance(n.node.data, Pointwise):
             rw = n.read_writes
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
+            print(f"MRA propagate_mutation_layouts: args={[a.dep.name for a in args]}")
             output = n.node.get_layout()
-            n.node.layout = next(
-                iter(pointwise_layouts(n.node, output, output_dep, args))
-            )
+            layouts = list(pointwise_layouts(n.node, output, output_dep, args))
+            print(f"MRA propagate_mutation_layouts: got {len(layouts)} layouts, setting layout={layouts[0]}")
+            n.node.layout = layouts[0]
+            print(f"MRA propagate_mutation_layouts: n.node id={id(n.node)} layout now={type(n.node.layout).__name__}")
+            buf = V.graph.get_buffer(n.node.get_name())
+            print(f"MRA propagate_mutation_layouts: name_to_buffer[{n.node.get_name()}] id={id(buf)} layout={type(buf.get_layout()).__name__}")
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"

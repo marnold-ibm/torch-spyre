@@ -163,7 +163,7 @@ def _print_op_layouts(operations: list, label: str) -> None:
         layouts = getattr(op, "layouts", None)
         print(
             f"  {op.get_name()}: layout={type(layout).__name__}({layout})"
-            + (f" | candidates={[type(l).__name__ for l in layouts]}" if layouts else "")
+            + (f" | layouts={[type(l).__name__ for l in layouts]}" if layouts else "")
         )
 
 
@@ -185,6 +185,8 @@ def greedy_local_min_cost(operations: list) -> None:
     print("=== In greedy_local_min_cost ===")
     _print_op_layouts(operations, "before")
 
+    print ()
+    print ("-- Running greedy algorithm --")
     # Process graph inputs first so all upstreams have committed_layout.
     # For now inputs are always a set of size 1, since we use it as it 
     # was tranferred to device
@@ -207,6 +209,7 @@ def greedy_local_min_cost(operations: list) -> None:
             del tb.layouts
 
     for op in operations:
+        print ("Processing node:", op.get_name())
         if not hasattr(op, "layouts"):
             continue  # FallbackKernel and other unhandled op types
 
