@@ -191,10 +191,14 @@ def always_choose_first_arg_stick(operations: list) -> None:
 
         if not hasattr(op, "restick_cost_fn"):
             # Layout is fixed/inherited — no restickify decision needed.
-            # Stamp committed_layout if this is a tiled layout, else skip.
+            # Set chosen_layout so finalize_layouts assigns the tiled layout,
+            # but only if the op isn't already a mutation op (those keep their
+            # MutationLayoutSHOULDREMOVE for the scheduler to see).
+            from torch._inductor.ir import MutationLayoutSHOULDREMOVE
             from torch_spyre._inductor.ir import FixedTiledLayout
-            if isinstance(op.layout, FixedTiledLayout):
-                op.committed_layout = LayoutKey.from_stl(op.layout.device_layout)
+            if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                op.chosen_layout = op.layouts[0]
+                op.committed_layout = LayoutKey.from_stl(op.layouts[0].device_layout)
             continue
 
         cost_fn = op.restick_cost_fn
