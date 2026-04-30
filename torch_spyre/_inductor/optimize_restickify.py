@@ -188,7 +188,14 @@ def always_choose_first_arg_stick(operations: list) -> None:
 
     for op in operations:
         assert hasattr(op, "layouts"), f"{op.get_name()} has no layouts"
-        assert hasattr(op, "restick_cost_fn"), f"{op.get_name()} has layouts but no restick_cost_fn"
+
+        if not hasattr(op, "restick_cost_fn"):
+            # Layout is fixed/inherited — no restickify decision needed.
+            # Stamp committed_layout if this is a tiled layout, else skip.
+            from torch_spyre._inductor.ir import FixedTiledLayout
+            if isinstance(op.layout, FixedTiledLayout):
+                op.committed_layout = LayoutKey.from_stl(op.layout.device_layout)
+            continue
 
         cost_fn = op.restick_cost_fn
         in_layouts = []

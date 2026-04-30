@@ -199,7 +199,7 @@ def finalize_layouts(operations: list) -> None:
 
     Also commits layouts for graph input TensorBoxes.
     """
-    from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
+    from torch._inductor.ir import InputBuffer, MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
 
     # Commit layouts for graph inputs.
     for name in V.graph.graph_input_names:
@@ -230,7 +230,8 @@ def finalize_layouts(operations: list) -> None:
         # Commit chosen layout.
         chosen = decisions["chosen_layout"] if decisions else chosen_layout
         if chosen is not None:
-            op.layout = chosen
+            if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                op.layout = chosen
             op.committed_layout = LayoutKey.from_stl(chosen.device_layout)
 
         # Populate restickify_plan for ops that need edge restickifies.
