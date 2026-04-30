@@ -382,6 +382,7 @@ def pointwise_layouts(
     print(f"MRA:  ====== In Pointwise ({op.get_name()})  ======")
 
     if aten_op == spyreop.layernormnorm.default:
+        # Handled separately because layernorm only cares about the stick being first arg
         layouts = [
             first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
             for layout in args[0].layouts
@@ -394,7 +395,11 @@ def pointwise_layouts(
             first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
             for layout in args[0].layouts
         ]
-        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args))
+        out_key_by_expr = {
+            device_coordinates(in_layout, args[0].dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
+            for in_layout, out_layout in zip(args[0].layouts, layouts)
+        }
+        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args), out_key_by_expr)
         return layouts
     else:
         # Standard multi-input pointwise 
@@ -576,7 +581,11 @@ def reduction_layouts(
             if iter_var_id(out_idc[-1]) == -1:
                 print(f"MRA reduction_layouts ({op.get_name()}) stick on reduction dim — output layout has no free stick, using as-is")
             layouts.append(out_layout)
-        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args))
+        out_key_by_expr = {
+            device_coordinates(in_layout, args[0].dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
+            for in_layout, out_layout in zip(args[0].layouts, layouts)
+        }
+        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args), out_key_by_expr)
         return layouts
     else:
         # matmul/bmm
@@ -787,18 +796,18 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # Mutation ops write into an existing buffer. Give them an
-                # AllSameNode so the stick propagates through unchanged.
-                rw = op.get_read_writes()
-                args = get_mem_deps_from_rw(rw)
-                print(f"MRA mutation op ({op.get_name()}) args:")
-                for arg in args:
-                    print(f"  dep={arg.dep.name} layouts={list(arg.layouts)}")
-                stick_exprs = _collect_stick_exprs(args)
-                if stick_exprs:
-                    _attach_all_same_cost_fn(op, args, stick_exprs)
-                target_buf = op.layout.target
-                op.layouts = list(target_buf.layouts) if hasattr(target_buf, "layouts") else [generic_layout(op)]
+                # # Mutation ops write into an existing buffer. Give them an
+                # # AllSameNode so the stick propagates through unchanged.
+                # rw = op.get_read_writes()
+                # args = get_mem_deps_from_rw(rw)
+                # print(f"MRA mutation op ({op.get_name()}) args:")
+                # for arg in args:
+                #     print(f"  dep={arg.dep.name} layouts={list(arg.layouts)}")
+                # stick_exprs = _collect_stick_exprs(args)
+                # if stick_exprs:
+                #     _attach_all_same_cost_fn(op, args, stick_exprs)
+                # target_buf = op.layout.target
+                # op.layouts = list(target_buf.layouts) if hasattr(target_buf, "layouts") else [generic_layout(op)]
                 continue
             op.decide_layout()
             rw = op.get_read_writes()

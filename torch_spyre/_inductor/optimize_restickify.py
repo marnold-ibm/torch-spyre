@@ -252,7 +252,8 @@ def greedy_local_min_cost(operations: list) -> None:
 
         if out_key is None:
             # All candidates had infinite cost — fall back to first layout.
-            print(f"MRA WARNING ({op.get_name()}): all candidates inf, falling back to layouts[0]")
+
+            assert False, f"MRA WARNING ({op.get_name()}): all candidates inf, falling back to layouts[0]"
             layout = op.layouts[0]
             out_key = out_layout_keys[0]
 
