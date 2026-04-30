@@ -840,9 +840,11 @@ def propagate_mutation_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
             output = n.node.get_layout()
-            n.node.layout = next(
-                iter(pointwise_layouts(n.node, output, output_dep, args))
+            layouts = pointwise_layouts(n.node, output, output_dep, args)
+            assert len(layouts) == 1, (
+                f"mutation op {n.node.get_name()} expected 1 layout, got {len(layouts)}"
             )
+            n.node.layout = layouts[0]
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
