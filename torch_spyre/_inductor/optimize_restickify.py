@@ -187,7 +187,8 @@ def always_choose_first_arg_stick(operations: list) -> None:
             del tb.layouts
 
     for op in operations:
-        assert hasattr(op, "layouts"), f"{op.get_name()} has no layouts"
+        if not hasattr(op, "layouts"):
+            continue  # FallbackKernel and other unhandled op types
 
         if not hasattr(op, "restick_cost_fn"):
             # Layout is fixed/inherited — no restickify decision needed.
