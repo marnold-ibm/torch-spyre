@@ -269,6 +269,19 @@ def test_expand_at_plus_unsqueeze1_expand():
     _compare(lambda a, b: a.t() + b.unsqueeze(1).expand(s, s), a, b)
 
 
+# cat after two-stick add: the add produces two candidate sticks; the cat
+# forces a mutation op downstream and requires the chosen stick to be
+# compatible with the cat output layout.
+
+
+def test_cat_after_at_plus_b():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s, s), dtype=torch.float16) * 0.1
+    c = torch.randn((s, s), dtype=torch.float16) * 0.1
+    _compare(lambda a, b, c: torch.cat([a.t() + b, c]), a, b, c, check_strides=False)
+
+
 # 2-arg tests with size-1
 SIZES_4D_SIZE1 = [(128, 256)]
 
