@@ -18,10 +18,7 @@ from collections import defaultdict
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .optimize_restickify import FixedInOutNode, LayoutKey
-from .pass_utils import host_coordinates, device_coordinates
-from .propagate_layouts import compute_restickify_target_layout
-from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE, Operation, TensorBox
+from torch._inductor.ir import ComputedBuffer, Operation, TensorBox
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
@@ -258,51 +255,6 @@ def finalize_layouts(operations: list) -> None:
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
             )
             _record_restickify(op, rc.dep.name, tgt, restickify_plan)
-
-    # now handle mutation ops
-    for op in operations:
-        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            continue
-        target_layout = op.layout.target.get_layout()
-        assert isinstance(target_layout, FixedTiledLayout), (
-            f"mutation op {op.get_name()} target has no committed FixedTiledLayout"
-        )
-        target_key = LayoutKey.from_stl(target_layout.device_layout)
-        rw = op.get_read_writes()
-        output_dep = next(iter(rw.writes))
-        for dep in rw.reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            buf = V.graph.get_buffer(dep.name)
-            in_layout = buf.get_layout()
-            if not isinstance(in_layout, FixedTiledLayout):
-                continue
-            in_key = LayoutKey.from_stl(in_layout.device_layout)
-            print(
-                f"  mutation op={op.get_name()} arg={dep.name} "
-                f"in_key={list(in_key.stride_map)} target_key={list(target_key.stride_map)}"
-            )
-            if in_key.stride_map == target_key.stride_map:
-                print("    -> no restickify needed")
-                continue
-            ic = host_coordinates(in_layout, dep)
-            idc = device_coordinates(in_layout, dep)
-            target_stick_expr = device_coordinates(target_layout, output_dep)[-1]
-            tgt = compute_restickify_target_layout(in_layout, target_stick_expr, ic, idc)
-            assert tgt is not None, (
-                f"mutation op {op.get_name()} arg={dep.name}: cannot restickify "
-                f"{list(in_key.stride_map)} -> {list(target_key.stride_map)}"
-            )
-            print(
-                f"    -> scheduling restickify {list(in_key.stride_map)} "
-                f"-> {list(target_key.stride_map)}"
-            )
-            logger.warning(
-                f"Injecting restickify on {op.get_name()} input {dep.name}: "
-                f"{list(in_key.stride_map)} -> {list(target_key.stride_map)} "
-                f"target_stride_map={list(tgt.device_layout.stride_map)}"
-            )
-            _record_restickify(op, dep.name, tgt, restickify_plan)
 
     V.graph.restickify_plan = restickify_plan
     print(f"MRA finalize_layouts: set restickify_plan id={id(V.graph.restickify_plan)} keys={list(restickify_plan.keys())}")

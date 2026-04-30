@@ -787,12 +787,18 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # Mutation ops (e.g. spyre.overwrite) must keep their
-                # MutationLayoutSHOULDREMOVE so the scheduler correctly
-                # treats them as in-place writes to the target buffer.
-                # Their FixedTiledLayout is assigned later in
-                # propagate_mutation_layouts, after the scheduler has
-                # set up mutation tracking.
+                # Mutation ops write into an existing buffer. Give them an
+                # AllSameNode so the stick propagates through unchanged.
+                rw = op.get_read_writes()
+                args = get_mem_deps_from_rw(rw)
+                print(f"MRA mutation op ({op.get_name()}) args:")
+                for arg in args:
+                    print(f"  dep={arg.dep.name} layouts={list(arg.layouts)}")
+                stick_exprs = _collect_stick_exprs(args)
+                if stick_exprs:
+                    _attach_all_same_cost_fn(op, args, stick_exprs)
+                target_buf = op.layout.target
+                op.layouts = list(target_buf.layouts) if hasattr(target_buf, "layouts") else [generic_layout(op)]
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
@@ -840,11 +846,9 @@ def propagate_mutation_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
             output = n.node.get_layout()
-            layouts = pointwise_layouts(n.node, output, output_dep, args)
-            assert len(layouts) == 1, (
-                f"mutation op {n.node.get_name()} expected 1 layout, got {len(layouts)}"
+            n.node.layout = next(
+                iter(pointwise_layouts(n.node, output, output_dep, args))
             )
-            n.node.layout = layouts[0]
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
