@@ -143,10 +143,9 @@ class FixedInOutNode(RestickNodeCost):
 
 
 def record_stick_decisions(
-    op, chosen_layout, out_key: LayoutKey, in_layouts: "list[LayoutKey]"
+    op, out_key: LayoutKey, in_layouts: "list[LayoutKey]"
 ) -> None:
     op.stick_decisions = {
-        "chosen_layout": chosen_layout,
         "out_key": out_key,
         "arg_in_layouts": in_layouts,
     }
@@ -154,21 +153,41 @@ def record_stick_decisions(
 
 def optimize_restickify_locations(operations: list) -> None:
     # Dumb implemntation for now
-    always_choose_first_arg_stick(operations)
+    greedy_local_min_cost(operations)
 
 
-def always_choose_first_arg_stick(operations: list) -> None:
+def _print_op_layouts(operations: list, label: str) -> None:
+    print(f"\n=== op layouts [{label}] ===")
+    for op in operations:
+        layout = op.layout
+        layouts = getattr(op, "layouts", None)
+        print(
+            f"  {op.get_name()}: layout={type(layout).__name__}({layout})"
+            + (f" | candidates={[type(l).__name__ for l in layouts]}" if layouts else "")
+        )
+
+
+def greedy_local_min_cost(operations: list) -> None:
     """
-        Choose where to put restickiy
-        Replicate braindead algorithm of always using first arg's stick
+        Simple baseline
+        Greedy algorithm that processes nodes in topological order and finalizes output stick
+        However it uses the cost function at that node to pick a min local cost
+        If costs equal, choose left-most argument's stick
+        
+        This is largely equal to the previous baseline (always choose first arg's stick)
+        But this version has the potential to choose a different arg if the first arg's
+        is sub-optimal or inviable. 
     """
 
     from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
 
     print()
-    print("=== In Collapse Layouts ===")
+    print("=== In greedy_local_min_cost ===")
+    _print_op_layouts(operations, "before")
 
-    # Commit graph inputs first so all upstreams have committed_layout.
+    # Process graph inputs first so all upstreams have committed_layout.
+    # For now inputs are always a set of size 1, since we use it as it 
+    # was tranferred to device
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if (
@@ -178,12 +197,13 @@ def always_choose_first_arg_stick(operations: list) -> None:
             and hasattr(tb, "layouts")
         ):
             print(f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(l.device_layout).stride_map) for l in tb.layouts]}")
-            chosen = next(iter(tb.layouts))
-            tb.data.data.layout = chosen
-            committed = LayoutKey.from_stl(chosen.device_layout)
-            tb.data.data.committed_layout = committed
-            tb.committed_layout = committed
-            print(f"MRA input committed: {name} -> {list(committed.stride_map)}")
+            if not tb.layouts:
+                raise AssertionError(f"graph input {name} has empty layouts set")
+            layout = next(iter(tb.layouts))
+            tb.data.data.layout = layout
+            tb.data.data.committed_layout = LayoutKey.from_stl(layout.device_layout)
+            tb.committed_layout = tb.data.data.committed_layout
+            print(f"MRA input committed: {name} -> {list(tb.committed_layout.stride_map)}")
             del tb.layouts
 
     for op in operations:
@@ -191,14 +211,11 @@ def always_choose_first_arg_stick(operations: list) -> None:
             continue  # FallbackKernel and other unhandled op types
 
         if not hasattr(op, "restick_cost_fn"):
-            # Layout is fixed/inherited — no restickify decision needed.
-            # Set chosen_layout so finalize_layouts assigns the tiled layout,
-            # but only if the op isn't already a mutation op (those keep their
-            # MutationLayoutSHOULDREMOVE for the scheduler to see).
+            # Layout is fixed/inherited — assign directly, skip mutation ops
+            # (they keep MutationLayoutSHOULDREMOVE for the scheduler).
             from torch._inductor.ir import MutationLayoutSHOULDREMOVE
-            from torch_spyre._inductor.ir import FixedTiledLayout
             if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                op.chosen_layout = op.layouts[0]
+                op.layout = op.layouts[0]
                 op.committed_layout = LayoutKey.from_stl(op.layouts[0].device_layout)
             continue
 
@@ -217,5 +234,10 @@ def always_choose_first_arg_stick(operations: list) -> None:
             f"MRA select_restickify_locations ({op.get_name()}): "
             f"stick={list(out_key.stride_map)} cost={cost} in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
         )
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            op.layout = chosen
         op.committed_layout = out_key
-        record_stick_decisions(op, chosen, out_key, in_layouts)
+        record_stick_decisions(op, out_key, in_layouts)
+
+    _print_op_layouts(operations, "after")

@@ -189,17 +189,15 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
-    """Commit chosen layouts and build V.graph.restickify_plan.
+    """Build V.graph.restickify_plan from stick_decisions set by optimize_restickify_locations.
 
-    Called after optimize_restickify_locations. For each op:
-      1. Assigns op.layout from stick_decisions (or op.chosen_layout for ops
-         without a cost function) and stamps op.committed_layout.
-      2. For each arg that needs a stick conversion, records an entry in
-         V.graph.restickify_plan for insert_restickify to act on.
+    Layouts are already committed to op.layout by optimize_restickify_locations.
+    This pass cleans up temporary attributes and records restickify entries for
+    args that need a stick conversion.
 
     Also commits layouts for graph input TensorBoxes.
     """
-    from torch._inductor.ir import InputBuffer, MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
+    from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
 
     # Commit layouts for graph inputs.
     for name in V.graph.graph_input_names:
@@ -222,17 +220,9 @@ def finalize_layouts(operations: list) -> None:
     for op in operations:
         decisions = getattr(op, "stick_decisions", None)
         cost_fn = getattr(op, "restick_cost_fn", None)
-        chosen_layout = getattr(op, "chosen_layout", None)
-        for attr in ("layouts", "restick_cost_fn", "stick_decisions", "chosen_layout"):
+        for attr in ("layouts", "restick_cost_fn", "stick_decisions"):
             if hasattr(op, attr):
                 delattr(op, attr)
-
-        # Commit chosen layout.
-        chosen = decisions["chosen_layout"] if decisions else chosen_layout
-        if chosen is not None:
-            if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                op.layout = chosen
-            op.committed_layout = LayoutKey.from_stl(chosen.device_layout)
 
         # Populate restickify_plan for ops that need edge restickifies.
         if not decisions:

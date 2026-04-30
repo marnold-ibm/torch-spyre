@@ -333,7 +333,6 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
 # ------- Mutation + restickify regression test ---------
 
 
-@pytest.mark.xfail(reason="contains stick reduction: mutation op layout propagation not yet implemented")
 def test_bmm_with_inplace_mutation():
     # Regression test: copy_() creates a mutation_renames chain in the Inductor
     # scheduler. Combined with a bmm whose weight needs restickifying, this
