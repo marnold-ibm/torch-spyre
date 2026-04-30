@@ -573,11 +573,9 @@ def reduction_layouts(
                 f" stick_iv=iv{iter_var_id(out_idc[-1])}"
                 f" out_coords={out_idc}"
             )
-            # Not considering stick reductions yet
-            if iter_var_id(out_idc[-1]) != -1:
-                layouts.append(out_layout)
-            else:
-                print(f"MRA reduction_layouts ({op.get_name()}) dropping no-stick output (stick on reduction dim)")
+            if iter_var_id(out_idc[-1]) == -1:
+                print(f"MRA reduction_layouts ({op.get_name()}) stick on reduction dim — output layout has no free stick, using as-is")
+            layouts.append(out_layout)
         _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args))
         return layouts
     else:
