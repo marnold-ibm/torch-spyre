@@ -624,8 +624,6 @@ def compute_layouts(
     args: list[SchedNodeArg],
 ) -> list[FixedTiledLayout]:
     data = op.data
-    origin_node = next(iter(data.origins)) if data.origins else None
-    aten_op = origin_node.target if origin_node is not None else None
     print()
     print(f"MRA:  ====== In compute_layouts ({op.get_name()})  ======")
 
@@ -638,6 +636,7 @@ def compute_layouts(
     ):
         return _matmul_layouts(op, output, output_dep, args)
 
+    aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:
         first_layout = next(iter(args[0].layouts))
         if first_layout.size != output.size or first_layout.stride != output.stride:
