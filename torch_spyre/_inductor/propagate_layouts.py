@@ -44,6 +44,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
+    compute_restickify_target_layout,
     concretize_expr,
     get_mem_deps_from_rw,
     host_coordinates,
@@ -67,159 +68,30 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def restickify_device_size(
-    old_device_size: list,
-    old_sd_outer_dim: int,
-    old_sd_host_size: int,
-    new_sd_outer_dim: int,
-    new_sd_host_size: int,
-    stick_size: int = 64,
-) -> list:
-    """Compute device_size after moving the stick from old_sd to new_sd."""
-    assert new_sd_host_size % stick_size == 0, (
-        f"Cannot move stick to dimension with size {new_sd_host_size}: "
-        f"not a multiple of stick_size={stick_size}"
-    )
-    new_device_size = list(old_device_size)
-    new_device_size[-1] = stick_size
-    new_device_size[old_sd_outer_dim] = new_sd_host_size // stick_size
-    new_device_size[new_sd_outer_dim] = old_sd_host_size
-    return new_device_size
-
-
-def restickify_stride_map(
-    old_stride_map: list,
-    old_sd_outer_dim: int,
-    old_sd_host_stride: int,
-    new_sd_outer_dim: int,
-    new_sd_host_stride: int,
-    stick_size: int = 64,
-) -> list:
-    """Compute stride_map after moving the stick from old_sd to new_sd."""
-    new_stride_map = list(old_stride_map)
-    new_stride_map[-1] = new_sd_host_stride
-    new_stride_map[old_sd_outer_dim] = new_sd_host_stride * stick_size
-    new_stride_map[new_sd_outer_dim] = old_sd_host_stride
-    return new_stride_map
-
-
-def compute_restickify_target_layout(
-    layout: FixedTiledLayout,
-    target_stick_expr,
-    ic: list,
-    idc: list,
-) -> "FixedTiledLayout | None":
-    """Pure. Returns target layout, or None if restickify is infeasible."""
-    dl = layout.device_layout
-    new_sd = matching_dim(ic, target_stick_expr)
-    if new_sd is None:
-        return None
-    host_size = [concretize_expr(s) for s in layout.size]
-    host_stride = [concretize_expr(s) for s in layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
-        return None
-    old_stick_expr = idc[-1]
-    old_stride_map = list(dl.stride_map)
-    old_var = next(iter(old_stick_expr.free_symbols))
-    new_var = next(iter(target_stick_expr.free_symbols))
-    stick_size = 64
-    old_sd_outer_dim = next(
-        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
-    )
-    if old_sd_outer_dim is None:
-        return None
-    candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
-    if not candidates:
-        return None
-    new_sd_outer_dim = candidates[0]
-    if host_size[new_sd] % stick_size != 0:
-        return None
-    device_size = restickify_device_size(
-        list(dl.device_size),
-        old_sd_outer_dim,
-        host_size[old_sd],
-        new_sd_outer_dim,
-        host_size[new_sd],
-    )
-    stride_map = restickify_stride_map(
-        old_stride_map,
-        old_sd_outer_dim,
-        host_stride[old_sd],
-        new_sd_outer_dim,
-        host_stride[new_sd],
-    )
-    stl = SpyreTensorLayout(device_size, stride_map, dl.device_dtype)
-    return FixedTiledLayout(
-        layout.device, layout.dtype, layout.size, layout.stride, stl
-    )
-
-
-
-def compute_edge_costs_for_in_key(
-    rc: "EdgeCostMap",
-    in_key: "LayoutKey",
-    arg: "SchedNodeArg",
-    out_key_by_expr: "dict",
-) -> None:
-    """Populate rc._cost[in_key] for all out_keys in out_key_by_expr.
-
-    Finds the layout in arg.layouts matching in_key, then computes cost for
-    each (out_expr, out_key) pair and stores results in rc via set_cost_and_target.
-    Called on cache miss by RestickNodeCost subclasses.
-    """
-    layout = next(
-        (l for l in arg.layouts if LayoutKey.from_stl(l.device_layout) == in_key), None
-    )
-    if layout is None:
-        return
-    ic = host_coordinates(layout, arg.dep)
-    idc = device_coordinates(layout, arg.dep)
-    if iter_var_id(idc[-1]) == -1:
-        for out_key in out_key_by_expr.values():
-            rc.set_cost_and_target(in_key, out_key, 0, None)
-        return
-    for out_expr, out_key in out_key_by_expr.items():
-        if out_expr == idc[-1]:
-            rc.set_cost_and_target(in_key, out_key, 0, None)
-        else:
-            tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
-            if tgt is not None:
-                cost = 1
-                for s in layout.size:
-                    cost *= concretize_expr(s)
-                rc.set_cost_and_target(in_key, out_key, cost, tgt)
-
-
 def _attach_all_same_cost_fn(
     op: Operation,
     args: "list[SchedNodeArg]",
-    out_key_by_expr: "dict",
+    out_layouts: "list[FixedTiledLayout]",
+    out_dep: "MemoryDep",
 ) -> None:
     """Build and attach an AllSameNode cost function to op.
 
-    out_key_by_expr maps each stick_expr to the LayoutKey of the output layout
-    for that stick. No-op when out_key_by_expr is empty (scalar/broadcast-only args).
+    out_layouts are the candidate output layouts for this op.
+    out_dep is the MemoryDep for the output buffer, which may differ from each
+    arg's dep when inputs are accessed with a different index (e.g. transposed).
+    No-op when out_layouts is empty (scalar/broadcast-only args).
     """
-    if not out_key_by_expr:
+    if not out_layouts:
         return
-    edge_costs = [EdgeCostMap(arg.dep) for arg in args]
-    op.restick_cost_fn = AllSameNode(edge_costs, args, out_key_by_expr, compute_edge_costs_for_in_key)
+    edge_costs = [EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args]
+    op.restick_cost_fn = AllSameNode(edge_costs)
 
 
 def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_fn):
     layouts = [
         layout_fn(op, output, output_dep, arg.dep, layout) for layout in arg.layouts
     ]
-    out_key_by_expr = {
-        device_coordinates(in_layout, arg.dep)[-1]: LayoutKey.from_stl(
-            out_layout.device_layout
-        )
-        for in_layout, out_layout in zip(arg.layouts, layouts)
-        if device_coordinates(in_layout, arg.dep)[-1] != 0
-    }
-    _attach_all_same_cost_fn(op, cost_args, out_key_by_expr)
+    _attach_all_same_cost_fn(op, cost_args, layouts, output_dep)
     return layouts
 
 
@@ -419,10 +291,10 @@ def _matmul_layouts(
             f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
         )
 
-    x_out_key_by_expr = _single_out_key_by_expr(x, reduction_coord)
-    y_out_key_by_expr = _single_out_key_by_expr(y, generated_coord)
-    x_req_key = next(iter(x_out_key_by_expr.values()))
-    y_req_key = next(iter(y_out_key_by_expr.values()))
+    x_req_layout = _required_layout_for_expr(x, reduction_coord)
+    y_req_layout = _required_layout_for_expr(y, generated_coord)
+    x_req_key = LayoutKey.from_stl(x_req_layout.device_layout)
+    y_req_key = LayoutKey.from_stl(y_req_layout.device_layout)
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     print(f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}")
@@ -446,13 +318,10 @@ def _matmul_layouts(
         output.device, output.dtype, output.size, output.stride, stl
     )
     required_out_key = LayoutKey.from_stl(stl)
-    x_rc = EdgeCostMap(x.dep)
-    y_rc = EdgeCostMap(y.dep)
+    x_rc = EdgeCostMap(x.dep, x.layouts, [x_req_layout], x.dep)
+    y_rc = EdgeCostMap(y.dep, y.layouts, [y_req_layout], y.dep)
     op.restick_cost_fn = FixedInOutNode(
         [x_rc, y_rc],
-        args=[x, y],
-        out_key_by_expr={**x_out_key_by_expr, **y_out_key_by_expr},
-        compute_fn=compute_edge_costs_for_in_key,
         required_out_key=required_out_key,
         required_in_keys=[x_req_key, y_req_key],
     )
@@ -501,7 +370,6 @@ def _multi_arg_pointwise_layouts(
             can_use_same_layout = False
 
     results: list[FixedTiledLayout] = []
-    out_key_by_expr: dict = {}
     # Sort stick exprs for determinism
     for stick_expr in sorted(stick_exprs, key=str) if stick_exprs else [None]:
         if can_use_same_layout:
@@ -534,15 +402,13 @@ def _multi_arg_pointwise_layouts(
             print(
                 f"MRA: stick_expr={stick_expr} out_stick_dim={out_stick_dim} dim_order={dim_order} stride_map={list(stl.stride_map)}"
             )
-        if stick_expr is not None:
-            out_key_by_expr[stick_expr] = LayoutKey.from_stl(stl)
         results.append(
             FixedTiledLayout(
                 output.device, output.dtype, output.size, output.stride, stl
             )
         )
 
-    _attach_all_same_cost_fn(op, args, out_key_by_expr)
+    _attach_all_same_cost_fn(op, args, results, output_dep)
 
     return results
 
@@ -583,17 +449,15 @@ def compute_layouts(
     )
 
 
-def _single_out_key_by_expr(arg: "SchedNodeArg", out_expr) -> "dict":
-    """Build a single-entry out_key_by_expr for one stick expression from one arg."""
+def _required_layout_for_expr(arg: "SchedNodeArg", out_expr) -> "FixedTiledLayout":
+    """Return the layout an arg must reach to satisfy the given stick expression."""
     layout = next(iter(arg.layouts))
     ic = host_coordinates(layout, arg.dep)
     idc = device_coordinates(layout, arg.dep)
     if out_expr == idc[-1]:
-        return {out_expr: LayoutKey.from_stl(layout.device_layout)}
+        return layout
     tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
-    if tgt is not None:
-        return {out_expr: LayoutKey.from_stl(tgt.device_layout)}
-    return {out_expr: LayoutKey.from_stl(layout.device_layout)}
+    return tgt if tgt is not None else layout
 
 
 def generic_layout(op: Operation) -> FixedTiledLayout:

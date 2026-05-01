@@ -27,6 +27,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
+from .pass_utils import compute_edge_cost
 
 INF = math.inf
 
@@ -42,83 +43,74 @@ class LayoutKey:
 
 
 class EdgeCostMap:
-    """Thin 2-D cost table for one input arg.
+    """Lazy 2-D cost table for one input arg.
 
-    Cost table indexed [in_key][out_key] where both keys are LayoutKeys
-    (device_size, stride_map) — stable across all nodes in the graph.
+    Costs are computed on demand via compute_edge_cost when first queried.
+    dep is also used by insert_restickify to identify the buffer and read index.
     """
 
-    def __init__(self, dep: "MemoryDep"):
-        # dep is kept for IR passes (insert_restickify) that need the buffer name
-        # and read index.  Cost optimization code does not and should not use it
+    def __init__(
+        self,
+        dep: "MemoryDep",
+        in_layouts: list,
+        out_layouts: list,
+        out_dep: "MemoryDep",
+    ):
         self.dep = dep
+        self._in_layouts = in_layouts
+        self._out_layouts = out_layouts
+        self._out_dep = out_dep
         self._cost: dict[LayoutKey, dict[LayoutKey, float]] = {}
         self._target: dict[LayoutKey, dict[LayoutKey, Any]] = {}
 
-    def set_cost_and_target(
-        self, in_key: LayoutKey, out_key: LayoutKey, cost: float, target
-    ) -> None:
+    def _compute(self, in_key: "LayoutKey", out_key: "LayoutKey") -> None:
+        # Three outcomes from compute_edge_cost:
+        #   None          -> infeasible: leave _cost unpopulated so cost() returns INF
+        #   (0.0, None)   -> same stick / broadcast: cost=0, target=None (no restickify needed)
+        #   (cost, tgt)   -> restickify required: cost>0, target=tgt_layout
+        # insert_restickify uses target() is None to mean "no restickify needed",
+        # so None must NOT be stored for the infeasible case — leaving the entry
+        # absent (→ INF) is what distinguishes infeasible from zero-cost.
+        in_layout = next(
+            (l for l in self._in_layouts if LayoutKey.from_stl(l.device_layout) == in_key),
+            None,
+        )
+        out_layout = next(
+            (l for l in self._out_layouts if LayoutKey.from_stl(l.device_layout) == out_key),
+            None,
+        )
+        if in_layout is None or out_layout is None:
+            return
+        result = compute_edge_cost(in_layout, self.dep, out_layout, self._out_dep)
+        if result is None:
+            return  # infeasible — cost() will return INF
+        cost, tgt = result
         self._cost.setdefault(in_key, {})[out_key] = cost
-        self._target.setdefault(in_key, {})[out_key] = target
+        self._target.setdefault(in_key, {})[out_key] = tgt
 
-    def format_table(self) -> str:
-        lines = []
-        for in_key, row in self._cost.items():
-            trow = self._target.get(in_key, {})
-            for out_key, cost in row.items():
-                tgt = trow.get(out_key)
-                if cost == INF:
-                    lines.append(
-                        f"    {list(in_key.stride_map)}->{list(out_key.stride_map)} = MAX (infeasible)"
-                    )
-                else:
-                    lines.append(
-                        f"    {list(in_key.stride_map)}->{list(out_key.stride_map)} = {cost}"
-                        + (
-                            f"  target_stride_map={list(tgt.device_layout.stride_map)}"
-                            if tgt is not None
-                            else ""
-                        )
-                    )
-        return "\n".join(lines)
+    def cost(self, in_key: "LayoutKey", out_key: "LayoutKey") -> float:
+        if in_key not in self._cost or out_key not in self._cost[in_key]:
+            self._compute(in_key, out_key)
+        return self._cost.get(in_key, {}).get(out_key, INF)
 
-    def feasible_for_out(self, out_key: LayoutKey) -> bool:
-        return any(out_key in row and row[out_key] < INF for row in self._cost.values())
-
-    def cost(self, in_key: LayoutKey, out_key: LayoutKey) -> "float | None":
-        """Cost for in_key -> out_key transition. Returns None on cache miss."""
-        return self._cost.get(in_key, {}).get(out_key)
-
-    def target(self, in_key: LayoutKey, out_key: LayoutKey):
+    def target(self, in_key: "LayoutKey", out_key: "LayoutKey"):
         """Target layout for in_key -> out_key, or None if no restickify needed."""
         return self._target.get(in_key, {}).get(out_key)
 
 
 class RestickNodeCost(abc.ABC):
-    def __init__(self, edge_costs, args, out_key_by_expr, compute_fn):
+    def __init__(self, edge_costs):
         self.edge_costs = edge_costs
-        self.args = args
-        self.out_key_by_expr = out_key_by_expr
-        self._compute_fn = compute_fn
-
-    def _get_edge_cost(
-        self, rc: EdgeCostMap, in_key: LayoutKey, out_key: LayoutKey, arg
-    ) -> float:
-        c = rc.cost(in_key, out_key)
-        if c is None:
-            self._compute_fn(rc, in_key, arg, self.out_key_by_expr)
-            c = rc.cost(in_key, out_key)
-        return INF if c is None else c
 
     @abc.abstractmethod
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float: ...
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float: ...
 
 
 class AllSameNode(RestickNodeCost):
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         total = 0.0
-        for rc, lk, arg in zip(self.edge_costs, in_layouts, self.args):
-            c = self._get_edge_cost(rc, lk, out_key, arg)
+        for rc, lk in zip(self.edge_costs, in_layouts):
+            c = rc.cost(lk, out_key)
             if c == INF:
                 return INF
             total += c
@@ -129,24 +121,19 @@ class FixedInOutNode(RestickNodeCost):
     def __init__(
         self,
         edge_costs,
-        args,
-        out_key_by_expr,
-        compute_fn,
-        required_out_key: LayoutKey,
+        required_out_key: "LayoutKey",
         required_in_keys: "list[LayoutKey]",
     ):
-        super().__init__(edge_costs, args, out_key_by_expr, compute_fn)
+        super().__init__(edge_costs)
         self.required_out_key = required_out_key
         self.required_in_keys = required_in_keys
 
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         if out_key != self.required_out_key:
             return INF
         total = 0.0
-        for rc, lk, req_key, arg in zip(
-            self.edge_costs, in_layouts, self.required_in_keys, self.args
-        ):
-            c = self._get_edge_cost(rc, lk, req_key, arg)
+        for rc, lk, req_key in zip(self.edge_costs, in_layouts, self.required_in_keys):
+            c = rc.cost(lk, req_key)
             if c == INF:
                 return INF
             total += c

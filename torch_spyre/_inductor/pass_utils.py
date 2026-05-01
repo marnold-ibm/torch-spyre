@@ -26,10 +26,11 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
+from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 
 from .ir import FixedTiledLayout
-from .views import compute_coordinates
+from .views import compute_coordinates, matching_dim
 
 
 class SchedNodeArg(NamedTuple):
@@ -266,3 +267,124 @@ def apply_splits_from_index_coeff(
             if rc != 0 and rc in reduction_coeff_splits:
                 result[sym] = reduction_coeff_splits[rc]
     return result
+
+
+def restickify_device_size(
+    old_device_size: list,
+    old_sd_outer_dim: int,
+    old_sd_host_size: int,
+    new_sd_outer_dim: int,
+    new_sd_host_size: int,
+    stick_size: int = 64,
+) -> list:
+    """Compute device_size after moving the stick from old_sd to new_sd."""
+    assert new_sd_host_size % stick_size == 0, (
+        f"Cannot move stick to dimension with size {new_sd_host_size}: "
+        f"not a multiple of stick_size={stick_size}"
+    )
+    new_device_size = list(old_device_size)
+    new_device_size[-1] = stick_size
+    new_device_size[old_sd_outer_dim] = new_sd_host_size // stick_size
+    new_device_size[new_sd_outer_dim] = old_sd_host_size
+    return new_device_size
+
+
+def restickify_stride_map(
+    old_stride_map: list,
+    old_sd_outer_dim: int,
+    old_sd_host_stride: int,
+    new_sd_outer_dim: int,
+    new_sd_host_stride: int,
+    stick_size: int = 64,
+) -> list:
+    """Compute stride_map after moving the stick from old_sd to new_sd."""
+    new_stride_map = list(old_stride_map)
+    new_stride_map[-1] = new_sd_host_stride
+    new_stride_map[old_sd_outer_dim] = new_sd_host_stride * stick_size
+    new_stride_map[new_sd_outer_dim] = old_sd_host_stride
+    return new_stride_map
+
+
+def compute_restickify_target_layout(
+    layout: FixedTiledLayout,
+    target_stick_expr,
+    ic: list,
+    idc: list,
+) -> "FixedTiledLayout | None":
+    """Pure. Returns target layout, or None if restickify is infeasible."""
+    dl = layout.device_layout
+    new_sd = matching_dim(ic, target_stick_expr)
+    if new_sd is None:
+        return None
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    old_sd = matching_dim(ic, idc[-1])
+    if old_sd is None:
+        return None
+    old_stick_expr = idc[-1]
+    old_stride_map = list(dl.stride_map)
+    old_var = next(iter(old_stick_expr.free_symbols))
+    new_var = next(iter(target_stick_expr.free_symbols))
+    stick_size = 64
+    old_sd_outer_dim = next(
+        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
+        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+    )
+    if old_sd_outer_dim is None:
+        return None
+    candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
+    if not candidates:
+        return None
+    new_sd_outer_dim = candidates[0]
+    if host_size[new_sd] % stick_size != 0:
+        return None
+    device_size = restickify_device_size(
+        list(dl.device_size),
+        old_sd_outer_dim,
+        host_size[old_sd],
+        new_sd_outer_dim,
+        host_size[new_sd],
+    )
+    stride_map = restickify_stride_map(
+        old_stride_map,
+        old_sd_outer_dim,
+        host_stride[old_sd],
+        new_sd_outer_dim,
+        host_stride[new_sd],
+    )
+    stl = SpyreTensorLayout(device_size, stride_map, dl.device_dtype)
+    return FixedTiledLayout(
+        layout.device, layout.dtype, layout.size, layout.stride, stl
+    )
+
+
+def compute_edge_cost(
+    in_layout: FixedTiledLayout,
+    in_dep: MemoryDep,
+    out_layout: FixedTiledLayout,
+    out_dep: MemoryDep,
+) -> "tuple[float, FixedTiledLayout | None] | None":
+    """Compute restickify cost for one (in_layout, out_layout) pair.
+
+    in_dep and out_dep may differ when the output buffer is accessed with a
+    different index than the input (e.g. a transposed read).
+
+    Returns (cost, target) if feasible:
+      - cost=0, target=None  when no restickify is needed (same stick or broadcast)
+      - cost>0, target=tgt_layout  when a restickify is required
+    Returns None if the transition is infeasible.
+    """
+    ic = host_coordinates(in_layout, in_dep)
+    idc = device_coordinates(in_layout, in_dep)
+    out_idc = device_coordinates(out_layout, out_dep)
+    if iter_var_id(idc[-1]) == -1 or not out_idc or iter_var_id(out_idc[-1]) == -1:
+        return 0.0, None
+    if out_idc[-1] == idc[-1]:
+        return 0.0, None
+    tgt = compute_restickify_target_layout(in_layout, out_idc[-1], ic, idc)
+    if tgt is None:
+        return None
+    cost = 1
+    for s in in_layout.size:
+        cost *= concretize_expr(s)
+    return float(cost), tgt
