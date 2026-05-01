@@ -18,7 +18,13 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from torch._inductor.ir import InputBuffer, MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import (
+    InputBuffer,
+    MutationLayoutSHOULDREMOVE,
+    StorageBox,
+    TensorBox,
+)
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
 
@@ -77,9 +83,7 @@ class EdgeCostMap:
         return "\n".join(lines)
 
     def feasible_for_out(self, out_key: LayoutKey) -> bool:
-        return any(
-            out_key in row and row[out_key] < INF for row in self._cost.values()
-        )
+        return any(out_key in row and row[out_key] < INF for row in self._cost.values())
 
     def cost(self, in_key: LayoutKey, out_key: LayoutKey) -> float:
         """Cost for in_key -> out_key transition."""
@@ -91,7 +95,6 @@ class EdgeCostMap:
 
 
 class RestickNodeCost(abc.ABC):
-
     def __init__(self, edge_costs):
         self.edge_costs = edge_costs
 
@@ -100,15 +103,11 @@ class RestickNodeCost(abc.ABC):
 
 
 class AllSameNode(RestickNodeCost):
-
     def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
-        return sum(
-            rc.cost(lk, out_key) for rc, lk in zip(self.edge_costs, in_layouts)
-        )
+        return sum(rc.cost(lk, out_key) for rc, lk in zip(self.edge_costs, in_layouts))
 
 
 class FixedInOutNode(RestickNodeCost):
-
     def __init__(
         self,
         edge_costs,
@@ -151,30 +150,30 @@ def _print_op_layouts(operations: list, label: str) -> None:
         layouts = getattr(op, "layouts", None)
         print(
             f"  {op.get_name()}: layout={type(layout).__name__}({layout})"
-            + (f" | layouts={[type(l).__name__ for l in layouts]}" if layouts else "")
+            + (f" | layouts={[type(lo).__name__ for lo in layouts]}" if layouts else "")
         )
 
 
 def greedy_local_min_cost(operations: list) -> None:
     """
-        Simple baseline
-        Greedy algorithm that processes nodes in topological order and finalizes output stick
-        However it uses the cost function at that node to pick a min local cost
-        If costs equal, choose left-most argument's stick
-        
-        This is largely equal to the previous baseline (always choose first arg's stick)
-        But this version has the potential to choose a different arg if the first arg's
-        is sub-optimal or inviable. 
+    Simple baseline
+    Greedy algorithm that processes nodes in topological order and finalizes output stick
+    However it uses the cost function at that node to pick a min local cost
+    If costs equal, choose left-most argument's stick
+
+    This is largely equal to the previous baseline (always choose first arg's stick)
+    But this version has the potential to choose a different arg if the first arg's
+    is sub-optimal or inviable.
     """
 
     print()
     print("=== In greedy_local_min_cost ===")
     _print_op_layouts(operations, "before")
 
-    print ()
-    print ("-- Running greedy algorithm --")
+    print()
+    print("-- Running greedy algorithm --")
     # Process graph inputs first so all upstreams have committed_layout.
-    # For now inputs are always a set of size 1, since we use it as it 
+    # For now inputs are always a set of size 1, since we use it as it
     # was tranferred to device
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
@@ -184,21 +183,24 @@ def greedy_local_min_cost(operations: list) -> None:
             and isinstance(tb.data.data, InputBuffer)
             and hasattr(tb, "layouts")
         ):
-            print(f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(l.device_layout).stride_map) for l in tb.layouts]}")
+            print(
+                f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(lo.device_layout).stride_map) for lo in tb.layouts]}"
+            )
             if not tb.layouts:
                 raise AssertionError(f"graph input {name} has empty layouts set")
             layout = next(iter(tb.layouts))
             tb.data.data.layout = layout
             tb.data.data.committed_layout = LayoutKey.from_stl(layout.device_layout)
             tb.committed_layout = tb.data.data.committed_layout
-            print(f"MRA input committed: {name} -> {list(tb.committed_layout.stride_map)}")
+            print(
+                f"MRA input committed: {name} -> {list(tb.committed_layout.stride_map)}"
+            )
             del tb.layouts
 
     for op in operations:
-        print ("Processing node:", op.get_name())
+        print("Processing node:", op.get_name())
         if not hasattr(op, "layouts"):
             continue  # FallbackKernel and other unhandled op types
-
 
         if not hasattr(op, "restick_cost_fn"):
             if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
@@ -241,7 +243,9 @@ def greedy_local_min_cost(operations: list) -> None:
                 layout = out_layout
                 out_key = out_layout_key
 
-        assert out_key is not None, f"({op.get_name()}): all stick possibilities had infinite cost. Cannot proceed"
+        assert out_key is not None, (
+            f"({op.get_name()}): all stick possibilities had infinite cost. Cannot proceed"
+        )
 
         print(
             f"MRA select_restickify_locations ({op.get_name()}): "

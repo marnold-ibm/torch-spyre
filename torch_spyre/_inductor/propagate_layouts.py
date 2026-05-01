@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 
 import sympy
 import torch
@@ -184,14 +183,20 @@ def build_edge_restick_costs(
                 for out_key in out_key_by_expr.values():
                     rc.set_cost_and_target(in_key, out_key, 0, None)
                 continue
-            print(f"MRA build_edge_restick_costs: arg={arg.dep.name} idc={idc} stick=idc[-1]={idc[-1]} in_key={list(in_key.stride_map)}")
+            print(
+                f"MRA build_edge_restick_costs: arg={arg.dep.name} idc={idc} stick=idc[-1]={idc[-1]} in_key={list(in_key.stride_map)}"
+            )
             for out_expr, out_key in out_key_by_expr.items():
                 if out_expr == idc[-1]:
-                    print(f"MRA build_edge_restick_costs:   out_expr={out_expr} same stick -> out_key={list(out_key.stride_map)} cost=0")
+                    print(
+                        f"MRA build_edge_restick_costs:   out_expr={out_expr} same stick -> out_key={list(out_key.stride_map)} cost=0"
+                    )
                     rc.set_cost_and_target(in_key, out_key, 0, None)
                 else:
                     tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
-                    print(f"MRA build_edge_restick_costs:   out_expr={out_expr} tgt={None if tgt is None else list(tgt.device_layout.stride_map)}")
+                    print(
+                        f"MRA build_edge_restick_costs:   out_expr={out_expr} tgt={None if tgt is None else list(tgt.device_layout.stride_map)}"
+                    )
                     if tgt is not None:
                         cost = 1
                         for s in layout.size:
@@ -227,7 +232,9 @@ def _attach_all_same_cost_fn(
     """
     print(f"MRA _attach_all_same_cost_fn ({op.get_name()}): stick_exprs={stick_exprs}")
     if not stick_exprs:
-        print(f"MRA _attach_all_same_cost_fn ({op.get_name()}): no stick exprs, skipping")
+        print(
+            f"MRA _attach_all_same_cost_fn ({op.get_name()}): no stick exprs, skipping"
+        )
         return
     for i, arg in enumerate(args):
         for layout in arg.layouts:
@@ -250,7 +257,9 @@ def _attach_all_same_cost_fn(
     for rc in edge_costs:
         for row in rc._cost.values():
             all_out_keys.update(row.keys())
-    viable_keys = [k for k in all_out_keys if all(rc.feasible_for_out(k) for rc in edge_costs)]
+    viable_keys = [
+        k for k in all_out_keys if all(rc.feasible_for_out(k) for rc in edge_costs)
+    ]
     print(f"MRA   viable_out_keys={[list(k.stride_map) for k in viable_keys]}")
     if not viable_keys:
         raise Unsupported(
@@ -264,14 +273,17 @@ def _attach_all_same_cost_fn(
 
 def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_fn):
     layouts = [
-        layout_fn(op, output, output_dep, arg.dep, layout)
-        for layout in arg.layouts
+        layout_fn(op, output, output_dep, arg.dep, layout) for layout in arg.layouts
     ]
     out_key_by_expr = {
-        device_coordinates(in_layout, arg.dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
+        device_coordinates(in_layout, arg.dep)[-1]: LayoutKey.from_stl(
+            out_layout.device_layout
+        )
         for in_layout, out_layout in zip(arg.layouts, layouts)
     }
-    _attach_all_same_cost_fn(op, cost_args, _collect_stick_exprs(cost_args), out_key_by_expr)
+    _attach_all_same_cost_fn(
+        op, cost_args, _collect_stick_exprs(cost_args), out_key_by_expr
+    )
     return layouts
 
 
@@ -307,12 +319,16 @@ def _single_arg_op_layout(
             if out_stick_dim is None:
                 out_dim_order = list(range(len(output.size))) + [-1]
             else:
-                out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+                out_dim_order = [
+                    d for d in range(len(output.size)) if d != out_stick_dim
+                ]
                 out_dim_order = out_dim_order + [out_stick_dim]
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-        return FixedTiledLayout(output.device, output.dtype, output.size, output.stride, stl)
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
@@ -489,9 +505,7 @@ def _matmul_layouts(
         )
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
-    print(
-        f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}"
-    )
+    print(f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}")
     if out_stick_dim is None:
         raise Unsupported(
             f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {generated_coord}"
@@ -618,7 +632,10 @@ def compute_layouts(
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
+    if isinstance(data, Reduction) and data.reduction_type in (
+        MATMUL_REDUCTION_OP,
+        BATCH_MATMUL_OP,
+    ):
         return _matmul_layouts(op, output, output_dep, args)
 
     if aten_op == spyreop.layernormnorm.default:
@@ -637,7 +654,6 @@ def compute_layouts(
     )
 
 
-
 def _single_out_key_by_expr(arg: "SchedNodeArg", out_expr) -> "dict":
     """Build a single-entry out_key_by_expr for one stick expression from one arg."""
     layout = next(iter(arg.layouts))
@@ -649,7 +665,6 @@ def _single_out_key_by_expr(arg: "SchedNodeArg", out_expr) -> "dict":
     if tgt is not None:
         return {out_expr: LayoutKey.from_stl(tgt.device_layout)}
     return {out_expr: LayoutKey.from_stl(layout.device_layout)}
-
 
 
 def generic_layout(op: Operation) -> FixedTiledLayout:
@@ -750,7 +765,6 @@ def propagate_mutation_layouts(
             output = n.node.get_layout()
             layouts = list(compute_layouts(n.node, output, output_dep, args))
             n.node.layout = layouts[0]
-            buf = V.graph.get_buffer(n.node.get_name())
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"

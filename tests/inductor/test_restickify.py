@@ -245,7 +245,9 @@ def test_expand_unsqueeze0_expand_plus_at():
     s = 128
     a = torch.randn((s, s), dtype=torch.float16) * 0.1
     b = torch.randn((s,), dtype=torch.float16) * 0.1
-    _compare(lambda a, b: b.unsqueeze(0).expand(s, s) + a.t(), a, b, check_strides=False)
+    _compare(
+        lambda a, b: b.unsqueeze(0).expand(s, s) + a.t(), a, b, check_strides=False
+    )
 
 
 def test_expand_at_plus_unsqueeze0_expand():
@@ -259,7 +261,9 @@ def test_expand_unsqueeze1_expand_plus_at():
     s = 128
     a = torch.randn((s, s), dtype=torch.float16) * 0.1
     b = torch.randn((s,), dtype=torch.float16) * 0.1
-    _compare(lambda a, b: b.unsqueeze(1).expand(s, s) + a.t(), a, b, check_strides=False)
+    _compare(
+        lambda a, b: b.unsqueeze(1).expand(s, s) + a.t(), a, b, check_strides=False
+    )
 
 
 def test_expand_at_plus_unsqueeze1_expand():

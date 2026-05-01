@@ -21,7 +21,12 @@ from .optimize_restickify import FixedInOutNode, LayoutKey
 from .pass_utils import host_coordinates, device_coordinates
 from .propagate_layouts import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE, Operation, TensorBox
+from torch._inductor.ir import (
+    ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    Operation,
+    TensorBox,
+)
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
@@ -177,7 +182,9 @@ def insert_restickify(operations: list[Operation]) -> None:
     in-place.  No scheduler state is touched.
     """
     restickify_plan = V.graph.restickify_plan
-    print(f"MRA insert_restickify: plan id={id(restickify_plan)} keys={list(restickify_plan.keys())}")
+    print(
+        f"MRA insert_restickify: plan id={id(restickify_plan)} keys={list(restickify_plan.keys())}"
+    )
     if not restickify_plan:
         return
 
@@ -194,7 +201,7 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 def finalize_layouts(operations: list) -> None:
     """
-        Needs comment
+    Needs comment
     """
     from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
 
@@ -212,7 +219,7 @@ def finalize_layouts(operations: list) -> None:
             tb.data.data.committed_layout = LayoutKey.from_stl(chosen.device_layout)
             del tb.layouts
 
-    restickify_plan = defaultdict(list)
+    restickify_plan: dict = defaultdict(list)
     print()
     print("=== In finalize_layouts ===")
 
@@ -247,7 +254,9 @@ def finalize_layouts(operations: list) -> None:
             if tgt is None:
                 print("    -> no restickify needed")
                 continue
-            print(f"    -> scheduling restickify {list(in_key.stride_map)} -> {list(req_key.stride_map)}")
+            print(
+                f"    -> scheduling restickify {list(in_key.stride_map)} -> {list(req_key.stride_map)}"
+            )
             logger.warning(
                 f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
                 f"{list(in_key.stride_map)} -> {list(req_key.stride_map)} "
@@ -286,7 +295,9 @@ def finalize_layouts(operations: list) -> None:
             if in_stick_expr == target_stick_expr:
                 print("    -> no restickify needed")
                 continue
-            tgt = compute_restickify_target_layout(in_layout, target_stick_expr, ic, idc)
+            tgt = compute_restickify_target_layout(
+                in_layout, target_stick_expr, ic, idc
+            )
             assert tgt is not None, (
                 f"mutation op {op.get_name()} arg={dep.name}: cannot restickify "
                 f"{list(in_key.stride_map)} -> {list(target_key.stride_map)}"
@@ -303,7 +314,9 @@ def finalize_layouts(operations: list) -> None:
             _record_restickify(op, dep.name, tgt, restickify_plan)
 
     V.graph.restickify_plan = restickify_plan
-    print(f"MRA finalize_layouts: set restickify_plan id={id(V.graph.restickify_plan)} keys={list(restickify_plan.keys())}")
+    print(
+        f"MRA finalize_layouts: set restickify_plan id={id(V.graph.restickify_plan)} keys={list(restickify_plan.keys())}"
+    )
 
 
 def _format_restickify_plan(restickify_plan: dict) -> None:
