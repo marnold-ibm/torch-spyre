@@ -85,9 +85,9 @@ class EdgeCostMap:
     def feasible_for_out(self, out_key: LayoutKey) -> bool:
         return any(out_key in row and row[out_key] < INF for row in self._cost.values())
 
-    def cost(self, in_key: LayoutKey, out_key: LayoutKey) -> float:
-        """Cost for in_key -> out_key transition."""
-        return self._cost.get(in_key, {}).get(out_key, INF)
+    def cost(self, in_key: LayoutKey, out_key: LayoutKey) -> "float | None":
+        """Cost for in_key -> out_key transition. Returns None on cache miss."""
+        return self._cost.get(in_key, {}).get(out_key)
 
     def target(self, in_key: LayoutKey, out_key: LayoutKey):
         """Target layout for in_key -> out_key, or None if no restickify needed."""
@@ -95,8 +95,20 @@ class EdgeCostMap:
 
 
 class RestickNodeCost(abc.ABC):
-    def __init__(self, edge_costs):
+    def __init__(self, edge_costs, args, out_key_by_expr, compute_fn):
         self.edge_costs = edge_costs
+        self.args = args
+        self.out_key_by_expr = out_key_by_expr
+        self._compute_fn = compute_fn
+
+    def _get_edge_cost(
+        self, rc: EdgeCostMap, in_key: LayoutKey, out_key: LayoutKey, arg
+    ) -> float:
+        c = rc.cost(in_key, out_key)
+        if c is None:
+            self._compute_fn(rc, in_key, arg, self.out_key_by_expr)
+            c = rc.cost(in_key, out_key)
+        return INF if c is None else c
 
     @abc.abstractmethod
     def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float: ...
@@ -104,29 +116,41 @@ class RestickNodeCost(abc.ABC):
 
 class AllSameNode(RestickNodeCost):
     def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
-        return sum(rc.cost(lk, out_key) for rc, lk in zip(self.edge_costs, in_layouts))
+        total = 0.0
+        for rc, lk, arg in zip(self.edge_costs, in_layouts, self.args):
+            c = self._get_edge_cost(rc, lk, out_key, arg)
+            if c == INF:
+                return INF
+            total += c
+        return total
 
 
 class FixedInOutNode(RestickNodeCost):
     def __init__(
         self,
         edge_costs,
+        args,
+        out_key_by_expr,
+        compute_fn,
         required_out_key: LayoutKey,
         required_in_keys: "list[LayoutKey]",
     ):
-        super().__init__(edge_costs)
+        super().__init__(edge_costs, args, out_key_by_expr, compute_fn)
         self.required_out_key = required_out_key
         self.required_in_keys = required_in_keys
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: LayoutKey) -> float:
         if out_key != self.required_out_key:
             return INF
-        return sum(
-            rc.cost(lk, req_key)
-            for rc, lk, req_key in zip(
-                self.edge_costs, in_layouts, self.required_in_keys
-            )
-        )
+        total = 0.0
+        for rc, lk, req_key, arg in zip(
+            self.edge_costs, in_layouts, self.required_in_keys, self.args
+        ):
+            c = self._get_edge_cost(rc, lk, req_key, arg)
+            if c == INF:
+                return INF
+            total += c
+        return total
 
 
 def record_stick_decisions(
