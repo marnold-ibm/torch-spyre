@@ -18,6 +18,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from torch._inductor.ir import InputBuffer, MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
 
@@ -45,13 +46,8 @@ class EdgeCostMap:
         # dep is kept for IR passes (insert_restickify) that need the buffer name
         # and read index.  Cost optimization code does not and should not use it
         self.dep = dep
-        self.has_no_stick = False  # True for scalar/broadcast args (no real stick)
         self._cost: dict[LayoutKey, dict[LayoutKey, float]] = {}
         self._target: dict[LayoutKey, dict[LayoutKey, Any]] = {}
-
-    def mark_no_stick(self) -> None:
-        """Mark this arg as scalar/broadcast — compatible with any output at zero cost."""
-        self.has_no_stick = True
 
     def set_cost_and_target(
         self, in_key: LayoutKey, out_key: LayoutKey, cost: float, target
@@ -60,8 +56,6 @@ class EdgeCostMap:
         self._target.setdefault(in_key, {})[out_key] = target
 
     def format_table(self) -> str:
-        if self.has_no_stick:
-            return "    (no stick — compatible with any output at zero cost)"
         lines = []
         for in_key, row in self._cost.items():
             trow = self._target.get(in_key, {})
@@ -83,22 +77,16 @@ class EdgeCostMap:
         return "\n".join(lines)
 
     def feasible_for_out(self, out_key: LayoutKey) -> bool:
-        if self.has_no_stick:
-            return True
         return any(
             out_key in row and row[out_key] < INF for row in self._cost.values()
         )
 
     def cost(self, in_key: LayoutKey, out_key: LayoutKey) -> float:
         """Cost for in_key -> out_key transition."""
-        if self.has_no_stick:
-            return 0
         return self._cost.get(in_key, {}).get(out_key, INF)
 
     def target(self, in_key: LayoutKey, out_key: LayoutKey):
         """Target layout for in_key -> out_key, or None if no restickify needed."""
-        if self.has_no_stick:
-            return None
         return self._target.get(in_key, {}).get(out_key)
 
 
@@ -179,8 +167,6 @@ def greedy_local_min_cost(operations: list) -> None:
         is sub-optimal or inviable. 
     """
 
-    from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
-
     print()
     print("=== In greedy_local_min_cost ===")
     _print_op_layouts(operations, "before")
@@ -213,18 +199,20 @@ def greedy_local_min_cost(operations: list) -> None:
         if not hasattr(op, "layouts"):
             continue  # FallbackKernel and other unhandled op types
 
+
         if not hasattr(op, "restick_cost_fn"):
-            # Layout is fixed/inherited — assign directly, skip mutation ops
-            # (they keep MutationLayoutSHOULDREMOVE for the scheduler).
-            from torch._inductor.ir import MutationLayoutSHOULDREMOVE
             if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # TODO: This is not safe. we don't know that there aren't other choices flowing in that we must match 
-                # ie, if the layout A flows in we need to pick layout B that aligns with it, using the cost function and/or viability
+                # Must set the layout for Mutation Ops
+                # TODO should this be done in propagate_layouts?
                 op.layout = op.layouts[0]
                 op.committed_layout = LayoutKey.from_stl(op.layouts[0].device_layout)
+
+            # nothing to do here.
             continue
 
         cost_fn = op.restick_cost_fn
+
+        # Collect each input arg's committed layout (finalized by earlier topo iterations).
         in_layouts = []
         for rc in cost_fn.edge_costs:
             buf = V.graph.get_buffer(rc.dep.name)
@@ -232,9 +220,9 @@ def greedy_local_min_cost(operations: list) -> None:
                 f"buffer {rc.dep.name} has no committed_layout — "
                 "topological order violated or input not committed"
             )
-            lk = buf.committed_layout
-            print(f"MRA in_layout: arg={rc.dep.name} layout={list(lk.stride_map)}")
-            in_layouts.append(lk)
+            in_layouts.append(buf.committed_layout)
+
+        # TODO: Don't out layout keys every time sigh
         out_layout_keys = [LayoutKey.from_stl(ol.device_layout) for ol in op.layouts]
         assert out_layout_keys, (
             f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
@@ -253,19 +241,13 @@ def greedy_local_min_cost(operations: list) -> None:
                 layout = out_layout
                 out_key = out_layout_key
 
-        if out_key is None:
-            # All candidates had infinite cost — fall back to first layout.
-
-            assert False, f"MRA WARNING ({op.get_name()}): all candidates inf, falling back to layouts[0]"
-            layout = op.layouts[0]
-            out_key = out_layout_keys[0]
+        assert out_key is not None, f"({op.get_name()}): all stick possibilities had infinite cost. Cannot proceed"
 
         print(
             f"MRA select_restickify_locations ({op.get_name()}): "
             f"stick={list(out_key.stride_map)} cost={best_cost} "
             f"in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
         )
-        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             op.layout = layout
         op.committed_layout = out_key

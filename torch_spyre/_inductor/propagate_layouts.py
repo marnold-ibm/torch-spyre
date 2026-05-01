@@ -174,11 +174,16 @@ def build_edge_restick_costs(
         for layout in arg.layouts:
             ic = host_coordinates(layout, arg.dep)
             idc = device_coordinates(layout, arg.dep)
-            if iter_var_id(idc[-1]) == -1:
-                rc.mark_no_stick()
-                continue
-
             in_key = LayoutKey.from_stl(layout.device_layout)
+            if iter_var_id(idc[-1]) == -1:
+                print(
+                    f"MRA no_stick: arg={arg.dep.name} idc={idc} "
+                    f"ic={ic} layout.size={list(layout.size)} layout.stride={list(layout.stride)}"
+                )
+                # Setting zero cost for constants TODO: vaidate this is correct for sparse sticks
+                for out_key in out_key_by_expr.values():
+                    rc.set_cost_and_target(in_key, out_key, 0, None)
+                continue
             print(f"MRA build_edge_restick_costs: arg={arg.dep.name} idc={idc} stick=idc[-1]={idc[-1]} in_key={list(in_key.stride_map)}")
             for out_expr, out_key in out_key_by_expr.items():
                 if out_expr == idc[-1]:
@@ -243,9 +248,8 @@ def _attach_all_same_cost_fn(
     # then keep only those feasible for every arg.
     all_out_keys: set[LayoutKey] = set()
     for rc in edge_costs:
-        if not rc.has_no_stick:
-            for row in rc._cost.values():
-                all_out_keys.update(row.keys())
+        for row in rc._cost.values():
+            all_out_keys.update(row.keys())
     viable_keys = [k for k in all_out_keys if all(rc.feasible_for_out(k) for rc in edge_costs)]
     print(f"MRA   viable_out_keys={[list(k.stride_map) for k in viable_keys]}")
     if not viable_keys:
