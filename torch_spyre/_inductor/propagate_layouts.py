@@ -258,6 +258,19 @@ def _attach_all_same_cost_fn(
     print(f"MRA   attached AllSameNode to {op.get_name()}")
 
 
+def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_fn):
+    layouts = [
+        layout_fn(op, output, output_dep, arg.dep, layout)
+        for layout in arg.layouts
+    ]
+    out_key_by_expr = {
+        device_coordinates(in_layout, arg.dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
+        for in_layout, out_layout in zip(arg.layouts, layouts)
+    }
+    _attach_all_same_cost_fn(op, cost_args, _collect_stick_exprs(cost_args), out_key_by_expr)
+    return layouts
+
+
 def first_arg_pointwise_layout(
     op: Operation,
     output: FixedLayout,
@@ -286,20 +299,6 @@ def first_arg_pointwise_layout(
 
         case spyreop.overwrite.default:
             stl = SpyreTensorLayout(output.size, output.dtype)
-            return FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
-            )
-
-        case spyreop.layernormnorm.default:
-            # Output layout is determined by layout of first argument only
-            x_stl = layout.device_layout
-            if layout.size != output.size or layout.stride != output.stride:
-                raise Unsupported(
-                    f"views not supported for spyre.layernormnorm({layout.size})=>{output.size}) "
-                )
-            stl = SpyreTensorLayout(
-                x_stl.device_size, x_stl.stride_map, x_stl.device_dtype
-            )
             return FixedTiledLayout(
                 output.device, output.dtype, output.size, output.stride, stl
             )
@@ -352,130 +351,258 @@ def first_arg_pointwise_layout(
             )
 
 
-def pointwise_layouts(
+def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
 ) -> list[FixedTiledLayout]:
     data = op.data
-    origin_node = next(iter(data.origins))
-    aten_op = origin_node.target
+    print(f"MRA:  ====== In MatMul ({op.get_name()})  ======")
+    out_coords = host_coordinates(output, output_dep)
+
+    print("MRA: ARGS:")
+    for i, arg in enumerate(args):
+        print("MRA: arg:", i, arg)
+        _hc = host_coordinates(next(iter(arg.layouts)), arg.dep)
+        _dc = device_coordinates(next(iter(arg.layouts)), arg.dep)
+        print("MRA: host_coords:", _hc)
+        print("MRA: device_coords:", _dc)
+        print("MRA: Matching host stick dim:", matching_dim(_hc, _dc[-1]))
+    print("MRA: out_coords:", out_coords)
     print()
-    print(f"MRA:  ====== In Pointwise ({op.get_name()})  ======")
+
+    x = args[0]
+    y = args[1]
+    x_coords = host_coordinates(next(iter(x.layouts)), x.dep)
+    x_dev_coords = device_coordinates(next(iter(x.layouts)), x.dep)
+    y_coords = host_coordinates(next(iter(y.layouts)), y.dep)
+    y_dev_coords = device_coordinates(next(iter(y.layouts)), y.dep)
+
+    x_stick_expr = x_dev_coords[-1]
+    y_stick_expr = y_dev_coords[-1]
+    x_stick_dim = matching_dim(x_coords, x_stick_expr)
+    y_stick_dim = matching_dim(y_coords, y_stick_expr)
+    print(
+        f"MRA: x_stick_expr={x_stick_expr} x_stick_dim={x_stick_dim} x_stick_iv=iv{iter_var_id(x_stick_expr)}"
+    )
+    print(
+        f"MRA: y_stick_expr={y_stick_expr} y_stick_dim={y_stick_dim} y_stick_iv=iv{iter_var_id(y_stick_expr)}"
+    )
+    if x_stick_dim is None or y_stick_dim is None:
+        raise Unsupported(
+            f"{data.reduction_type}: failed to map stick_dims to host coords"
+        )
+
+    # Hardware stick constraints (DF16):
+    #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
+    #   Input2 (y): stick on generated_dim (the y coord that appears in output)
+    #   Output:     stick on generated_dim
+    if matching_dim(out_coords, x_stick_expr) is not None:
+        reduction_coord = next(
+            c
+            for c in x_coords
+            if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+        )
+        print(
+            f"MRA: x stick iv{iter_var_id(x_stick_expr)} is on output dim -> needs restickify to reduction_coord={reduction_coord} iv{iter_var_id(reduction_coord)}"
+        )
+    else:
+        reduction_coord = x_stick_expr
+        print(
+            f"MRA: x stick iv{iter_var_id(x_stick_expr)} already on reduction dim -> reduction_coord={reduction_coord}"
+        )
+
+    if matching_dim(out_coords, y_stick_expr) is None:
+        generated_coord = next(
+            c
+            for c in y_coords
+            if len(c.free_symbols) > 0
+            and matching_dim(out_coords, c) is not None
+            and matching_dim(x_coords, c) is None
+        )
+        print(
+            f"MRA: y stick iv{iter_var_id(y_stick_expr)} not on output dim -> needs restickify to generated_coord={generated_coord} iv{iter_var_id(generated_coord)}"
+        )
+    else:
+        generated_coord = y_stick_expr
+        print(
+            f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
+        )
+
+    x_rc = build_edge_restick_costs([x], _single_out_key_by_expr(x, reduction_coord))[0]
+    y_rc = build_edge_restick_costs([y], _single_out_key_by_expr(y, generated_coord))[0]
+    x_req_key = _required_key_from_single_stick_rc(x_rc)
+    y_req_key = _required_key_from_single_stick_rc(y_rc)
+
+    print(f"MRA EdgeCostmap tables for {op.get_name()}:")
+    print(f"  x ({x.dep.name}) required_in_key={list(x_req_key.stride_map)}:")
+    print(x_rc.format_table())
+    print(f"  y ({y.dep.name}) required_in_key={list(y_req_key.stride_map)}:")
+    print(y_rc.format_table())
+    if not x_rc.feasible_for_out(x_req_key):
+        raise Unsupported(
+            f"{data.reduction_type}: x arg cannot reach required stick {list(x_req_key.stride_map)}"
+        )
+    if not y_rc.feasible_for_out(y_req_key):
+        raise Unsupported(
+            f"{data.reduction_type}: y arg cannot reach required stick {list(y_req_key.stride_map)}"
+        )
+
+    out_stick_dim = matching_dim(out_coords, generated_coord)
+    print(
+        f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}"
+    )
+    if out_stick_dim is None:
+        raise Unsupported(
+            f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {generated_coord}"
+        )
+
+    out_dims = len(output.size)
+    out_dim_order = list(range(out_dims - 2))
+    if out_stick_dim == out_dims - 1:
+        out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
+    else:
+        out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
+    print(f"MRA: out_dim_order={out_dim_order}")
+    # Concretize for C++ SpyreTensorLayout constructor.
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    result_layout = FixedTiledLayout(
+        output.device, output.dtype, output.size, output.stride, stl
+    )
+    required_out_key = LayoutKey.from_stl(stl)
+    op.restick_cost_fn = FixedInOutNode(
+        [x_rc, y_rc],
+        required_out_key=required_out_key,
+        required_in_keys=[x_req_key, y_req_key],
+    )
+    print(f"MRA: matmul output layout: {result_layout}")
+    return [result_layout]
+
+
+def _multi_arg_pointwise_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[SchedNodeArg],
+) -> list[FixedTiledLayout]:
+    stick_exprs = _collect_stick_exprs(args)
+    print("MRA: stick_exprs (from all layouts):", stick_exprs)
+    stick_expr = next(iter(stick_exprs)) if stick_exprs else None
+
+    if len(stick_exprs) > 1:
+        logger.warning(
+            f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
+        )
+
+    # If the indexing and device element size are identical
+    # across all inputs and the output we can just propagate the device layout.
+    in_coords = [host_coordinates(next(iter(arg.layouts)), arg.dep) for arg in args]
+    out_coords = host_coordinates(output, output_dep)
+    can_use_same_layout = True
+
+    if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
+        can_use_same_layout = False
+    else:
+        for arg, arg_coors in zip(args, in_coords):
+            if (
+                arg_coors != out_coords
+                or arg.dep.index != output_dep.index
+                or not same_device_size(next(iter(arg.layouts)).dtype, output.dtype)
+            ):
+                can_use_same_layout = False
+                break
+        if stick_expr not in stick_exprs:
+            can_use_same_layout = False
+
+    results: list[FixedTiledLayout] = []
+    out_key_by_expr: dict = {}
+    # Sort stick exprs for determinism
+    for stick_expr in sorted(stick_exprs, key=str) if stick_exprs else [None]:
+        if can_use_same_layout:
+            template_stl = next(iter(args[0].layouts)).device_layout
+            stl = SpyreTensorLayout(
+                template_stl.device_size,
+                template_stl.stride_map,
+                get_device_dtype(output.dtype),
+            )
+        else:
+            if stick_expr is None:
+                out_stick_dim = -1
+            else:
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
+                out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
+            dim_order = [
+                d
+                for d in range(len(output.size))
+                if d != out_stick_dim and out_coords[d] != 0
+            ]
+            dim_order += [
+                d
+                for d in range(len(output.size))
+                if d != out_stick_dim and out_coords[d] == 0
+            ]
+            dim_order += [out_stick_dim]
+            c_size = [concretize_expr(s) for s in output.size]
+            c_stride = [concretize_expr(s) for s in output.stride]
+            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+            print(
+                f"MRA: stick_expr={stick_expr} out_stick_dim={out_stick_dim} dim_order={dim_order} stride_map={list(stl.stride_map)}"
+            )
+        if stick_expr is not None:
+            out_key_by_expr[stick_expr] = LayoutKey.from_stl(stl)
+        results.append(
+            FixedTiledLayout(
+                output.device, output.dtype, output.size, output.stride, stl
+            )
+        )
+
+    _attach_all_same_cost_fn(op, args, stick_exprs, out_key_by_expr)
+
+    return results
+
+
+def compute_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[SchedNodeArg],
+) -> list[FixedTiledLayout]:
+    data = op.data
+    origin_node = next(iter(data.origins)) if data.origins else None
+    aten_op = origin_node.target if origin_node is not None else None
+    print()
+    print(f"MRA:  ====== In compute_layouts ({op.get_name()})  ======")
+
+    if isinstance(data, Reduction) and data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
+        return _matmul_layouts(op, output, output_dep, args)
 
     if aten_op == spyreop.layernormnorm.default:
-        # Handled separately because layernorm only cares about the stick of the first arg.
-        layouts = [
-            first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
-            for layout in args[0].layouts
-        ]
-        out_key_by_expr = {
-            device_coordinates(in_layout, args[0].dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
-            for in_layout, out_layout in zip(args[0].layouts, layouts)
-        }
-        _attach_all_same_cost_fn(op, args[:1], _collect_stick_exprs(args[:1]), out_key_by_expr)
-        return layouts
+        first_layout = next(iter(args[0].layouts))
+        if first_layout.size != output.size or first_layout.stride != output.stride:
+            raise Unsupported(
+                f"views not supported for spyre.layernormnorm({first_layout.size})=>{output.size})"
+            )
+        return _single_arg_layouts_and_cost(
+            op, output, output_dep, args[0], args[:1], first_arg_pointwise_layout
+        )
 
     if len(args) == 1:
-        layouts = [
-            first_arg_pointwise_layout(op, output, output_dep, args[0].dep, layout)
-            for layout in args[0].layouts
-        ]
-        out_key_by_expr = {
-            device_coordinates(in_layout, args[0].dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
-            for in_layout, out_layout in zip(args[0].layouts, layouts)
-        }
-        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args), out_key_by_expr)
-        return layouts
-    else:
-        # Standard multi-input pointwise 
+        layout_fn = (
+            first_arg_reduction_layout
+            if isinstance(data, Reduction)
+            else first_arg_pointwise_layout
+        )
+        return _single_arg_layouts_and_cost(
+            op, output, output_dep, args[0], args, layout_fn
+        )
 
-        # print("MRA: ARGS:")
-        # for i, arg in enumerate(args):
-        #     for layout in arg.layouts:
-        #         ic = host_coordinates(layout, arg.dep)
-        #         idc = device_coordinates(layout, arg.dep)
-        #         print(
-        #             f"MRA: arg {i} layout: host_coords={ic} device_coords={idc}"
-        #         )
-        # print("MRA: out_coords:", host_coordinates(output, output_dep))
-        # print()
-
-        stick_exprs = _collect_stick_exprs(args)
-        print("MRA: stick_exprs (from all layouts):", stick_exprs)
-        stick_expr = next(iter(stick_exprs)) if stick_exprs else None
-
-        if len(stick_exprs) > 1:
-            logger.warning(
-                f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
-            )
-
-        # If the indexing and device element size are identical
-        # across all inputs and the output we can just propagate the device layout.
-        in_coords = [host_coordinates(next(iter(arg.layouts)), arg.dep) for arg in args]
-        out_coords = host_coordinates(output, output_dep)
-        can_use_same_layout = True
-
-        if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
-            can_use_same_layout = False
-        else:
-            for arg, arg_coors in zip(args, in_coords):
-                if (
-                    arg_coors != out_coords
-                    or arg.dep.index != output_dep.index
-                    or not same_device_size(next(iter(arg.layouts)).dtype, output.dtype)
-                ):
-                    can_use_same_layout = False
-                    break
-            if stick_expr not in stick_exprs:
-                can_use_same_layout = False
-
-        results: list[FixedTiledLayout] = []
-        out_key_by_expr: dict = {}
-        # Sort stick exprs for determinism
-        for stick_expr in sorted(stick_exprs, key=str) if stick_exprs else [None]:
-            if can_use_same_layout:
-                template_stl = next(iter(args[0].layouts)).device_layout
-                stl = SpyreTensorLayout(
-                    template_stl.device_size,
-                    template_stl.stride_map,
-                    get_device_dtype(output.dtype),
-                )
-            else:
-                if stick_expr is None:
-                    out_stick_dim = -1
-                else:
-                    maybe_stick_dim = matching_dim(out_coords, stick_expr)
-                    out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
-                dim_order = [
-                    d
-                    for d in range(len(output.size))
-                    if d != out_stick_dim and out_coords[d] != 0
-                ]
-                dim_order += [
-                    d
-                    for d in range(len(output.size))
-                    if d != out_stick_dim and out_coords[d] == 0
-                ]
-                dim_order += [out_stick_dim]
-                c_size = [concretize_expr(s) for s in output.size]
-                c_stride = [concretize_expr(s) for s in output.stride]
-                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-                print(
-                    f"MRA: stick_expr={stick_expr} out_stick_dim={out_stick_dim} dim_order={dim_order} stride_map={list(stl.stride_map)}"
-                )
-            if stick_expr is not None:
-                out_key_by_expr[stick_expr] = LayoutKey.from_stl(stl)
-            results.append(
-                FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
-            )
-
-        _attach_all_same_cost_fn(op, args, stick_exprs, out_key_by_expr if out_key_by_expr else None)
-
-        return results
+    assert isinstance(data, Pointwise), (
+        f"unexpected multi-arg op type {type(data).__name__} for {op.get_name()}"
+    )
+    return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
 
 def first_arg_reduction_layout(
@@ -531,176 +658,6 @@ def first_arg_reduction_layout(
             )
 
         return result
-
-
-def reduction_layouts(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    args: list[SchedNodeArg],
-) -> list[FixedTiledLayout]:
-    data = op.data
-
-    print()
-    print(f"MRA:  ====== In Reduction ({op.get_name()})  ======")
-    print(f"MRA reduction_layouts ({op.get_name()}) output_dep: index={output_dep.index} ranges={output_dep.ranges}")
-    print(f"MRA reduction_layouts ({op.get_name()}) args[0].dep: index={args[0].dep.index} ranges={args[0].dep.ranges}")
-
-    if len(args) == 1:
-        layouts = []
-        for layout in args[0].layouts:
-            dl = layout.device_layout
-            idc = device_coordinates(layout, args[0].dep)
-            print(
-                f"MRA reduction_layouts ({op.get_name()}) input layout:"
-                f" device_size={list(dl.device_size)} stride_map={list(dl.stride_map)}"
-                f" stick_iv=iv{iter_var_id(idc[-1])}"
-            )
-            out_layout = first_arg_reduction_layout(op, output, output_dep, args[0].dep, layout)
-            out_dl = out_layout.device_layout
-            out_idc = device_coordinates(out_layout, output_dep)
-            print(
-                f"MRA reduction_layouts ({op.get_name()}) output layout:"
-                f" device_size={list(out_dl.device_size)} stride_map={list(out_dl.stride_map)}"
-                f" stick_iv=iv{iter_var_id(out_idc[-1])}"
-                f" out_coords={out_idc}"
-            )
-            if iter_var_id(out_idc[-1]) == -1:
-                print(f"MRA reduction_layouts ({op.get_name()}) stick on reduction dim — output layout has no free stick, using as-is")
-            layouts.append(out_layout)
-        out_key_by_expr = {
-            device_coordinates(in_layout, args[0].dep)[-1]: LayoutKey.from_stl(out_layout.device_layout)
-            for in_layout, out_layout in zip(args[0].layouts, layouts)
-        }
-        _attach_all_same_cost_fn(op, args, _collect_stick_exprs(args), out_key_by_expr)
-        return layouts
-    else:
-        # matmul/bmm
-        assert data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP), (
-            f"unexpected multi-arg reduction type: {data.reduction_type}"
-        )
-        print(f"MRA:  ====== In MatMul ({op.get_name()})  ======")
-        out_coords = host_coordinates(output, output_dep)
-
-        print("MRA: ARGS:")
-        for i, arg in enumerate(args):
-            print("MRA: arg:", i, arg)
-            _hc = host_coordinates(next(iter(arg.layouts)), arg.dep)
-            _dc = device_coordinates(next(iter(arg.layouts)), arg.dep)
-            print("MRA: host_coords:", _hc)
-            print("MRA: device_coords:", _dc)
-            print("MRA: Matching host stick dim:", matching_dim(_hc, _dc[-1]))
-        print("MRA: out_coords:", out_coords)
-        print()
-
-        x = args[0]
-        y = args[1]
-        x_coords = host_coordinates(next(iter(x.layouts)), x.dep)
-        x_dev_coords = device_coordinates(next(iter(x.layouts)), x.dep)
-        y_coords = host_coordinates(next(iter(y.layouts)), y.dep)
-        y_dev_coords = device_coordinates(next(iter(y.layouts)), y.dep)
-
-        x_stick_expr = x_dev_coords[-1]
-        y_stick_expr = y_dev_coords[-1]
-        x_stick_dim = matching_dim(x_coords, x_stick_expr)
-        y_stick_dim = matching_dim(y_coords, y_stick_expr)
-        print(
-            f"MRA: x_stick_expr={x_stick_expr} x_stick_dim={x_stick_dim} x_stick_iv=iv{iter_var_id(x_stick_expr)}"
-        )
-        print(
-            f"MRA: y_stick_expr={y_stick_expr} y_stick_dim={y_stick_dim} y_stick_iv=iv{iter_var_id(y_stick_expr)}"
-        )
-        if x_stick_dim is None or y_stick_dim is None:
-            raise Unsupported(
-                f"{data.reduction_type}: failed to map stick_dims to host coords"
-            )
-
-        # Hardware stick constraints (DF16):
-        #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
-        #   Input2 (y): stick on generated_dim (the y coord that appears in output)
-        #   Output:     stick on generated_dim
-        if matching_dim(out_coords, x_stick_expr) is not None:
-            reduction_coord = next(
-                c
-                for c in x_coords
-                if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-            )
-            print(
-                f"MRA: x stick iv{iter_var_id(x_stick_expr)} is on output dim -> needs restickify to reduction_coord={reduction_coord} iv{iter_var_id(reduction_coord)}"
-            )
-        else:
-            reduction_coord = x_stick_expr
-            print(
-                f"MRA: x stick iv{iter_var_id(x_stick_expr)} already on reduction dim -> reduction_coord={reduction_coord}"
-            )
-
-        if matching_dim(out_coords, y_stick_expr) is None:
-            generated_coord = next(
-                c
-                for c in y_coords
-                if len(c.free_symbols) > 0
-                and matching_dim(out_coords, c) is not None
-                and matching_dim(x_coords, c) is None
-            )
-            print(
-                f"MRA: y stick iv{iter_var_id(y_stick_expr)} not on output dim -> needs restickify to generated_coord={generated_coord} iv{iter_var_id(generated_coord)}"
-            )
-        else:
-            generated_coord = y_stick_expr
-            print(
-                f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
-            )
-
-        x_rc = build_edge_restick_costs([x], _single_out_key_by_expr(x, reduction_coord))[0]
-        y_rc = build_edge_restick_costs([y], _single_out_key_by_expr(y, generated_coord))[0]
-        x_req_key = _required_key_from_single_stick_rc(x_rc)
-        y_req_key = _required_key_from_single_stick_rc(y_rc)
-
-        print(f"MRA EdgeCostmap tables for {op.get_name()}:")
-        print(f"  x ({x.dep.name}) required_in_key={list(x_req_key.stride_map)}:")
-        print(x_rc.format_table())
-        print(f"  y ({y.dep.name}) required_in_key={list(y_req_key.stride_map)}:")
-        print(y_rc.format_table())
-        if not x_rc.feasible_for_out(x_req_key):
-            raise Unsupported(
-                f"{data.reduction_type}: x arg cannot reach required stick {list(x_req_key.stride_map)}"
-            )
-        if not y_rc.feasible_for_out(y_req_key):
-            raise Unsupported(
-                f"{data.reduction_type}: y arg cannot reach required stick {list(y_req_key.stride_map)}"
-            )
-
-        out_stick_dim = matching_dim(out_coords, generated_coord)
-        print(
-            f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}"
-        )
-        if out_stick_dim is None:
-            raise Unsupported(
-                f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {generated_coord}"
-            )
-
-        out_dims = len(output.size)
-        out_dim_order = list(range(out_dims - 2))
-        if out_stick_dim == out_dims - 1:
-            out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
-        else:
-            out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
-        print(f"MRA: out_dim_order={out_dim_order}")
-        # Concretize for C++ SpyreTensorLayout constructor.
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-        result_layout = FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
-        required_out_key = LayoutKey.from_stl(stl)
-        op.restick_cost_fn = FixedInOutNode(
-            [x_rc, y_rc],
-            required_out_key=required_out_key,
-            required_in_keys=[x_req_key, y_req_key],
-        )
-        print(f"MRA: matmul output layout: {result_layout}")
-        return [result_layout]
 
 
 def _single_out_key_by_expr(arg: "SchedNodeArg", out_expr) -> "dict":
@@ -801,10 +758,8 @@ def propagate_spyre_tensor_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps_from_rw(rw)
             output = op.get_layout()
-            if isinstance(op.data, Pointwise):
-                op.layouts = pointwise_layouts(op, output, output_dep, args)
-            elif isinstance(op.data, Reduction):
-                op.layouts = reduction_layouts(op, output, output_dep, args)
+            if isinstance(op.data, (Pointwise, Reduction)):
+                op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
@@ -845,7 +800,7 @@ def propagate_mutation_layouts(
             args = get_mem_deps(n)
             print(f"MRA propagate_mutation_layouts: args={[a.dep.name for a in args]}")
             output = n.node.get_layout()
-            layouts = list(pointwise_layouts(n.node, output, output_dep, args))
+            layouts = list(compute_layouts(n.node, output, output_dep, args))
             print(f"MRA propagate_mutation_layouts: got {len(layouts)} layouts, setting layout={layouts[0]}")
             n.node.layout = layouts[0]
             print(f"MRA propagate_mutation_layouts: n.node id={id(n.node)} layout now={type(n.node.layout).__name__}")
