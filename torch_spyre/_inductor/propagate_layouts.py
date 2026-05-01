@@ -51,7 +51,7 @@ from .pass_utils import (
     device_coordinates,
     iter_var_id,
 )
-from .optimize_restickify import EdgeCostMap, AllSameNode, FixedInOutNode, LayoutKey
+from .optimize_restickify import AllSameNode, FixedInOutNode
 from .views import matching_dim
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -68,30 +68,13 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def _attach_all_same_cost_fn(
-    op: Operation,
-    args: "list[SchedNodeArg]",
-    out_layouts: "list[FixedTiledLayout]",
-    out_dep: "MemoryDep",
-) -> None:
-    """Build and attach an AllSameNode cost function to op.
-
-    out_layouts are the candidate output layouts for this op.
-    out_dep is the MemoryDep for the output buffer, which may differ from each
-    arg's dep when inputs are accessed with a different index (e.g. transposed).
-    No-op when out_layouts is empty (scalar/broadcast-only args).
-    """
-    if not out_layouts:
-        return
-    edge_costs = [EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args]
-    op.restick_cost_fn = AllSameNode(edge_costs)
-
 
 def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_fn):
     layouts = [
         layout_fn(op, output, output_dep, arg.dep, layout) for layout in arg.layouts
     ]
-    _attach_all_same_cost_fn(op, cost_args, layouts, output_dep)
+    if layouts:
+        op.restick_cost_fn = AllSameNode.from_args(cost_args, layouts, output_dep)
     return layouts
 
 
@@ -235,10 +218,12 @@ def _matmul_layouts(
 
     x = args[0]
     y = args[1]
-    x_coords = host_coordinates(next(iter(x.layouts)), x.dep)
-    x_dev_coords = device_coordinates(next(iter(x.layouts)), x.dep)
-    y_coords = host_coordinates(next(iter(y.layouts)), y.dep)
-    y_dev_coords = device_coordinates(next(iter(y.layouts)), y.dep)
+    x_layout = next(iter(x.layouts))
+    y_layout = next(iter(y.layouts))
+    x_coords = host_coordinates(x_layout, x.dep)
+    x_dev_coords = device_coordinates(x_layout, x.dep)
+    y_coords = host_coordinates(y_layout, y.dep)
+    y_dev_coords = device_coordinates(y_layout, y.dep)
 
     x_stick_expr = x_dev_coords[-1]
     y_stick_expr = y_dev_coords[-1]
@@ -291,18 +276,13 @@ def _matmul_layouts(
             f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
         )
 
-    x_layout = next(iter(x.layouts))
     x_req_layout = x_layout if reduction_coord == x_dev_coords[-1] else compute_restickify_target_layout(x_layout, reduction_coord, x_coords, x_dev_coords)
     if x_req_layout is None:
         raise Unsupported(f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}")
 
-    y_layout = next(iter(y.layouts))
     y_req_layout = y_layout if generated_coord == y_dev_coords[-1] else compute_restickify_target_layout(y_layout, generated_coord, y_coords, y_dev_coords)
     if y_req_layout is None:
         raise Unsupported(f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}")
-
-    x_req_key = LayoutKey.from_stl(x_req_layout.device_layout)
-    y_req_key = LayoutKey.from_stl(y_req_layout.device_layout)
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     print(f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}")
@@ -325,13 +305,8 @@ def _matmul_layouts(
     result_layout = FixedTiledLayout(
         output.device, output.dtype, output.size, output.stride, stl
     )
-    required_out_key = LayoutKey.from_stl(stl)
-    x_rc = EdgeCostMap(x.dep, x.layouts, [x_req_layout], x.dep)
-    y_rc = EdgeCostMap(y.dep, y.layouts, [y_req_layout], y.dep)
-    op.restick_cost_fn = FixedInOutNode(
-        [x_rc, y_rc],
-        required_out_key=required_out_key,
-        required_in_keys=[x_req_key, y_req_key],
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [x, y], stl, [x_req_layout, y_req_layout]
     )
     print(f"MRA: matmul output layout: {result_layout}")
     return [result_layout]
@@ -415,9 +390,8 @@ def _multi_arg_pointwise_layouts(
                 output.device, output.dtype, output.size, output.stride, stl
             )
         )
-
-    _attach_all_same_cost_fn(op, args, results, output_dep)
-
+    if results:
+        op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
 
 

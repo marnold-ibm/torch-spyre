@@ -113,6 +113,11 @@ class RestickNodeCost(abc.ABC):
 
 
 class AllSameNode(RestickNodeCost):
+    @classmethod
+    def from_args(cls, args, out_layouts, out_dep):
+        edge_costs = [EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args]
+        return cls(edge_costs)
+
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         total = 0.0
         for edge_cost, layout_key in zip(self.edge_costs, in_layouts):
@@ -134,12 +139,18 @@ class FixedInOutNode(RestickNodeCost):
         self.required_out_key = required_out_key  # output layout currently assigned
         self.required_in_keys = required_in_keys  # each input must be stick-compatible with this layout
 
+    @classmethod
+    def from_args(cls, args, out_stl, req_layouts):
+        required_out_key = LayoutKey.from_stl(out_stl)
+        edge_costs = [EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep) for arg, req in zip(args, req_layouts)]
+        req_keys = [LayoutKey.from_stl(req.device_layout) for req in req_layouts]
+        return cls(edge_costs, required_out_key=required_out_key, required_in_keys=req_keys)
+
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         assert out_key == self.required_out_key, (
             f"FixedInOutNode: out_key {out_key} != required_out_key {self.required_out_key}; "
             "stick compatibility check not implemented because propagate layouts should have only one layout"
         )
-
         total = 0.0
         for edge_cost, layout_key, req_key in zip(self.edge_costs, in_layouts, self.required_in_keys):
             c = edge_cost.cost(layout_key, req_key)
