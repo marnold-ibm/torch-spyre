@@ -27,7 +27,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
-from .pass_utils import compute_edge_cost
+from .pass_utils import compute_restickify_needed
 
 INF = math.inf
 
@@ -45,7 +45,7 @@ class LayoutKey:
 class EdgeCostMap:
     """Lazy 2-D cost table for one input arg.
 
-    Costs are computed on demand via compute_edge_cost when first queried.
+    Costs are computed on demand via compute_restickify_needed when first queried.
     dep is also used by insert_restickify to identify the buffer and read index.
     """
 
@@ -53,49 +53,44 @@ class EdgeCostMap:
         self,
         dep: "MemoryDep",
         in_layouts: list,
-        out_layouts: list,
-        out_dep: "MemoryDep",
+        match_stick_layouts: list,
+        match_stick_dep: "MemoryDep",
     ):
         self.dep = dep
-        self._in_layouts = in_layouts
-        self._out_layouts = out_layouts
-        self._out_dep = out_dep
+        self._match_stick_dep = match_stick_dep
+        self._in_by_key = {LayoutKey.from_stl(l.device_layout): l for l in in_layouts}
+        self._match_stick_by_key = {LayoutKey.from_stl(l.device_layout): l for l in match_stick_layouts}
         self._cost: dict[LayoutKey, dict[LayoutKey, float]] = {}
-        self._target: dict[LayoutKey, dict[LayoutKey, Any]] = {}
+        self._restick_target: dict[LayoutKey, dict[LayoutKey, Any]] = {}
 
-    def _compute(self, in_key: "LayoutKey", out_key: "LayoutKey") -> None:
-        # Three outcomes from compute_edge_cost:
-        #   None          -> infeasible: leave _cost unpopulated so cost() returns INF
-        #   (0.0, None)   -> same stick / broadcast: cost=0, target=None (no restickify needed)
-        #   (cost, tgt)   -> restickify required: cost>0, target=tgt_layout
-        # insert_restickify uses target() is None to mean "no restickify needed",
-        # so None must NOT be stored for the infeasible case — leaving the entry
-        # absent (→ INF) is what distinguishes infeasible from zero-cost.
-        in_layout = next(
-            (l for l in self._in_layouts if LayoutKey.from_stl(l.device_layout) == in_key),
-            None,
-        )
-        out_layout = next(
-            (l for l in self._out_layouts if LayoutKey.from_stl(l.device_layout) == out_key),
-            None,
-        )
-        if in_layout is None or out_layout is None:
+    def _compute_and_cache_cost(self, in_key: "LayoutKey", match_stick_key: "LayoutKey") -> None:
+        # Three outcomes from compute_restickify_needed:
+        #   (False, None) -> same stick: cost=0, restick_target=None (no restickify needed)
+        #   (True, layout) -> restickify required: cost=product(sizes), restick_target=layout
+        #   (True, None)  -> infeasible: cost=INF, restick_target=None
+        in_layout = self._in_by_key.get(in_key)
+        match_stick_layout = self._match_stick_by_key.get(match_stick_key)
+        if in_layout is None or match_stick_layout is None:
             return
-        result = compute_edge_cost(in_layout, self.dep, out_layout, self._out_dep)
-        if result is None:
-            return  # infeasible — cost() will return INF
-        cost, tgt = result
-        self._cost.setdefault(in_key, {})[out_key] = cost
-        self._target.setdefault(in_key, {})[out_key] = tgt
+        needed, tgt = compute_restickify_needed(in_layout, self.dep, match_stick_layout, self._match_stick_dep)
+        if not needed:
+            cost = 0.0
+        elif tgt is None:
+            cost = INF # We don't know how to perform this resticification
+        else:
+            cost = float(math.prod(s for s in in_layout.size))
+            
+        self._cost.setdefault(in_key, {})[match_stick_key] = cost
+        self._restick_target.setdefault(in_key, {})[match_stick_key] = tgt
 
-    def cost(self, in_key: "LayoutKey", out_key: "LayoutKey") -> float:
-        if in_key not in self._cost or out_key not in self._cost[in_key]:
-            self._compute(in_key, out_key)
-        return self._cost.get(in_key, {}).get(out_key, INF)
+    def cost(self, in_key: "LayoutKey", match_stick_key: "LayoutKey") -> float:
+        if in_key not in self._cost or match_stick_key not in self._cost[in_key]:
+            self._compute_and_cache_cost(in_key, match_stick_key)
+        return self._cost.get(in_key, {}).get(match_stick_key, INF)
 
-    def target(self, in_key: "LayoutKey", out_key: "LayoutKey"):
-        """Target layout for in_key -> out_key, or None if no restickify needed."""
-        return self._target.get(in_key, {}).get(out_key)
+    def restick_target(self, in_key: "LayoutKey", match_stick_key: "LayoutKey"):
+        """Restickified layout to insert, or None if no restickify needed."""
+        return self._restick_target.get(in_key, {}).get(match_stick_key)
 
 
 class RestickNodeCost(abc.ABC):

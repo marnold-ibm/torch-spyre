@@ -358,33 +358,27 @@ def compute_restickify_target_layout(
     )
 
 
-def compute_edge_cost(
+def compute_restickify_needed(
     in_layout: FixedTiledLayout,
     in_dep: MemoryDep,
     out_layout: FixedTiledLayout,
     out_dep: MemoryDep,
-) -> "tuple[float, FixedTiledLayout | None] | None":
-    """Compute restickify cost for one (in_layout, out_layout) pair.
+) -> "tuple[bool, FixedTiledLayout | None]":
+    """Determine whether a restickify is needed for one (in_layout, out_layout) pair.
 
     in_dep and out_dep may differ when the output buffer is accessed with a
     different index than the input (e.g. a transposed read).
 
-    Returns (cost, target) if feasible:
-      - cost=0, target=None  when no restickify is needed (same stick or broadcast)
-      - cost>0, target=tgt_layout  when a restickify is required
-    Returns None if the transition is infeasible.
+    Returns:
+      (False, None)   — no restickify needed (same stick or broadcast), zero cost
+      (True, layout)  — restickify needed, layout is the target
+      (True, None)    — restickify needed but infeasible
     """
-    ic = host_coordinates(in_layout, in_dep)
     idc = device_coordinates(in_layout, in_dep)
     out_idc = device_coordinates(out_layout, out_dep)
     if iter_var_id(idc[-1]) == -1 or not out_idc or iter_var_id(out_idc[-1]) == -1:
-        return 0.0, None
+        return False, None
     if out_idc[-1] == idc[-1]:
-        return 0.0, None
-    tgt = compute_restickify_target_layout(in_layout, out_idc[-1], ic, idc)
-    if tgt is None:
-        return None
-    cost = 1
-    for s in in_layout.size:
-        cost *= concretize_expr(s)
-    return float(cost), tgt
+        return False, None
+    ic = host_coordinates(in_layout, in_dep)
+    return True, compute_restickify_target_layout(in_layout, out_idc[-1], ic, idc)
