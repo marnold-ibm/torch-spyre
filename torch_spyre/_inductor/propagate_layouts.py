@@ -291,8 +291,16 @@ def _matmul_layouts(
             f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
         )
 
-    x_req_layout = _required_layout_for_expr(x, reduction_coord)
-    y_req_layout = _required_layout_for_expr(y, generated_coord)
+    x_layout = next(iter(x.layouts))
+    x_req_layout = x_layout if reduction_coord == x_dev_coords[-1] else compute_restickify_target_layout(x_layout, reduction_coord, x_coords, x_dev_coords)
+    if x_req_layout is None:
+        raise Unsupported(f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}")
+
+    y_layout = next(iter(y.layouts))
+    y_req_layout = y_layout if generated_coord == y_dev_coords[-1] else compute_restickify_target_layout(y_layout, generated_coord, y_coords, y_dev_coords)
+    if y_req_layout is None:
+        raise Unsupported(f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}")
+
     x_req_key = LayoutKey.from_stl(x_req_layout.device_layout)
     y_req_key = LayoutKey.from_stl(y_req_layout.device_layout)
 
@@ -448,16 +456,6 @@ def compute_layouts(
         op, output, output_dep, args[0], args, _single_arg_op_layout
     )
 
-
-def _required_layout_for_expr(arg: "SchedNodeArg", out_expr) -> "FixedTiledLayout":
-    """Return the layout an arg must reach to satisfy the given stick expression."""
-    layout = next(iter(arg.layouts))
-    ic = host_coordinates(layout, arg.dep)
-    idc = device_coordinates(layout, arg.dep)
-    if out_expr == idc[-1]:
-        return layout
-    tgt = compute_restickify_target_layout(layout, out_expr, ic, idc)
-    return tgt if tgt is not None else layout
 
 
 def generic_layout(op: Operation) -> FixedTiledLayout:

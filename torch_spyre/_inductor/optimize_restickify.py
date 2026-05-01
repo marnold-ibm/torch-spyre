@@ -33,6 +33,8 @@ from .pass_utils import compute_restickify_needed
 INF = math.inf
 
 
+# A python key for STL
+# Consider using  STL itself but it would require a has function, and the dtype is not needed  
 @dataclass(frozen=True)
 class LayoutKey:
     device_size: tuple[int, ...]
@@ -47,7 +49,7 @@ class EdgeCostMap:
     """Lazy 2-D cost table for one input arg.
 
     Costs are computed on demand via compute_restickify_needed when first queried.
-    dep is also used by insert_restickify to identify the buffer and read index.
+    MemDep is not used in this file, but is carried so it can be passed to restickify helpers in pass_utils
     """
 
     def __init__(
@@ -65,6 +67,12 @@ class EdgeCostMap:
         self._restick_target: defaultdict[LayoutKey, dict[LayoutKey, Any]] = defaultdict(dict)
 
     def _compute_and_cache_cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> None:
+        """
+        Compute the potential restick cost for this edge:
+        in_key and target_key represent the layouts of the input and target
+        If they are stick compatible there is no cost
+        If they are not stick compatible, they would need to be restickified with a cost
+        """
         in_layout = next((l for l in self._in_layouts if LayoutKey.from_stl(l.device_layout) == in_key), None)
         target_layout = next((l for l in self._target_layouts if LayoutKey.from_stl(l.device_layout) == target_key), None)
         assert in_layout is not None, f"in_key {in_key} not found in in_layouts"
@@ -79,7 +87,12 @@ class EdgeCostMap:
         self._cost[in_key][target_key] = cost
         self._restick_target[in_key][target_key] = tgt
 
+
     def cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> float:
+        """
+        Return the cached restick cost for this in/target key pair of layouts
+        Compute from scratch if not cached
+        """
         if target_key not in self._cost[in_key]:
             self._compute_and_cache_cost(in_key, target_key)
         return self._cost[in_key][target_key]
@@ -102,8 +115,8 @@ class RestickNodeCost(abc.ABC):
 class AllSameNode(RestickNodeCost):
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         total = 0.0
-        for rc, lk in zip(self.edge_costs, in_layouts):
-            c = rc.cost(lk, out_key)
+        for edge_cost, layout_key in zip(self.edge_costs, in_layouts):
+            c = edge_cost.cost(layout_key, out_key)
             if c == INF:
                 return INF
             total += c
@@ -122,11 +135,14 @@ class FixedInOutNode(RestickNodeCost):
         self.required_in_keys = required_in_keys  # each input must be stick-compatible with this layout
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
-        if out_key != self.required_out_key:
-            return INF
+        assert out_key == self.required_out_key, (
+            f"FixedInOutNode: out_key {out_key} != required_out_key {self.required_out_key}; "
+            "stick compatibility check not implemented because propagate layouts should have only one layout"
+        )
+
         total = 0.0
-        for rc, lk, req_key in zip(self.edge_costs, in_layouts, self.required_in_keys):
-            c = rc.cost(lk, req_key)
+        for edge_cost, layout_key, req_key in zip(self.edge_costs, in_layouts, self.required_in_keys):
+            c = edge_cost.cost(layout_key, req_key)
             if c == INF:
                 return INF
             total += c
@@ -143,11 +159,19 @@ def record_stick_decisions(
 
 
 def optimize_restickify_locations(operations: list) -> None:
+    """
+    Main entry point to optimizer
+    """
+    
     # Dumb implemntation for now
+    # To be replaced with global optimizer
     greedy_local_min_cost(operations)
 
 
 def _print_op_layouts(operations: list, label: str) -> None:
+    """
+    Temp Helper
+    """
     print(f"\n=== op layouts [{label}] ===")
     for op in operations:
         layout = op.layout
@@ -220,13 +244,14 @@ def greedy_local_min_cost(operations: list) -> None:
 
         # Collect each input arg's committed layout (finalized by earlier topo iterations).
         in_layouts = []
-        for rc in cost_fn.edge_costs:
-            buf = V.graph.get_buffer(rc.dep.name)
-            assert hasattr(buf, "committed_layout"), (
-                f"buffer {rc.dep.name} has no committed_layout — "
-                "topological order violated or input not committed"
-            )
-            in_layouts.append(buf.committed_layout)
+        for dep in op.get_read_writes().reads:
+            if isinstance(dep, MemoryDep):
+                buf = V.graph.get_buffer(dep.name)
+                assert hasattr(buf, "committed_layout"), (
+                    f"buffer {dep.name} has no committed_layout — "
+                    "topological order violated or input not committed"
+                )
+                in_layouts.append(buf.committed_layout)
 
         # TODO: Don't out layout keys every time sigh
         out_layout_keys = [LayoutKey.from_stl(ol.device_layout) for ol in op.layouts]
