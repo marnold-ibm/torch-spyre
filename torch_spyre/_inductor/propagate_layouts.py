@@ -275,7 +275,7 @@ def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_
     return layouts
 
 
-def _single_arg_layout(
+def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
@@ -284,39 +284,38 @@ def _single_arg_layout(
 ) -> FixedTiledLayout:
     data = op.data
 
-    # exx2: stick must be on last host dim; output gets default dim_order with stick last.
-    if isinstance(data, Reduction) and data.reduction_type == "exx2":
-        x_coords = host_coordinates(layout, dep)
-        x_dev_coords = device_coordinates(layout, dep)
-        x_stick_expr = x_dev_coords[-1]
-        x_stick_dim = matching_dim(x_coords, x_stick_expr)
-        if x_stick_dim is None or x_stick_dim != len(layout.size) - 1:
-            # TODO: Insert a restickify to enable the operation to be performed
-            raise Unsupported(f"exx2: illegal device layout {layout}")
-        dim_order = list(range(len(output.size))) + [-1]
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-        return FixedTiledLayout(output.device, output.dtype, output.size, output.stride, stl)
-
-    # Non-exx2 reduction: propagate input stick to output if the dim survives, else put stick last.
     if isinstance(data, Reduction):
-        x_coords = host_coordinates(layout, dep)
-        x_dev_coords = device_coordinates(layout, dep)
-        out_coords = host_coordinates(output, output_dep)
-        x_stick_expr = x_dev_coords[-1]
-        out_stick_dim = matching_dim(out_coords, x_stick_expr)
-        if out_stick_dim is None:
-            out_dim_order = list(range(len(output.size))) + [-1]
+        if data.reduction_type == "exx2":
+            x_coords = host_coordinates(layout, dep)
+            x_dev_coords = device_coordinates(layout, dep)
+            x_stick_expr = x_dev_coords[-1]
+            x_stick_dim = matching_dim(x_coords, x_stick_expr)
+            if x_stick_dim is None or x_stick_dim != len(layout.size) - 1:
+                # TODO: Insert a restickify to enable the operation to be performed
+                raise Unsupported(f"exx2: illegal device layout {layout}")
+            dim_order = list(range(len(output.size))) + [-1]
+            c_size = [concretize_expr(s) for s in output.size]
+            c_stride = [concretize_expr(s) for s in output.stride]
+            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         else:
-            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
-            out_dim_order = out_dim_order + [out_stick_dim]
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+            # Propagate input stick to output if the dim survives, else put stick last.
+            x_coords = host_coordinates(layout, dep)
+            x_dev_coords = device_coordinates(layout, dep)
+            out_coords = host_coordinates(output, output_dep)
+            x_stick_expr = x_dev_coords[-1]
+            out_stick_dim = matching_dim(out_coords, x_stick_expr)
+            if out_stick_dim is None:
+                out_dim_order = list(range(len(output.size))) + [-1]
+            else:
+                out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+                out_dim_order = out_dim_order + [out_stick_dim]
+            c_size = [concretize_expr(s) for s in output.size]
+            c_stride = [concretize_expr(s) for s in output.stride]
+            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
         return FixedTiledLayout(output.device, output.dtype, output.size, output.stride, stl)
 
-    # Pointwise: handle special ops, then propagate stick from input to output.
+    # Single-arg pointwise
+    assert isinstance(data, Pointwise)
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
@@ -468,10 +467,12 @@ def _matmul_layouts(
             f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
         )
 
-    x_rc = build_edge_restick_costs([x], _single_out_key_by_expr(x, reduction_coord))[0]
-    y_rc = build_edge_restick_costs([y], _single_out_key_by_expr(y, generated_coord))[0]
-    x_req_key = _required_key_from_single_stick_rc(x_rc)
-    y_req_key = _required_key_from_single_stick_rc(y_rc)
+    x_out_key_by_expr = _single_out_key_by_expr(x, reduction_coord)
+    y_out_key_by_expr = _single_out_key_by_expr(y, generated_coord)
+    x_rc = build_edge_restick_costs([x], x_out_key_by_expr)[0]
+    y_rc = build_edge_restick_costs([y], y_out_key_by_expr)[0]
+    x_req_key = next(iter(x_out_key_by_expr.values()))
+    y_req_key = next(iter(y_out_key_by_expr.values()))
 
     print(f"MRA EdgeCostmap tables for {op.get_name()}:")
     print(f"  x ({x.dep.name}) required_in_key={list(x_req_key.stride_map)}:")
@@ -627,11 +628,12 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({first_layout.size})=>{output.size})"
             )
         return _single_arg_layouts_and_cost(
-            op, output, output_dep, args[0], args[:1], _single_arg_layout
+            op, output, output_dep, args[0], args[:1], _single_arg_op_layout
         )
 
+    # All other single arg ops
     return _single_arg_layouts_and_cost(
-        op, output, output_dep, args[0], args, _single_arg_layout
+        op, output, output_dep, args[0], args, _single_arg_op_layout
     )
 
 
@@ -648,21 +650,6 @@ def _single_out_key_by_expr(arg: "SchedNodeArg", out_expr) -> "dict":
         return {out_expr: LayoutKey.from_stl(tgt.device_layout)}
     return {out_expr: LayoutKey.from_stl(layout.device_layout)}
 
-
-def _required_key_from_single_stick_rc(rc: EdgeCostMap) -> LayoutKey:
-    """Extract the target LayoutKey from a cost map built with exactly one stick_expr.
-
-    Returns the non-identity out_key if a restickify target exists, otherwise
-    the identity (the input is already on the required stick).
-    """
-    for in_key, row in rc._cost.items():
-        for out_key in row:
-            if in_key != out_key:
-                return out_key
-    # All entries are identity transitions — input is already on the required stick.
-    for in_key in rc._cost:
-        return in_key
-    raise AssertionError("EdgeCostMap has no entries")
 
 
 def generic_layout(op: Operation) -> FixedTiledLayout:
@@ -716,18 +703,6 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # # Mutation ops write into an existing buffer. Give them an
-                # # AllSameNode so the stick propagates through unchanged.
-                # rw = op.get_read_writes()
-                # args = get_mem_deps_from_rw(rw)
-                # print(f"MRA mutation op ({op.get_name()}) args:")
-                # for arg in args:
-                #     print(f"  dep={arg.dep.name} layouts={list(arg.layouts)}")
-                # stick_exprs = _collect_stick_exprs(args)
-                # if stick_exprs:
-                #     _attach_all_same_cost_fn(op, args, stick_exprs)
-                # target_buf = op.layout.target
-                # op.layouts = list(target_buf.layouts) if hasattr(target_buf, "layouts") else [generic_layout(op)]
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
@@ -766,22 +741,16 @@ def propagate_mutation_layouts(
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
-        print(f"MRA propagate_mutation_layouts: node={n.node.get_name()} layout={type(n.node.layout).__name__}")
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
-        print(f"MRA propagate_mutation_layouts: processing mutation op {n.node.get_name()}")
         if isinstance(n.node.data, Pointwise):
             rw = n.read_writes
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
-            print(f"MRA propagate_mutation_layouts: args={[a.dep.name for a in args]}")
             output = n.node.get_layout()
             layouts = list(compute_layouts(n.node, output, output_dep, args))
-            print(f"MRA propagate_mutation_layouts: got {len(layouts)} layouts, setting layout={layouts[0]}")
             n.node.layout = layouts[0]
-            print(f"MRA propagate_mutation_layouts: n.node id={id(n.node)} layout now={type(n.node.layout).__name__}")
             buf = V.graph.get_buffer(n.node.get_name())
-            print(f"MRA propagate_mutation_layouts: name_to_buffer[{n.node.get_name()}] id={id(buf)} layout={type(buf.get_layout()).__name__}")
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
