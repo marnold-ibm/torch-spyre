@@ -15,6 +15,7 @@
 
 import abc
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,44 +54,41 @@ class EdgeCostMap:
         self,
         dep: "MemoryDep",
         in_layouts: list,
-        match_stick_layouts: list,
-        match_stick_dep: "MemoryDep",
+        target_layouts: list,
+        target_dep: "MemoryDep",
     ):
         self.dep = dep
-        self._match_stick_dep = match_stick_dep
-        self._in_by_key = {LayoutKey.from_stl(l.device_layout): l for l in in_layouts}
-        self._match_stick_by_key = {LayoutKey.from_stl(l.device_layout): l for l in match_stick_layouts}
-        self._cost: dict[LayoutKey, dict[LayoutKey, float]] = {}
-        self._restick_target: dict[LayoutKey, dict[LayoutKey, Any]] = {}
+        self._in_layouts = in_layouts
+        self._target_layouts = target_layouts
+        self._target_dep = target_dep
+        self._cost: defaultdict[LayoutKey, dict[LayoutKey, float]] = defaultdict(dict)
+        self._restick_target: defaultdict[LayoutKey, dict[LayoutKey, Any]] = defaultdict(dict)
 
-    def _compute_and_cache_cost(self, in_key: "LayoutKey", match_stick_key: "LayoutKey") -> None:
-        # Three outcomes from compute_restickify_needed:
-        #   (False, None) -> same stick: cost=0, restick_target=None (no restickify needed)
-        #   (True, layout) -> restickify required: cost=product(sizes), restick_target=layout
-        #   (True, None)  -> infeasible: cost=INF, restick_target=None
-        in_layout = self._in_by_key.get(in_key)
-        match_stick_layout = self._match_stick_by_key.get(match_stick_key)
-        if in_layout is None or match_stick_layout is None:
-            return
-        needed, tgt = compute_restickify_needed(in_layout, self.dep, match_stick_layout, self._match_stick_dep)
+    def _compute_and_cache_cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> None:
+        in_layout = next((l for l in self._in_layouts if LayoutKey.from_stl(l.device_layout) == in_key), None)
+        target_layout = next((l for l in self._target_layouts if LayoutKey.from_stl(l.device_layout) == target_key), None)
+        assert in_layout is not None, f"in_key {in_key} not found in in_layouts"
+        assert target_layout is not None, f"target_key {target_key} not found in target_layouts"
+        needed, tgt = compute_restickify_needed(in_layout, self.dep, target_layout, self._target_dep)
         if not needed:
             cost = 0.0
         elif tgt is None:
-            cost = INF # We don't know how to perform this resticification
+            cost = INF  # infeasible restickify
         else:
             cost = float(math.prod(s for s in in_layout.size))
-            
-        self._cost.setdefault(in_key, {})[match_stick_key] = cost
-        self._restick_target.setdefault(in_key, {})[match_stick_key] = tgt
+        self._cost[in_key][target_key] = cost
+        self._restick_target[in_key][target_key] = tgt
 
-    def cost(self, in_key: "LayoutKey", match_stick_key: "LayoutKey") -> float:
-        if in_key not in self._cost or match_stick_key not in self._cost[in_key]:
-            self._compute_and_cache_cost(in_key, match_stick_key)
-        return self._cost.get(in_key, {}).get(match_stick_key, INF)
+    def cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> float:
+        if target_key not in self._cost[in_key]:
+            self._compute_and_cache_cost(in_key, target_key)
+        return self._cost[in_key][target_key]
 
-    def restick_target(self, in_key: "LayoutKey", match_stick_key: "LayoutKey"):
+    def restick_target(self, in_key: "LayoutKey", target_key: "LayoutKey"):
         """Restickified layout to insert, or None if no restickify needed."""
-        return self._restick_target.get(in_key, {}).get(match_stick_key)
+        if target_key not in self._cost[in_key]:
+            self._compute_and_cache_cost(in_key, target_key)
+        return self._restick_target[in_key][target_key]
 
 
 class RestickNodeCost(abc.ABC):
@@ -120,8 +118,8 @@ class FixedInOutNode(RestickNodeCost):
         required_in_keys: "list[LayoutKey]",
     ):
         super().__init__(edge_costs)
-        self.required_out_key = required_out_key
-        self.required_in_keys = required_in_keys
+        self.required_out_key = required_out_key  # output layout currently assigned
+        self.required_in_keys = required_in_keys  # each input must be stick-compatible with this layout
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         if out_key != self.required_out_key:

@@ -370,8 +370,8 @@ def compute_restickify_needed(
     different index than the input (e.g. a transposed read).
 
     Returns:
-      (False, None)   — no restickify needed (same stick or broadcast), zero cost
-      (True, layout)  — restickify needed, layout is the target
+      (False, None)   — same stick or broadcast: no restickify needed
+      (True, layout)  — restickify needed, layout is the restickified input to produce
       (True, None)    — restickify needed but infeasible
     """
     idc = device_coordinates(in_layout, in_dep)
