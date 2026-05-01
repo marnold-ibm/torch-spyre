@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
@@ -68,16 +67,6 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-
-def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_fn):
-    layouts = [
-        layout_fn(op, output, output_dep, arg.dep, layout) for layout in arg.layouts
-    ]
-    if layouts:
-        op.restick_cost_fn = AllSameNode.from_args(cost_args, layouts, output_dep)
-    return layouts
-
-
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -85,6 +74,10 @@ def _single_arg_op_layout(
     dep: MemoryDep,
     layout: FixedTiledLayout,
 ) -> FixedTiledLayout:
+    """
+    Compute the output FixedTiledLayout for a single-arg op given one input layout.
+    Called once per candidate input layout to produce the corresponding output layout.
+    """
     data = op.data
 
     if isinstance(data, Reduction):
@@ -201,6 +194,13 @@ def _matmul_layouts(
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
 ) -> list[FixedTiledLayout]:
+    """
+    Matmul has fixed in/out stick requirements so handled specially.
+    Algorithm is
+       1. For both input args, compuate a layout that is representative
+       2. For output arg, compute the output layout
+       3. Construct the FixdInOutNode cost function
+    """
     data = op.data
     print(f"MRA:  ====== In MatMul ({op.get_name()})  ======")
     out_coords = host_coordinates(output, output_dep)
@@ -276,13 +276,29 @@ def _matmul_layouts(
             f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
         )
 
-    x_req_layout = x_layout if reduction_coord == x_dev_coords[-1] else compute_restickify_target_layout(x_layout, reduction_coord, x_coords, x_dev_coords)
+    x_req_layout = (
+        x_layout
+        if reduction_coord == x_dev_coords[-1]
+        else compute_restickify_target_layout(
+            x_layout, reduction_coord, x_coords, x_dev_coords
+        )
+    )
     if x_req_layout is None:
-        raise Unsupported(f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}")
+        raise Unsupported(
+            f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
+        )
 
-    y_req_layout = y_layout if generated_coord == y_dev_coords[-1] else compute_restickify_target_layout(y_layout, generated_coord, y_coords, y_dev_coords)
+    y_req_layout = (
+        y_layout
+        if generated_coord == y_dev_coords[-1]
+        else compute_restickify_target_layout(
+            y_layout, generated_coord, y_coords, y_dev_coords
+        )
+    )
     if y_req_layout is None:
-        raise Unsupported(f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}")
+        raise Unsupported(
+            f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
+        )
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     print(f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}")
@@ -318,6 +334,13 @@ def _multi_arg_pointwise_layouts(
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
 ) -> list[FixedTiledLayout]:
+    """
+    Multi-arg pointwise is a join point so handled specially.
+    Algorithm is
+       1. Compute set of output stick expressions possible given the input layouts
+       2. Compute an out layout for each
+       3. Construct the AllSameNode cost function since in and out sticks must always match
+    """
     stick_exprs = {
         device_coordinates(layout, arg.dep)[-1]
         for arg in args
@@ -390,8 +413,7 @@ def _multi_arg_pointwise_layouts(
                 output.device, output.dtype, output.size, output.stride, stl
             )
         )
-    if results:
-        op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
 
 
@@ -401,6 +423,10 @@ def compute_layouts(
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
 ) -> list[FixedTiledLayout]:
+    """
+    Compute candidate output FixedTiledLayouts given the set(s) of input layouts.
+    Attach a restick cost function based on the type of op.
+    """
     data = op.data
     print()
     print(f"MRA:  ====== In compute_layouts ({op.get_name()})  ======")
@@ -416,20 +442,27 @@ def compute_layouts(
 
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:
+        # layernormnorm is pointwise but special: it has multiple args, input and output
+        # must have matching size/stride, but only the first arg drives the output layout.
         first_layout = next(iter(args[0].layouts))
         if first_layout.size != output.size or first_layout.stride != output.stride:
             raise Unsupported(
                 f"views not supported for spyre.layernormnorm({first_layout.size})=>{output.size})"
             )
-        return _single_arg_layouts_and_cost(
-            op, output, output_dep, args[0], args[:1], _single_arg_op_layout
-        )
+        layouts = [
+            _single_arg_op_layout(op, output, output_dep, args[0].dep, lo)
+            for lo in args[0].layouts
+        ]
+        op.restick_cost_fn = AllSameNode.from_args(args[:1], layouts, output_dep)
+        return layouts
 
     # All other single arg ops
-    return _single_arg_layouts_and_cost(
-        op, output, output_dep, args[0], args, _single_arg_op_layout
-    )
-
+    layouts = [
+        _single_arg_op_layout(op, output, output_dep, args[0].dep, lo)
+        for lo in args[0].layouts
+    ]
+    op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep)
+    return layouts
 
 
 def generic_layout(op: Operation) -> FixedTiledLayout:

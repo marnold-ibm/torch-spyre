@@ -23,8 +23,10 @@ from .propagate_layouts import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
+    InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
+    StorageBox,
     TensorBox,
 )
 from torch._inductor.ops_handler import WrapperHandler
@@ -41,7 +43,11 @@ def _record_restickify(
     target_layout: FixedTiledLayout,
     restickify_plan: dict,
 ) -> None:
-    """Append a restickify entry to restickify_plan."""
+    """Record that op's input arg_name must be restickified to target_layout.
+
+    restickify_plan is the deferred execution queue: entries are recorded here during
+    finalize_layouts and executed later by insert_restickify.
+    """
     restickify_plan[op.get_name()].append(
         {"arg_name": dep_name, "target_layout": target_layout}
     )
@@ -124,7 +130,10 @@ def insert_restickify_on_node_inputs(
     resticks_needed: list[dict],
     operations: list[Operation],
 ) -> None:
-    """Create a restickify node for each incompatible input arg of op."""
+    """Insert restickify nodes before op for each incompatible input, patch op's inner_fn
+    to read the new buffer names, and reconstruct the consumer ComputedBuffer to
+    invalidate its sizes cache.
+    """
     name_map = {}
     try:
         op_index = operations.index(op)
@@ -174,12 +183,11 @@ def insert_restickify_on_node_inputs(
 
 
 def insert_restickify(operations: list[Operation]) -> None:
-    """
-    Insert restickify operations before all nodes in restickify_plan.
+    """Insert restickify operations before all nodes in restickify_plan.
 
-    Consumes V.graph.restickify_plan (built by propagate_spyre_tensor_layouts)
-    and splices the necessary ComputedBuffer nodes into the operations list
-    in-place.  No scheduler state is touched.
+    Consumes V.graph.restickify_plan (built by finalize_layouts) and splices the
+    necessary ComputedBuffer nodes into the operations list in-place.
+    No scheduler state is touched.
     """
     restickify_plan = V.graph.restickify_plan
     print(
@@ -200,12 +208,11 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
+    """Build V.graph.restickify_plan for insert_restickify:
+    - Translate stick_decisions (set by the optimizer) into restickify entries.
+    - Handle mutation ops whose stick must match their target buffer.
+    - Commit chosen layouts and clean up optimizer-only attributes.
     """
-    Needs comment
-    """
-    from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
-
-    # Commit layouts for graph inputs.
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if (

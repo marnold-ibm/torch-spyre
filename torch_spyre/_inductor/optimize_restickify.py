@@ -33,10 +33,14 @@ from .pass_utils import compute_restickify_needed
 INF = math.inf
 
 
-# A python key for STL
-# Consider using  STL itself but it would require a has function, and the dtype is not needed  
 @dataclass(frozen=True)
 class LayoutKey:
+    """Hashable Python surrogate for SpyreTensorLayout, used as a dict/set key.
+
+    SpyreTensorLayout is not hashable and includes dtype, which is irrelevant
+    for stick-compatibility comparisons.
+    """
+
     device_size: tuple[int, ...]
     stride_map: tuple[int, ...]
 
@@ -46,10 +50,11 @@ class LayoutKey:
 
 
 class EdgeCostMap:
-    """Lazy 2-D cost table for one input arg.
+    """Lazy cost table mapping (in_layout, target_layout) -> restick cost for one op input.
 
-    Costs are computed on demand via compute_restickify_needed when first queried.
-    MemDep is not used in this file, but is carried so it can be passed to restickify helpers in pass_utils
+    Entries are computed on demand by compute_restickify_needed. `dep` is the
+    MemoryDep for this input; it is not used locally but is forwarded to
+    compute_restickify_needed in pass_utils.
     """
 
     def __init__(
@@ -64,20 +69,40 @@ class EdgeCostMap:
         self._target_layouts = target_layouts
         self._target_dep = target_dep
         self._cost: defaultdict[LayoutKey, dict[LayoutKey, float]] = defaultdict(dict)
-        self._restick_target: defaultdict[LayoutKey, dict[LayoutKey, Any]] = defaultdict(dict)
+        self._restick_target: defaultdict[LayoutKey, dict[LayoutKey, Any]] = (
+            defaultdict(dict)
+        )
 
-    def _compute_and_cache_cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> None:
+    def _compute_and_cache_cost(
+        self, in_key: "LayoutKey", target_key: "LayoutKey"
+    ) -> None:
+        """Populate _cost and _restick_target for (in_key, target_key).
+
+        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
-        Compute the potential restick cost for this edge:
-        in_key and target_key represent the layouts of the input and target
-        If they are stick compatible there is no cost
-        If they are not stick compatible, they would need to be restickified with a cost
-        """
-        in_layout = next((l for l in self._in_layouts if LayoutKey.from_stl(l.device_layout) == in_key), None)
-        target_layout = next((l for l in self._target_layouts if LayoutKey.from_stl(l.device_layout) == target_key), None)
+        in_layout = next(
+            (
+                layout
+                for layout in self._in_layouts
+                if LayoutKey.from_stl(layout.device_layout) == in_key
+            ),
+            None,
+        )
+        target_layout = next(
+            (
+                layout
+                for layout in self._target_layouts
+                if LayoutKey.from_stl(layout.device_layout) == target_key
+            ),
+            None,
+        )
         assert in_layout is not None, f"in_key {in_key} not found in in_layouts"
-        assert target_layout is not None, f"target_key {target_key} not found in target_layouts"
-        needed, tgt = compute_restickify_needed(in_layout, self.dep, target_layout, self._target_dep)
+        assert target_layout is not None, (
+            f"target_key {target_key} not found in target_layouts"
+        )
+        needed, tgt = compute_restickify_needed(
+            in_layout, self.dep, target_layout, self._target_dep
+        )
         if not needed:
             cost = 0.0
         elif tgt is None:
@@ -87,12 +112,8 @@ class EdgeCostMap:
         self._cost[in_key][target_key] = cost
         self._restick_target[in_key][target_key] = tgt
 
-
     def cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> float:
-        """
-        Return the cached restick cost for this in/target key pair of layouts
-        Compute from scratch if not cached
-        """
+        """Return the restick cost for (in_key, target_key), computing it on first access."""
         if target_key not in self._cost[in_key]:
             self._compute_and_cache_cost(in_key, target_key)
         return self._cost[in_key][target_key]
@@ -105,6 +126,13 @@ class EdgeCostMap:
 
 
 class RestickNodeCost(abc.ABC):
+    """Abstract base for per-op restick cost functions.
+
+    Subclasses encode the stick-compatibility rules for a specific op type and
+    compute the total restick cost given each input's committed layout and a
+    candidate output layout key.
+    """
+
     def __init__(self, edge_costs):
         self.edge_costs = edge_costs
 
@@ -113,9 +141,14 @@ class RestickNodeCost(abc.ABC):
 
 
 class AllSameNode(RestickNodeCost):
+    """Cost node for ops that require all inputs and the output to be stick compatible (eg pointwise ops)."""
+
     @classmethod
     def from_args(cls, args, out_layouts, out_dep):
-        edge_costs = [EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args]
+        assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
+        edge_costs = [
+            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args
+        ]
         return cls(edge_costs)
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
@@ -129,6 +162,8 @@ class AllSameNode(RestickNodeCost):
 
 
 class FixedInOutNode(RestickNodeCost):
+    """Cost node for ops whose input and output stick compatibility is fixed by the op (eg, matmul)."""
+
     def __init__(
         self,
         edge_costs,
@@ -137,14 +172,22 @@ class FixedInOutNode(RestickNodeCost):
     ):
         super().__init__(edge_costs)
         self.required_out_key = required_out_key  # output layout currently assigned
-        self.required_in_keys = required_in_keys  # each input must be stick-compatible with this layout
+        self.required_in_keys = (
+            required_in_keys  # each input must be stick-compatible with this layout
+        )
 
     @classmethod
     def from_args(cls, args, out_stl, req_layouts):
+        assert req_layouts, "FixedInOutNode.from_args: req_layouts is empty"
         required_out_key = LayoutKey.from_stl(out_stl)
-        edge_costs = [EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep) for arg, req in zip(args, req_layouts)]
+        edge_costs = [
+            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep)
+            for arg, req in zip(args, req_layouts)
+        ]
         req_keys = [LayoutKey.from_stl(req.device_layout) for req in req_layouts]
-        return cls(edge_costs, required_out_key=required_out_key, required_in_keys=req_keys)
+        return cls(
+            edge_costs, required_out_key=required_out_key, required_in_keys=req_keys
+        )
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         assert out_key == self.required_out_key, (
@@ -152,7 +195,9 @@ class FixedInOutNode(RestickNodeCost):
             "stick compatibility check not implemented because propagate layouts should have only one layout"
         )
         total = 0.0
-        for edge_cost, layout_key, req_key in zip(self.edge_costs, in_layouts, self.required_in_keys):
+        for edge_cost, layout_key, req_key in zip(
+            self.edge_costs, in_layouts, self.required_in_keys
+        ):
             c = edge_cost.cost(layout_key, req_key)
             if c == INF:
                 return INF
@@ -163,6 +208,7 @@ class FixedInOutNode(RestickNodeCost):
 def record_stick_decisions(
     op, out_key: LayoutKey, in_layouts: "list[LayoutKey]"
 ) -> None:
+    """Store the optimizer's chosen output layout and input layouts on op for the restickify insertion pass."""
     op.stick_decisions = {
         "out_key": out_key,
         "arg_in_layouts": in_layouts,
@@ -170,19 +216,15 @@ def record_stick_decisions(
 
 
 def optimize_restickify_locations(operations: list) -> None:
+    """Select restickify locations for all ops, minimizing total restickify cost.
+
+    Currently uses a greedy local algorithm; intended to be replaced with a global optimizer.
     """
-    Main entry point to optimizer
-    """
-    
-    # Dumb implemntation for now
-    # To be replaced with global optimizer
     greedy_local_min_cost(operations)
 
 
 def _print_op_layouts(operations: list, label: str) -> None:
-    """
-    Temp Helper
-    """
+    """Debug helper: print op layout candidates before/after greedy selection."""
     print(f"\n=== op layouts [{label}] ===")
     for op in operations:
         layout = op.layout
@@ -194,15 +236,10 @@ def _print_op_layouts(operations: list, label: str) -> None:
 
 
 def greedy_local_min_cost(operations: list) -> None:
-    """
-    Simple baseline
-    Greedy algorithm that processes nodes in topological order and finalizes output stick
-    However it uses the cost function at that node to pick a min local cost
-    If costs equal, choose left-most argument's stick
+    """Greedy layout selection: process ops in topological order, picking the output layout with minimum local restick cost.
 
-    This is largely equal to the previous baseline (always choose first arg's stick)
-    But this version has the potential to choose a different arg if the first arg's
-    is sub-optimal or inviable.
+    On cost ties, the first candidate layout (leftmost arg's stick) is chosen. Each op's chosen
+    layout is committed immediately so downstream ops can read it.
     """
 
     print()
