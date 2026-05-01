@@ -193,13 +193,8 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
-    """Build V.graph.restickify_plan from stick_decisions set by optimize_restickify_locations.
-
-    Layouts are already committed to op.layout by optimize_restickify_locations.
-    This pass cleans up temporary attributes and records restickify entries for
-    args that need a stick conversion.
-
-    Also commits layouts for graph input TensorBoxes.
+    """
+        Needs comment
     """
     from torch._inductor.ir import InputBuffer, StorageBox, TensorBox
 

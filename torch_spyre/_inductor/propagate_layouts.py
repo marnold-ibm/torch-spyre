@@ -271,7 +271,7 @@ def _single_arg_layouts_and_cost(op, output, output_dep, arg, cost_args, layout_
     return layouts
 
 
-def first_arg_pointwise_layout(
+def _single_arg_layout(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
@@ -279,6 +279,40 @@ def first_arg_pointwise_layout(
     layout: FixedTiledLayout,
 ) -> FixedTiledLayout:
     data = op.data
+
+    # exx2: stick must be on last host dim; output gets default dim_order with stick last.
+    if isinstance(data, Reduction) and data.reduction_type == "exx2":
+        x_coords = host_coordinates(layout, dep)
+        x_dev_coords = device_coordinates(layout, dep)
+        x_stick_expr = x_dev_coords[-1]
+        x_stick_dim = matching_dim(x_coords, x_stick_expr)
+        if x_stick_dim is None or x_stick_dim != len(layout.size) - 1:
+            # TODO: Insert a restickify to enable the operation to be performed
+            raise Unsupported(f"exx2: illegal device layout {layout}")
+        dim_order = list(range(len(output.size))) + [-1]
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+        return FixedTiledLayout(output.device, output.dtype, output.size, output.stride, stl)
+
+    # Non-exx2 reduction: propagate input stick to output if the dim survives, else put stick last.
+    if isinstance(data, Reduction):
+        x_coords = host_coordinates(layout, dep)
+        x_dev_coords = device_coordinates(layout, dep)
+        out_coords = host_coordinates(output, output_dep)
+        x_stick_expr = x_dev_coords[-1]
+        out_stick_dim = matching_dim(out_coords, x_stick_expr)
+        if out_stick_dim is None:
+            out_dim_order = list(range(len(output.size))) + [-1]
+        else:
+            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+            out_dim_order = out_dim_order + [out_stick_dim]
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+        return FixedTiledLayout(output.device, output.dtype, output.size, output.stride, stl)
+
+    # Pointwise: handle special ops, then propagate stick from input to output.
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
@@ -576,6 +610,9 @@ def compute_layouts(
     print()
     print(f"MRA:  ====== In compute_layouts ({op.get_name()})  ======")
 
+    if len(args) > 1 and isinstance(data, Pointwise):
+        return _multi_arg_pointwise_layouts(op, output, output_dep, args)
+
     if isinstance(data, Reduction) and data.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
         return _matmul_layouts(op, output, output_dep, args)
 
@@ -586,78 +623,13 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({first_layout.size})=>{output.size})"
             )
         return _single_arg_layouts_and_cost(
-            op, output, output_dep, args[0], args[:1], first_arg_pointwise_layout
+            op, output, output_dep, args[0], args[:1], _single_arg_layout
         )
 
-    if len(args) == 1:
-        layout_fn = (
-            first_arg_reduction_layout
-            if isinstance(data, Reduction)
-            else first_arg_pointwise_layout
-        )
-        return _single_arg_layouts_and_cost(
-            op, output, output_dep, args[0], args, layout_fn
-        )
-
-    assert isinstance(data, Pointwise), (
-        f"unexpected multi-arg op type {type(data).__name__} for {op.get_name()}"
+    return _single_arg_layouts_and_cost(
+        op, output, output_dep, args[0], args, _single_arg_layout
     )
-    return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
-
-def first_arg_reduction_layout(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    dep: MemoryDep,
-    layout: FixedTiledLayout,
-) -> FixedTiledLayout:
-    data = op.data
-    if data.reduction_type == "exx2":
-        x_coords = host_coordinates(layout, dep)
-        x_dev_coords = device_coordinates(layout, dep)
-        x_stick_expr = x_dev_coords[-1]
-        x_stick_dim = matching_dim(x_coords, x_stick_expr)
-        if x_stick_dim is None or x_stick_dim != len(layout.size) - 1:
-            # TODO: Insert a restickify to enable the operation to be performed
-            raise Unsupported(f"exx2: illegal device layout {layout}")
-
-        dim_order = list(range(len(output.size))) + [-1]
-        # Concretize for C++ SpyreTensorLayout constructor.
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-        return FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
-    else:
-        x_coords = host_coordinates(layout, dep)
-        x_dev_coords = device_coordinates(layout, dep)
-        out_coords = host_coordinates(output, output_dep)
-        x_stick_expr = x_dev_coords[-1]
-        out_stick_dim = matching_dim(out_coords, x_stick_expr)
-        if out_stick_dim is None:
-            out_dim_order = list(range(len(output.size))) + [-1]
-        else:
-            out_dim_order = [
-                d for d in list(range(len(output.size))) if d != out_stick_dim
-            ]
-            out_dim_order = out_dim_order + [out_stick_dim]
-        # Concretize for C++ SpyreTensorLayout constructor.
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-        result = FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"{data.reduction_type} layout: in:{list(layout.size)} -> out:{list(result.size)}, "
-                f"device_size={list(result.device_layout.device_size)}"
-            )
-
-        return result
 
 
 def _single_out_key_by_expr(arg: "SchedNodeArg", out_expr) -> "dict":
