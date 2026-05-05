@@ -122,14 +122,15 @@ class TestSpyreTensorLayout(TestCase):
         z = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         z2 = SpyreTensorLayout([512, 256], torch.float32)
 
-        self.assertEqual(x, y)
-        self.assertNotEqual(y, z)
+        self.assertEqual(hash(x), hash(x))
 
-        # equal layouts must have equal hashes
+        self.assertEqual(x, y)
         self.assertEqual(hash(x), hash(y))
 
-        # different layouts should have different hashes
-        self.assertNotEqual(hash(x), hash(z))
+        self.assertNotEqual(y, z)
+        self.assertNotEqual(hash(y), hash(z))
+
+        self.assertNotEqual(x, z2)
         self.assertNotEqual(hash(x), hash(z2))
 
         # usable as dict key
