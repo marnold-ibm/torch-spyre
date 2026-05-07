@@ -357,7 +357,6 @@ class Frontier:
         return state.assignments[idx]
 
     def best(self) -> BeamState:
-        assert self.states, "beam is empty — all candidate layouts produced INF cost"
         return self.states[0]
 
     def trim(self) -> None:
@@ -441,6 +440,10 @@ def beam_global_min_cost(operations: list) -> None:
 
         frontier.states = next_states
         frontier.trim()
+        if not frontier.states:
+            raise RuntimeError(
+                f"beam search: no feasible layout combination found after op {op.get_name()}"
+            )
         max_states = max(max_states, len(frontier.states))
         if logger.isEnabledFor(logging.DEBUG):
             lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]
