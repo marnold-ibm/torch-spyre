@@ -48,6 +48,7 @@ from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .chunk_large_tensors import chunk_large_tensors
 
 
 logger = get_inductor_logger("passes")
@@ -228,6 +229,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
+        chunk_large_tensors(operations)
         span_reduction(operations)
         work_distribution(operations)
         if config.lx_planning:
@@ -242,6 +244,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
+            inspect.getfile(chunk_large_tensors),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(scratchpad_planning),
