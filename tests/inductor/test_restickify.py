@@ -38,9 +38,9 @@ T = 64  # side length for 4D tests (all dims equal)
 
 
 def _verify_cost(expected_cost):
-    if not _insert_restickify.restickify_plan:
-        # Cache hit — finalize_layouts did not run, plan was not captured. Skip cost check.
-        return
+    # None means finalize_layouts never ran (cache hit); {} means it ran but no restickify is needed
+    if _insert_restickify.restickify_plan is None:
+        raise AssertionError("restickify_plan is None")
     actual = sum(
         math.prod(int(s) for s in entry["target_layout"].size)
         for entries in _insert_restickify.restickify_plan.values()
@@ -57,7 +57,7 @@ def _compare(fn, *args, check_strides=True, optimal_cost=None, skip_correctness=
     the compiler; the env var below instructs the compiler to stash it for us.
     """
     if optimal_cost is not None:
-        _insert_restickify.restickify_plan = {}
+        _insert_restickify.restickify_plan = None
         os.environ["SPYRE_CAPTURE_RESTICKIFY_PLAN"] = "1"
         try:
             spyre_result = _compile_and_run(fn, args, DEVICE)
