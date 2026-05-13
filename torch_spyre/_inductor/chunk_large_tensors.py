@@ -45,24 +45,40 @@ logger = get_inductor_logger("chunk_large_tensors")
 # ---------------------------------------------------------------------------
 
 
-def _needs_chunking(
-    op: ComputedBuffer, max_cores: int
-) -> tuple[int, FixedTiledLayout] | None:
-    """Return ``(total_device_bytes, layout)`` when the op exceeds capacity."""
-    layout = op.layout
+def _needs_chunking(layout: FixedTiledLayout, max_cores: int) -> int | None:
+    """Return total_device_bytes when op exceeds capacity, else None."""
+
     device_size = layout.device_layout.device_size
     total_bytes = math.prod(int(s) for s in device_size) * layout.dtype.itemsize
     if total_bytes > MAX_SPAN_BYTES * max_cores:
-        return total_bytes, layout
+        return total_bytes
     return None
 
 
 def _find_split_dim(layout: FixedTiledLayout) -> int:
-    """Pick the host dimension to split along.
+    """Pick the host dimension to split chunks along.
 
-    Walks device dims outermost-first (skipping the within-stick dim) and
-    returns the first host dim whose size > 1.  Falls back to the largest
-    host dim.
+
+    Strategy:
+        Walk device dims from outermost to innermost,
+        skipping the last dim (stick dim, always 64).
+        For each device dim, use stride_map to find
+        the corresponding host dim.
+        Return the first host dim with size > 1.
+
+    Why device dim order matters:
+        Device outermost dim = largest contiguous block
+        in memory = best candidate to split across cores
+        without breaking data locality.
+
+    Why skip stick dim:
+        Stick dim (last device dim) is the atomic unit.
+        Splitting it requires special handling and is
+        not supported in this pass.
+
+    Falls back to largest host dim if stride_map
+    lookup finds no valid dim.
+
     """
     stl = layout.device_layout
     host_size = [int(s) for s in layout.size]
@@ -172,8 +188,13 @@ def _chunk_op(
 
     split_dim_idx = _find_split_dim(original_ftl)
     full_size = int(original_ranges[split_dim_idx])
+    stick_elems = original_ftl.device_layout.elems_per_stick()
+
     num_chunks = math.ceil(total_bytes / (MAX_SPAN_BYTES * max_cores))
     chunk_size = math.ceil(full_size / num_chunks)
+    # Align chunk_size UP to nearest stick boundary.
+    chunk_size = math.ceil(chunk_size / stick_elems) * stick_elems
+
     num_chunks = math.ceil(full_size / chunk_size)
 
     logger.info(
@@ -199,11 +220,14 @@ def _chunk_op(
 
     # --- chunks 1..N-1: new compute + overwrite-scatter buffers -----------
     insert_pos = op_index + 1
-    mutation_target = op
 
     for c in range(1, num_chunks):
         offset = c * chunk_size
-        this_chunk_size = min(chunk_size, full_size - offset)
+        remaining = full_size - offset
+
+        # Align last chunk to stick boundary.
+        this_chunk_size = math.ceil(remaining / stick_elems) * stick_elems
+        this_chunk_size = min(this_chunk_size, chunk_size)
         chunk_ranges = list(original_ranges)
         chunk_ranges[split_dim_idx] = this_chunk_size
 
@@ -235,31 +259,32 @@ def _chunk_op(
         )
         overwrite_buf = ComputedBuffer(
             name=None,
-            layout=MutationLayoutSHOULDREMOVE(mutation_target),
+            layout=MutationLayoutSHOULDREMOVE(op),
             data=overwrite_data,
         )
         insert_pos = _register_and_insert(overwrite_buf, op, operations, insert_pos)
-        mutation_target = overwrite_buf
 
 
 def chunk_large_tensors(operations: list[Operation]) -> None:
     """Split pointwise ops whose device footprint exceeds the hardware limit.
 
     Must run **after** ``propagate_spyre_tensor_layouts`` /
-    ``insert_restickify`` and **before** ``core_division_planning``.
+    ``insert_restickify and before span_reduction``.
     """
+
     max_cores = config.sencores
-    i = 0
-    while i < len(operations):
-        op = operations[i]
+    for i, op in enumerate(operations):
         if (
             isinstance(op, ComputedBuffer)
             and isinstance(op.data, Pointwise)
+            # Note: ir.Pointwise is broader than torch.Tag.pointwise.
+            # inner_fn can in theory access non-corresponding input
+            # indices making chunking unsafe.
+            # TODO: Use OpsHandler to verify output[i] only uses
+            # input[i] before chunking.
             and isinstance(op.layout, FixedTiledLayout)
             and len(op.data.ranges) == 3
         ):
-            result = _needs_chunking(op, max_cores)
-            if result is not None:
-                total_bytes, layout = result
-                _chunk_op(op, max_cores, operations, i, total_bytes, layout)
-        i += 1
+            total_bytes = _needs_chunking(op.layout, max_cores)
+            if total_bytes is not None:
+                _chunk_op(op, max_cores, operations, i, total_bytes, op.layout)
