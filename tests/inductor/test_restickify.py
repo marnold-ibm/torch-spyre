@@ -28,6 +28,7 @@ import os
 import pytest
 import torch
 
+import torch._inductor.exc
 import torch_spyre._inductor.insert_restickify as _insert_restickify
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from utils_inductor import _compile_and_run, compare_with_cpu
@@ -455,6 +456,17 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+# ------- FallbackKernel + restickify regression test ---------
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+def test_fallback_with_restickify():
+    # FallbackKernel (torch.sin) produces a MultiOutput node. Verify the optimizer
+    # handles it via AnyInNode and still makes a correct restickify decision downstream.
+    x, y = _make_tensors(2, S, S)
+    _compare(lambda x, y: torch.sin(x) + y.t(), x, y, optimal_cost=S * S)
+
+
 # ------- Mutation + restickify regression test ---------
 
 
@@ -720,3 +732,21 @@ def test_opt_matmul_both_inputs_upstream_conflict():
         d,
         optimal_cost=2 * S * S,
     )
+
+
+# ------- Unsupported stick configurations ---------
+
+
+def test_sparse_dense_pointwise_unsupported():
+    """a.sum(1) + b - pointwise of sparse and dense tensors not yet supported.
+
+    There is no restickify resolution for this configuration so we must catch this and report error
+    """
+    a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    cfn = torch.compile(lambda a, b: a.sum(1) + b)
+    with pytest.raises(
+        torch._inductor.exc.InductorError,
+        match="NotImplementedError",
+    ):
+        cfn(a, b)
