@@ -103,6 +103,12 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
         self.assertEqual(stl.stride_map, [1, -1, 256, -1])
 
+    def test_is_sparse(self):
+        sparse_stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1, -1])
+        dense_stl = SpyreTensorLayout([512, 256], torch.float16)
+        self.assertTrue(sparse_stl.is_sparse)
+        self.assertFalse(dense_stl.is_sparse)
+
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
