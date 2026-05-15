@@ -163,11 +163,11 @@ PYBIND11_MODULE(_C, m) {
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
-      .def_property_readonly(
-          "is_sparse",
-          [](const spyre::SpyreTensorLayout& c) {
-            return !c.stride_map.empty() && c.stride_map.back() == -1;
-          })
+      .def_property_readonly("is_sparse",
+                             [](const spyre::SpyreTensorLayout& c) {
+                               return !c.stride_map.empty() &&
+                                      c.stride_map.back() == -1;
+                             })
       .def("__str__",
            [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("__repr__",
