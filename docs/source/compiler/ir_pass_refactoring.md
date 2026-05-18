@@ -129,3 +129,6 @@ it would add indirection with no clarity benefit.
 ## Matt Additions
 - Claude didn't pick it up but I think  `_find_split_dim`   could probably be renamed `device_dim_to_host_dim` and put somewhere so that it is reusable.
 It's analogous to `matching_dim` in in `views.py` which maps coordinate expressions to host dims
+- Both `_make_chunk_fn` and `_make_overwrite_fn` in `chunk_large_tensor.py` and `lower_overwrite` in `lowering.py` could call a shared helper `shift_index(index, dims, offsets)`
+- chunk_large_tensors can indeed use NameSwap Handler.  The NameSwapHandler + name-redirect pattern appears independently in four files: insert_restickify.py (inlined), dedup_constants.py (extracted as _patch_inner_fn), chunk_large_tensors.py (not applicable), and scratchpad.py (as create_Loop_hack_inner_fn). Similarly, the "register buffer, register operation, remove from tail, insert at position" sequence appears independently in both chunk_large_tensors.py (_register_and_insert) and scratchpad.py (lines 463–492). scratchpad.py also has its own local NameSwapHandler class. Both patterns are therefore duplicated across three files, not two as initially identified — making the case for extracting them into pass_utils.py  even stronger.
+
