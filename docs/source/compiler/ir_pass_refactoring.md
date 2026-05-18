@@ -124,3 +124,8 @@ it would add indirection with no clarity benefit.
 | Use `replace_computed_buffer_body` in Insert Restickify | Insert Restickify | Eliminates metadata field drift trap |
 | Extract `insert_ops_before` to `pass_utils` | Insert Restickify, Matmul Padding | Single implementation of topological-order invariant |
 | Chunk Large Tensors | — | No changes needed |
+
+
+## Matt Additions
+- Claude didn't pick it up but I think  `_find_split_dim`   could probably be renamed `device_dim_to_host_dim` and put somewhere so that it is reusable.
+It's analogous to `matching_dim` in in `views.py` which maps coordinate expressions to host dims
