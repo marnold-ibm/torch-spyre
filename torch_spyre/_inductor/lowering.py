@@ -20,7 +20,7 @@ import torch
 from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
 import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
-from .ir import SpyreConstantFallback
+from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 from typing import Any, Callable, Union
 
@@ -294,6 +294,7 @@ def lower_mm(x, y):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.batched_matmul.default)
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
     x.realize()
@@ -705,15 +706,21 @@ def lower_restickify(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.aten.slice.Tensor, type_promotion_kind=None)
-def lower_slice(x, dim=0, start=None, end=None, step=1):
-    result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
-    return clone(result, memory_format=torch.contiguous_format)
-
-
 @register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
 def lower_constant(value, dtype, device):
     op_overload = getattr(
         torch.ops.spyre.constant, V.graph.current_node.target._overloadname
     )
     return ir.TensorBox.create(SpyreConstantFallback(op_overload, value, dtype, device))
+
+
+@register_spyre_lowering(torch.ops.spyre.empty.default, type_promotion_kind=None)
+def lower_empty(size, device, dtype=None):
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    op_overload = getattr(
+        torch.ops.spyre.empty, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreEmptyFallback(op_overload, list(size), device, dtype)
+    )
