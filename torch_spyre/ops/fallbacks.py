@@ -330,6 +330,10 @@ def spyre__bitwise_or(input1, input2, **kwargs):
 def spyre__argmax(*args, **kwargs):
     return torch.argmax(*args, **kwargs)
 
+@register_fallback([aten.where.default])
+def spyre__where(*args, **kwargs):
+    return torch.where(*args, **kwargs)
+
 
 @register_fallback(["spyre::max_dim_int64_fallback"])
 def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):

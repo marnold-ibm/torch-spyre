@@ -111,6 +111,11 @@ register_torch_compile_kernel(
         aten.maximum,
         aten.pow,
         aten.linalg_vector_norm,
+        aten.where.self,
+        aten.where.ScalarOther,
+        aten.where.ScalarSelf,
+        aten.where.Scalar,
+        aten.where.self_out,
     ]
 )
 
