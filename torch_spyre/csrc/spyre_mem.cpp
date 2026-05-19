@@ -380,17 +380,34 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   c10::IntArrayRef t_dev_strides;
   c10::IntArrayRef t_cpu_strides;
 
+  // For 0D (scalar) tensors, synthesize [1]/[1] so the DMA engine gets rank-1
+  // shapes (senlib treats [] as "0 iterations"). The tensor metadata stays 0D.
+  static const int64_t one_arr[] = {1};
   if (host2device) {
-    cpu_shape = cpu_tensor->sizes().vec();
-    t_sizes = cpu_tensor->sizes();
-    t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
-    t_cpu_strides = cpu_tensor->strides();
+    if (cpu_tensor->dim() == 0) {
+      cpu_shape = {1};
+      t_sizes = c10::IntArrayRef(one_arr, 1);
+      t_dev_strides = c10::IntArrayRef(one_arr, 1);
+      t_cpu_strides = c10::IntArrayRef(one_arr, 1);
+    } else {
+      cpu_shape = cpu_tensor->sizes().vec();
+      t_sizes = cpu_tensor->sizes();
+      t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+      t_cpu_strides = cpu_tensor->strides();
+    }
   } else {
     // Transfer contiguous memory, deal with view on cpu
-    cpu_shape = spyre_tensor_impl->dma_sizes;
-    t_sizes = c10::IntArrayRef(spyre_tensor_impl->dma_sizes);
-    t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
-    t_cpu_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+    if (spyre_tensor_impl->dma_sizes.size() == 0) {
+      cpu_shape = {1};
+      t_sizes = c10::IntArrayRef(one_arr, 1);
+      t_dev_strides = c10::IntArrayRef(one_arr, 1);
+      t_cpu_strides = c10::IntArrayRef(one_arr, 1);
+    } else {
+      cpu_shape = spyre_tensor_impl->dma_sizes;
+      t_sizes = c10::IntArrayRef(spyre_tensor_impl->dma_sizes);
+      t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+      t_cpu_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+    }
   }
   // Reverse PyTorch ordering
   std::reverse(cpu_shape.begin(), cpu_shape.end());
@@ -489,15 +506,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
   auto spyre_tensor_impl =
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
-  if (size.size() == 0) {
-    std::vector<int64_t> one = {1};
-    c10::IntArrayRef tmp_size(one);
-    c10::IntArrayRef tmp_stride(one);
-    spyre_tensor_impl->set_sizes_and_strides(tmp_size, tmp_stride);
-
-  } else {
-    spyre_tensor_impl->set_sizes_and_strides(size, stride);
-  }
+  spyre_tensor_impl->set_sizes_and_strides(size, stride);
 
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
@@ -563,22 +572,36 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     stream = getCurrentStream(dst.device());
   } else {
     stream = getCurrentStream(self.device());
-    // D2H of a non-(dense+non-overlapping) source: the DMA path uses
-    // dma_sizes/dma_strides directly and would drop broadcast/strided dims.
-    // Stage the underlying allocation, then realize self's logical view on
-    // top of it after the copy.
-    if (self.is_privateuseone() &&
-        !self.unsafeGetTensorImpl()->is_non_overlapping_and_dense_default()) {
-      non_overlapping_and_dense = false;
+    // D2H staging path: DMA the full physical allocation into a CPU buffer
+    // using dma_sizes/dma_strides/spyre_layout (the layout the data was
+    // written with), then apply the logical view on the CPU side.
+    //
+    // This path is taken when either:
+    //   (a) the tensor is not dense+non-overlapping (e.g. expanded/broadcast),
+    //       where the DMA path would drop broadcast/strided dims, OR
+    //   (b) product(dma_sizes) > self.numel(), meaning the physical allocation
+    //       is larger than the logical view (e.g. a slice of a flattened
+    //       tensor).  In that case the fast dense path would DMA dma_sizes
+    //       bytes into a dst sized from the logical shape, overflowing the
+    //       allocation and corrupting the heap.
+    if (self.is_privateuseone()) {
       auto* spyre_impl =
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-      c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
-      c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
-      alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
-                                  /*storage_offset=*/0);
-      cpu_alloc = at::empty(alloc_sizes, dst.options());
-      copy_from = &alloc_view;
-      copy_to = &cpu_alloc;
+      int64_t dma_numel = 1;
+      for (auto s : spyre_impl->dma_sizes) dma_numel *= s;
+      const bool physical_exceeds_logical = (dma_numel > self.numel());
+
+      if (!self.unsafeGetTensorImpl()->is_non_overlapping_and_dense_default() ||
+          physical_exceeds_logical) {
+        non_overlapping_and_dense = false;
+        c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
+        c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+        alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
+                                    /*storage_offset=*/0);
+        cpu_alloc = at::empty(alloc_sizes, dst.options());
+        copy_from = &alloc_view;
+        copy_to = &cpu_alloc;
+      }
     }
   }
 
