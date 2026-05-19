@@ -2968,6 +2968,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_4d_dim_3",
             ],
         },
+        (
+            "test_pointwise_unary_op_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": POINTWISE_UNARY_OPS_FP32_DICT,
+            "param_sets": {
+                "256": (cached_randn((256,), dtype=torch.float32),),
+                "67x256": (cached_randn((67, 256), dtype=torch.float32),),
+                "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
+            },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
             "param_sets": {
