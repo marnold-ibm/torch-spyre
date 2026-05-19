@@ -2978,6 +2978,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x256": (cached_randn((67, 256), dtype=torch.float32),),
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
+        },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
             "param_sets": {
