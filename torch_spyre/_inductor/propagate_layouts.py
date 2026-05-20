@@ -281,6 +281,30 @@ def _layernormnorm_layout(
     return [out_stl]
 
 
+def _find_req_stl(
+    arg: PropArg,
+    req_coord,
+) -> "SpyreTensorLayout | None":
+    """Return an STL from arg.layouts satisfying req_coord as the stick.
+    Prefers a layout that already has the right stick; falls back to the
+    first that can be restickified to it. Returns None if all fail."""
+    coords = host_coordinates(arg.layout, arg.dep)
+    req_dim = matching_dim(coords, req_coord)
+    for stl in arg.layouts:
+        if req_dim is not None and matching_dim(
+            coords, device_coordinates(stl, arg.dep)[-1]
+        ) == req_dim:
+            return stl
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep)
+        result = compute_restickify_target_layout(
+            stl, arg.layout, req_coord, coords, dev_coords
+        )
+        if result is not None:
+            return result
+    return None
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -289,94 +313,70 @@ def _matmul_layouts(
 ) -> list[SpyreTensorLayout]:
     """
     Matmul has fixed in/out stick requirements so handled specially.
-    Algorithm is
-       1. For both input args, compuate a layout that is representative
-       2. For output arg, compute the output layout
-       3. Construct the FixdInOutNode cost function
+    Algorithm:
+      1. Compute required stick coords from geometry (stl-independent).
+      2. For each input, find the first STL that satisfies its required coord,
+         restickifying if necessary. Raise if no layout works.
+      3. Build the output STL and FixedInOutNode cost function.
+
+    Hardware stick constraints (DF16):
+      Input x:  stick on reduction_coord  (x coord absent from output)
+      Input y:  stick on generated_coord  (y coord in output but not in x)
+      Output:   stick on generated_coord
     """
     data = op.data
     out_coords = host_coordinates(output, output_dep)
-
     x = args[0]
     y = args[1]
-    x_stl = next(iter(x.layouts))
-    y_stl = next(iter(y.layouts))
     x_coords = host_coordinates(x.layout, x.dep)
-    x_dev_coords = device_coordinates(x_stl, x.dep)
     y_coords = host_coordinates(y.layout, y.dep)
-    y_dev_coords = device_coordinates(y_stl, y.dep)
 
-    x_stick_expr = x_dev_coords[-1]
-    y_stick_expr = y_dev_coords[-1]
-    if (
-        matching_dim(x_coords, x_stick_expr) is None
-        or matching_dim(y_coords, y_stick_expr) is None
-    ):
-        raise Unsupported(
-            f"{data.reduction_type}: failed to map stick_dims to host coords"
-        )
-
-    # Hardware stick constraints (DF16):
-    #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
-    #   Input2 (y): stick on generated_dim (the y coord that appears in output)
-    #   Output:     stick on generated_dim
-    if matching_dim(out_coords, x_stick_expr) is not None:
-        reduction_coord = next(
+    reduction_coord = next(
+        (
             c
             for c in x_coords
             if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-        )
-    else:
-        reduction_coord = x_stick_expr
-
-    if matching_dim(out_coords, y_stick_expr) is None:
-        generated_coord = next(
+        ),
+        None,
+    )
+    generated_coord = next(
+        (
             c
             for c in y_coords
             if len(c.free_symbols) > 0
             and matching_dim(out_coords, c) is not None
             and matching_dim(x_coords, c) is None
+        ),
+        None,
+    )
+    if reduction_coord is None or generated_coord is None:
+        raise Unsupported(
+            f"{data.reduction_type}: cannot identify reduction/generated coords"
         )
-    else:
-        generated_coord = y_stick_expr
 
-    if reduction_coord == x_dev_coords[-1]:
-        x_req_stl = x_stl
-    else:
-        _x = compute_restickify_target_layout(
-            x_stl, x.layout, reduction_coord, x_coords, x_dev_coords
+    x_req_stl = _find_req_stl(x, reduction_coord)
+    if x_req_stl is None:
+        raise Unsupported(
+            f"{data.reduction_type}: no x layout satisfies reduction_coord={reduction_coord}"
         )
-        if _x is None:
-            raise Unsupported(
-                f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
-            )
-        x_req_stl = _x
-
-    if generated_coord == y_dev_coords[-1]:
-        y_req_stl = y_stl
-    else:
-        _y = compute_restickify_target_layout(
-            y_stl, y.layout, generated_coord, y_coords, y_dev_coords
+    y_req_stl = _find_req_stl(y, generated_coord)
+    if y_req_stl is None:
+        raise Unsupported(
+            f"{data.reduction_type}: no y layout satisfies generated_coord={generated_coord}"
         )
-        if _y is None:
-            raise Unsupported(
-                f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
-            )
-        y_req_stl = _y
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     if out_stick_dim is None:
         raise Unsupported(
-            f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {generated_coord}"
+            f"{data.reduction_type}: cannot map generated_coord to output"
         )
 
     out_dims = len(output.size)
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
-        out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
+        out_dim_order += [out_dims - 2, out_dims - 1]
     else:
-        out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
-    # Concretize for C++ SpyreTensorLayout constructor.
+        out_dim_order += [out_dims - 1, out_dims - 2]
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
