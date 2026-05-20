@@ -225,7 +225,10 @@ def _single_arg_op_layout(
 def _stick_on_last_dim_req_stl(
     arg: PropArg,
 ) -> SpyreTensorLayout:
-    """Build the required-input STL with stick on arg's last logical dim."""
+    """
+    Build the required-input STL with stick on arg's last logical dim.
+    TODO: unify this with _find_req_stl
+    """
     x_coords = host_coordinates(arg.layout, arg.dep)
     last_dim_coord = x_coords[-1]
     candidate = next(iter(arg.layouts))
@@ -281,19 +284,16 @@ def _layernormnorm_layout(
     return [out_stl]
 
 
-def _find_req_stl(
-    arg: PropArg,
-    req_coord,
-) -> "SpyreTensorLayout | None":
-    """Return an STL from arg.layouts satisfying req_coord as the stick.
-    Prefers a layout that already has the right stick; falls back to the
-    first that can be restickified to it. Returns None if all fail."""
+def _find_req_stl(arg: PropArg, req_coord) -> "SpyreTensorLayout | None":
+    """Find an STL from arg.layouts whose stick is on req_coord.
+    Phase 1: return a layout already on req_coord.
+    Phase 2: return the first layout that can be restickified to req_coord.
+    Returns None if all layouts fail."""
     coords = host_coordinates(arg.layout, arg.dep)
     req_dim = matching_dim(coords, req_coord)
     for stl in arg.layouts:
-        if req_dim is not None and matching_dim(
-            coords, device_coordinates(stl, arg.dep)[-1]
-        ) == req_dim:
+        dev_coords = device_coordinates(stl, arg.dep)
+        if req_dim is not None and matching_dim(coords, dev_coords[-1]) == req_dim:
             return stl
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep)
@@ -312,17 +312,10 @@ def _matmul_layouts(
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
     """
-    Matmul has fixed in/out stick requirements so handled specially.
-    Algorithm:
-      1. Compute required stick coords from geometry (stl-independent).
-      2. For each input, find the first STL that satisfies its required coord,
-         restickifying if necessary. Raise if no layout works.
-      3. Build the output STL and FixedInOutNode cost function.
-
     Hardware stick constraints (DF16):
-      Input x:  stick on reduction_coord  (x coord absent from output)
-      Input y:  stick on generated_coord  (y coord in output but not in x)
-      Output:   stick on generated_coord
+      Input x:  stick on reduction_dim (the x coord that does NOT appear in output)
+      Input y:  stick on generated_dim (the y coord that appears in output)
+      Output:   stick on generated_dim
     """
     data = op.data
     out_coords = host_coordinates(output, output_dep)
@@ -331,38 +324,37 @@ def _matmul_layouts(
     x_coords = host_coordinates(x.layout, x.dep)
     y_coords = host_coordinates(y.layout, y.dep)
 
-    reduction_coord = next(
-        (
-            c
-            for c in x_coords
+    x_stl = next(iter(x.layouts))
+    x_stick_expr = device_coordinates(x_stl, x.dep)[-1]
+    if matching_dim(out_coords, x_stick_expr) is not None:
+        reduction_coord = next(
+            c for c in x_coords
             if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-        ),
-        None,
-    )
-    generated_coord = next(
-        (
-            c
-            for c in y_coords
+        )
+    else:
+        reduction_coord = x_stick_expr
+
+    y_stl = next(iter(y.layouts))
+    y_stick_expr = device_coordinates(y_stl, y.dep)[-1]
+    if matching_dim(out_coords, y_stick_expr) is None:
+        generated_coord = next(
+            c for c in y_coords
             if len(c.free_symbols) > 0
             and matching_dim(out_coords, c) is not None
             and matching_dim(x_coords, c) is None
-        ),
-        None,
-    )
-    if reduction_coord is None or generated_coord is None:
-        raise Unsupported(
-            f"{data.reduction_type}: cannot identify reduction/generated coords"
         )
+    else:
+        generated_coord = y_stick_expr
 
     x_req_stl = _find_req_stl(x, reduction_coord)
     if x_req_stl is None:
         raise Unsupported(
-            f"{data.reduction_type}: no x layout satisfies reduction_coord={reduction_coord}"
+            f"{data.reduction_type}: cannot find x layout satisfying reduction stick constraint"
         )
     y_req_stl = _find_req_stl(y, generated_coord)
     if y_req_stl is None:
         raise Unsupported(
-            f"{data.reduction_type}: no y layout satisfies generated_coord={generated_coord}"
+            f"{data.reduction_type}: cannot find y layout satisfying generated stick constraint"
         )
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
