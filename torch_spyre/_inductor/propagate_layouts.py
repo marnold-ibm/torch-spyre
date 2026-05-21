@@ -353,6 +353,7 @@ def _matmul_layouts(
     #   Output:     stick on generated_dim
     reduction_coord = _find_reduction_coord(x_coords, out_coords)
     generated_coord = _matmul_generated_coord(y_coords, x_coords, out_coords)
+
     x_req_stl = find_stick_compatible_input_layout(
         x, x_coords, reduction_coord, data.reduction_type, "x"
     )
