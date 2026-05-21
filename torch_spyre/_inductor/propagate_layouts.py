@@ -281,6 +281,69 @@ def _layernormnorm_layout(
     return [out_stl]
 
 
+def _matmul_find_req_stl(
+    arg: "PropArg",
+    arg_coords,
+    target_coord,
+    reduction_type: str,
+    label: str,
+) -> "SpyreTensorLayout":
+    """Find the required STL for a matmul input by iterating all candidate layouts.
+
+    1. Return the first layout whose stick is already on target_coord (zero cost).
+    2. Else return the first layout that can be restickified to target_coord.
+    3. Else raise Unsupported.
+    """
+    arg_dev_coords = [device_coordinates(stl, arg.dep) for stl in arg.layouts]
+    target_dim = matching_dim(arg_coords, target_coord)
+
+    # Pass 1: already stick-compatible
+    for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
+        if matching_dim(arg_coords, dev_coords[-1]) == target_dim:
+            return stl
+
+    # Pass 2: can be restickified
+    for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
+        result = compute_restickify_target_layout(
+            stl, arg.layout, target_coord, arg_coords, dev_coords
+        )
+        if result is not None:
+            return result
+
+    raise Unsupported(
+        f"{reduction_type}: cannot restickify {label} to {label}_coord={target_coord}"
+    )
+
+
+def _matmul_reduction_coord(x_coords, out_coords):
+    """K dim: resolvable x coord whose loop variable does not appear in output."""
+    x_syms = {s for c in x_coords for s in c.free_symbols}
+    out_syms = {s for c in out_coords for s in c.free_symbols}
+    reduction_syms = x_syms - out_syms
+    if len(reduction_syms) != 1:
+        raise Unsupported(f"matmul: expected 1 reduction symbol, got {reduction_syms}")
+    sym = next(iter(reduction_syms))
+    return next(
+        c for c in x_coords
+        if sym in c.free_symbols and matching_dim(x_coords, c) is not None
+    )
+
+
+def _matmul_generated_coord(y_coords, x_coords, out_coords):
+    """N dim: resolvable y coord whose loop variable appears in output but not in x."""
+    y_syms = {s for c in y_coords for s in c.free_symbols}
+    x_syms = {s for c in x_coords for s in c.free_symbols}
+    out_syms = {s for c in out_coords for s in c.free_symbols}
+    generated_syms = (y_syms & out_syms) - x_syms
+    if len(generated_syms) != 1:
+        raise Unsupported(f"matmul: expected 1 generated symbol, got {generated_syms}")
+    sym = next(iter(generated_syms))
+    return next(
+        c for c in y_coords
+        if sym in c.free_symbols and matching_dim(y_coords, c) is not None
+    )
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -290,79 +353,27 @@ def _matmul_layouts(
     """
     Matmul has fixed in/out stick requirements so handled specially.
     Algorithm is
-       1. For both input args, compuate a layout that is representative
-       2. For output arg, compute the output layout
-       3. Construct the FixdInOutNode cost function
+       1. Compute reduction_coord (K) and generated_coord (N) from host geometry
+       2. For both input args, find a required STL with the correct stick
+       3. Compute the output STL and construct the FixedInOutNode cost function
     """
     data = op.data
     out_coords = host_coordinates(output, output_dep)
 
     x = args[0]
     y = args[1]
-    x_stl = next(iter(x.layouts))
-    y_stl = next(iter(y.layouts))
     x_coords = host_coordinates(x.layout, x.dep)
-    x_dev_coords = device_coordinates(x_stl, x.dep)
     y_coords = host_coordinates(y.layout, y.dep)
-    y_dev_coords = device_coordinates(y_stl, y.dep)
-
-    x_stick_expr = x_dev_coords[-1]
-    y_stick_expr = y_dev_coords[-1]
-    if (
-        matching_dim(x_coords, x_stick_expr) is None
-        or matching_dim(y_coords, y_stick_expr) is None
-    ):
-        raise Unsupported(
-            f"{data.reduction_type}: failed to map stick_dims to host coords"
-        )
 
     # Hardware stick constraints (DF16):
     #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
     #   Input2 (y): stick on generated_dim (the y coord that appears in output)
     #   Output:     stick on generated_dim
-    if matching_dim(out_coords, x_stick_expr) is not None:
-        reduction_coord = next(
-            c
-            for c in x_coords
-            if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-        )
-    else:
-        reduction_coord = x_stick_expr
+    reduction_coord = _matmul_reduction_coord(x_coords, out_coords)
+    generated_coord = _matmul_generated_coord(y_coords, x_coords, out_coords)
 
-    if matching_dim(out_coords, y_stick_expr) is None:
-        generated_coord = next(
-            c
-            for c in y_coords
-            if len(c.free_symbols) > 0
-            and matching_dim(out_coords, c) is not None
-            and matching_dim(x_coords, c) is None
-        )
-    else:
-        generated_coord = y_stick_expr
-
-    if reduction_coord == x_dev_coords[-1]:
-        x_req_stl = x_stl
-    else:
-        _x = compute_restickify_target_layout(
-            x_stl, x.layout, reduction_coord, x_coords, x_dev_coords
-        )
-        if _x is None:
-            raise Unsupported(
-                f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
-            )
-        x_req_stl = _x
-
-    if generated_coord == y_dev_coords[-1]:
-        y_req_stl = y_stl
-    else:
-        _y = compute_restickify_target_layout(
-            y_stl, y.layout, generated_coord, y_coords, y_dev_coords
-        )
-        if _y is None:
-            raise Unsupported(
-                f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
-            )
-        y_req_stl = _y
+    x_req_stl = _matmul_find_req_stl(x, x_coords, reduction_coord, data.reduction_type, "x")
+    y_req_stl = _matmul_find_req_stl(y, y_coords, generated_coord, data.reduction_type, "y")
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     if out_stick_dim is None:
