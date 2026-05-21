@@ -222,27 +222,6 @@ def _single_arg_op_layout(
                 return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
 
 
-def _stick_on_last_dim_req_stl(
-    arg: PropArg,
-) -> SpyreTensorLayout:
-    """Build the required-input STL with stick on arg's last logical dim."""
-    x_coords = host_coordinates(arg.layout, arg.dep)
-    last_dim_coord = x_coords[-1]
-    candidate = next(iter(arg.layouts))
-    cand_dev_coords = device_coordinates(candidate, arg.dep)
-    # Compare iter var ids: stick exprs may be wrapped (e.g. Mod(d1, 64)).
-    if iter_var_id(cand_dev_coords[-1]) == iter_var_id(last_dim_coord):
-        return candidate
-    req = compute_restickify_target_layout(
-        candidate, arg.layout, last_dim_coord, x_coords, cand_dev_coords
-    )
-    if req is None:
-        raise Unsupported(
-            f"cannot restickify to last logical dim (host_size={list(arg.layout.size)})"
-        )
-    return req
-
-
 def _exx2_layout(
     op: Operation,
     output: FixedLayout,
@@ -253,11 +232,14 @@ def _exx2_layout(
     Use FixedInOutNode to schedule a restickify if the input stick is elsewhere.
     """
     x = args[0]
+    x_coords = host_coordinates(x.layout, x.dep)
     out_dim_order = list(range(len(output.size))) + [-1]
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    req_in_stl = _stick_on_last_dim_req_stl(x)
+    req_in_stl = find_stick_compatible_input_layout(
+        x, x_coords, x_coords[-1], "exx2", "x"
+    )
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl])
     return [out_stl]
 
@@ -272,16 +254,19 @@ def _layernormnorm_layout(
     Use FixedInOutNode to schedule a restickify if x's stick is elsewhere.
     """
     x = args[0]
+    x_coords = host_coordinates(x.layout, x.dep)
     out_dim_order = list(range(len(output.size)))
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    req_in_stl = _stick_on_last_dim_req_stl(x)
+    req_in_stl = find_stick_compatible_input_layout(
+        x, x_coords, x_coords[-1], "layernormnorm", "x"
+    )
     op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl])
     return [out_stl]
 
 
-def _matmul_find_req_stl(
+def find_stick_compatible_input_layout(
     arg: "PropArg",
     arg_coords,
     target_coord,
@@ -311,36 +296,30 @@ def _matmul_find_req_stl(
             return result
 
     raise Unsupported(
-        f"{reduction_type}: cannot restickify {label} to {label}_coord={target_coord}"
+        f"{reduction_type}: cannot restickify any input layout of {label} to {label}_coord={target_coord}"
     )
 
 
-def _matmul_reduction_coord(x_coords, out_coords):
-    """K dim: resolvable x coord whose loop variable does not appear in output."""
-    x_syms = {s for c in x_coords for s in c.free_symbols}
-    out_syms = {s for c in out_coords for s in c.free_symbols}
-    reduction_syms = x_syms - out_syms
-    if len(reduction_syms) != 1:
-        raise Unsupported(f"matmul: expected 1 reduction symbol, got {reduction_syms}")
-    sym = next(iter(reduction_syms))
+def _find_reduction_coord(x_coords, out_coords):
+    """Reduction coord: x coord absent from output and resolvable in x."""
     return next(
-        c for c in x_coords
-        if sym in c.free_symbols and matching_dim(x_coords, c) is not None
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0
+        and matching_dim(out_coords, c) is None
+        and matching_dim(x_coords, c) is not None
     )
 
 
 def _matmul_generated_coord(y_coords, x_coords, out_coords):
-    """N dim: resolvable y coord whose loop variable appears in output but not in x."""
-    y_syms = {s for c in y_coords for s in c.free_symbols}
-    x_syms = {s for c in x_coords for s in c.free_symbols}
-    out_syms = {s for c in out_coords for s in c.free_symbols}
-    generated_syms = (y_syms & out_syms) - x_syms
-    if len(generated_syms) != 1:
-        raise Unsupported(f"matmul: expected 1 generated symbol, got {generated_syms}")
-    sym = next(iter(generated_syms))
+    """N dim: y coord present in output, absent from x, and resolvable in y."""
     return next(
-        c for c in y_coords
-        if sym in c.free_symbols and matching_dim(y_coords, c) is not None
+        c
+        for c in y_coords
+        if len(c.free_symbols) > 0
+        and matching_dim(out_coords, c) is not None
+        and matching_dim(x_coords, c) is None
+        and matching_dim(y_coords, c) is not None
     )
 
 
@@ -369,11 +348,15 @@ def _matmul_layouts(
     #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
     #   Input2 (y): stick on generated_dim (the y coord that appears in output)
     #   Output:     stick on generated_dim
-    reduction_coord = _matmul_reduction_coord(x_coords, out_coords)
+    reduction_coord = _find_reduction_coord(x_coords, out_coords)
     generated_coord = _matmul_generated_coord(y_coords, x_coords, out_coords)
 
-    x_req_stl = _matmul_find_req_stl(x, x_coords, reduction_coord, data.reduction_type, "x")
-    y_req_stl = _matmul_find_req_stl(y, y_coords, generated_coord, data.reduction_type, "y")
+    x_req_stl = find_stick_compatible_input_layout(
+        x, x_coords, reduction_coord, data.reduction_type, "x"
+    )
+    y_req_stl = find_stick_compatible_input_layout(
+        y, y_coords, generated_coord, data.reduction_type, "y"
+    )
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     if out_stick_dim is None:
@@ -487,11 +470,7 @@ def _topk_layouts(
     out_coords = host_coordinates(output, output_dep)
 
     # Reduction coordinate: in x's host coords but absent from output's host coords.
-    reduction_coord = next(
-        c
-        for c in x_coords
-        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-    )
+    reduction_coord = _find_reduction_coord(x_coords, out_coords)
     reduction_dim = matching_dim(x_coords, reduction_coord)
 
     # Coords that survive the reduction into the output.
