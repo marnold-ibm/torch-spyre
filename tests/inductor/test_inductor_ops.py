@@ -3530,6 +3530,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y = torch.randn(H * D, H * D, dtype=torch.float16) * 0.01
         self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
 
+    def test_matmul_1d_view_x(self):
+        # x is a 1D buffer viewed as 2D: inductor keeps the 1D buffer and uses
+        # a compound index, so reduction var must be found via symbol-set arithmetic.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x.view(A, B) @ y
+
+        x = torch.rand(A * B, dtype=torch.float16) * 0.01
+        y = torch.rand(B, C, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_cpu(self, op, x):
