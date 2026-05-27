@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import dataclasses
 from typing import Any
 
 import regex as re
@@ -24,6 +25,29 @@ from torch._inductor.ir import Operation
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("propagate_hints")
+
+
+@dataclasses.dataclass
+class DimHint:
+    dim_names: list[str]  # e.g. ["A"]
+    range_size: int  # full loop range, e.g. 256
+    split_count: int  # from slices={"A": 4}, e.g. 4
+    dim_index: int  # index into op.loop_var_dims / op.data.ranges
+    is_reduction: bool
+
+
+# op.nested_hints: list[list[DimHint]]
+#
+# One entry per nested spyre_hint scope, outermost first.
+# Each entry is the list of tensor dimensions tiled by that scope.
+#
+# Example — two nested hints:
+#   with spyre_hint(slices={"A": 2}):      # nested_hints[0]
+#       with spyre_hint(slices={"B": 4}):  # nested_hints[1]
+#           y = a + b
+#
+# nested_hints[0] = [DimHint(dim_names=["A"], split_count=2, ...)]
+# nested_hints[1] = [DimHint(dim_names=["B"], split_count=4, ...)]
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
