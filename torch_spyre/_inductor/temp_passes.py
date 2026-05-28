@@ -378,17 +378,24 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     operations in topological order and collect consecutive ops that carry
     identical hints into one group, breaking whenever the hint changes or an
     op has no hint at all.
+
+    If config.coarse_tiling_max_op_index is set, only ops at or before that
+    index in operations are eligible; ops beyond it are silently excluded.
     """
+    from . import config as spyre_config
+
+    max_idx = spyre_config.coarse_tiling_max_op_index
 
     def _key(op):
-        # Summarise an op's tiling intent as a hashable tuple so we can detect
-        # when consecutive ops share the same hint and belong in the same group.
-        # Reduction dims are excluded: coarse tiling only tiles compute dims.
         resolved = getattr(op, "spyre_hints", [])
         if not resolved:
             return None
         return (
-            tuple((h.split_count, h.dim_index) for h in resolved if not h.is_reduction)
+            tuple(
+                (h.split_count, tuple(sorted(h.dim_names)))
+                for h in resolved
+                if not h.is_reduction
+            )
             or None
         )  # all-reduction hint → treat as un-hinted
 
@@ -396,17 +403,20 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     current_ops: list[Operation] = []
     current_key = None
 
-    for op in operations:
+    for idx, op in enumerate(operations):
         if not isinstance(op, ComputedBuffer):
+            continue
+        if max_idx is not None and idx >= max_idx:
+            hints_logger.debug(
+                "hints_to_coarse_tile_groups: skipping %s (idx=%d >= max_op_index=%d)",
+                op.get_name(), idx, max_idx,
+            )
             continue
         key = _key(op)
 
         if key is not None and key == current_key:
-            # Same hint as the previous op: extend the current group.
             current_ops.append(op)
         else:
-            # Hint changed (or this op has no hint): flush the current group,
-            # then start a new one if this op is hinted.
             if current_ops and current_key is not None:
                 spec = _group_spec(current_ops[0].spyre_hints)
                 groups.append((current_ops, spec))
@@ -417,6 +427,15 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     if current_ops and current_key is not None:
         spec = _group_spec(current_ops[0].spyre_hints)
         groups.append((current_ops, spec))
+
+    summary = (
+        f"coarse_tile_groups: {len(groups)} group(s) formed"
+        + (f" (max_op_index={max_idx})" if max_idx is not None else "")
+    )
+    for i, group in enumerate(groups):
+        summary += f"\n  group {i}: [{', '.join(o.get_name() for o in group[0])}]"
+    print(summary)
+    hints_logger.info("%s", summary)
 
     return groups
 
