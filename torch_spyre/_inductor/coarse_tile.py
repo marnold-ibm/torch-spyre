@@ -69,6 +69,8 @@ from sympy import Expr
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
+    Layout,
+    Loops,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -696,6 +698,17 @@ def _divide_ranges(
     # Loops is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "ranges", ranges)
 
+    # Invalidate Loops-level caches that read ranges.
+    Loops.get_free_symbol_uses.clear_cache(data)
+    Loops.inner_fn_str.clear_cache(data)
+    Loops.inner_fn_opcount.clear_cache(data)
+    if isinstance(data, Reduction):
+        Reduction.get_free_symbol_uses.clear_cache(data)
+
+    # Invalidate ComputedBuffer-level caches derived from data.ranges.
+    ComputedBuffer.get_default_sizes_body.clear_cache(op)
+    ComputedBuffer.get_free_symbol_uses.clear_cache(op)
+
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     from torch._inductor.ir import FixedLayout, FlexibleLayout
 
@@ -713,6 +726,10 @@ def _divide_ranges(
 
     # Recompute contiguous strides for the smaller buffer.
     layout.stride = list(FlexibleLayout.contiguous_strides(new_size))
+
+    # Invalidate Layout- and ComputedBuffer-level caches that read size/stride.
+    Layout.get_free_symbol_uses.clear_cache(layout)
+    ComputedBuffer.get_free_symbol_uses.clear_cache(op)
 
     # Rebuild SpyreTensorLayout for the new host size, preserving the
     # within-stick dimension.  stride_map[-1] is the element stride of the
