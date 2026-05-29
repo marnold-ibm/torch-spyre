@@ -1197,19 +1197,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
         values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
 
-        _declare_tensor_dim("B", B)
-        _declare_tensor_dim("H", H)
-        _declare_tensor_dim("Lq", Lq)
-        _declare_tensor_dim("Lk", Lk)
-        _declare_tensor_dim("D", D)
-
         scale = 1.0 / math.sqrt(math.sqrt(D))
         lk_slices = Lk // block_size
 
         def flash(queries, keys, values):
-            _name_tensor_dims(queries, ["B", "H", "Lq", "D"])
-            _name_tensor_dims(keys, ["B", "H", "Lk", "D"])
-            _name_tensor_dims(values, ["B", "H", "Lk", "D"])
             output = torch.zeros_like(queries)
             M = torch.full(
                 (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
@@ -1234,18 +1225,31 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             exp_scores.transpose(-1, -2), values
                         )
                         M = max_running
-                        out = output / denominator.unsqueeze(-1)
-            return out
+            return output / denominator.unsqueeze(-1)
 
-        compare_with_cpu(
-            flash,
-            queries_t,
-            keys_t,
-            values_t,
-            run_compile=True,
-            run_eager=False,
-            atol=5.0,  # TODO: tighten once coarse tiling correctness is fixed
+        # CPU reference first, then device setup — matching the driver pattern exactly
+        ref = flash(queries_t, keys_t, values_t)
+
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+
+        result = torch.compile(flash)(queries_dev, keys_dev, values_dev).cpu()
+        torch.testing.assert_close(
+            result,
+            ref,
+            equal_nan=True,
+            atol=1.0,
             rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
 
