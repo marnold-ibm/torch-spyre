@@ -441,14 +441,16 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
         else:
             if current_ops and current_key is not None:
                 spec = _group_spec(_find_spec_op(current_ops).spyre_hints)
-                groups.append((current_ops, spec))
+                if spec:
+                    groups.append((current_ops, spec))
             current_ops = [op] if key is not None else []
             current_key = key
 
     # Flush the final group.
     if current_ops and current_key is not None:
         spec = _group_spec(_find_spec_op(current_ops).spyre_hints)
-        groups.append((current_ops, spec))
+        if spec:
+            groups.append((current_ops, spec))
 
     if hints_logger.isEnabledFor(logging.INFO):
         # Build an interleaved view: walk operations in order, emit group boundaries
