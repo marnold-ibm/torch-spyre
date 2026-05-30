@@ -156,6 +156,11 @@ class SpyreEmptyFallback(ir.ExternKernel):
         pass
 
     def should_allocate(self) -> bool:
+        # Pool-allocated buffers live in the intermediate pool managed by
+        # memory_planning — no separate spyre_empty_with_layout call needed.
+        layout = self.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return False
         return True
 
     def get_mutation_names(self) -> Sequence[str]:

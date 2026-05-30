@@ -22,7 +22,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger, _get_env_bool
 
 logger = get_inductor_logger("MEMORY_PLANNING")
@@ -193,6 +193,33 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     intermediates = {
         name for name in (written & read) - io_names if _is_intermediate(name)
     }
+
+    # Coarse-tile full buffers are ExternKernelSchedulerNode (excluded from
+    # non_kernel_nodes above) so they never enter written & read.  They are
+    # pre-seeded with allocation["pool"] = 0 in coarse_tile.py to signal that
+    # they need pool allocation; collect them here.
+    for n in nodes:
+        if not isinstance(n, ExternKernelSchedulerNode):
+            continue
+        buf_names = [dep.name for dep in n.read_writes.writes]
+        if not buf_names:
+            continue
+        name = buf_names[0]
+        buf = V.graph.get_buffer(name) if name else None
+        if not isinstance(buf, SpyreEmptyFallback):
+            continue
+        layout = buf.get_layout()
+        if (
+            isinstance(layout, FixedTiledLayout)
+            and layout.allocation.get("pool") == 0
+            and name not in io_names
+        ):
+            intermediates.add(name)
+            logger.debug(
+                "memory_planning: adding coarse-tile full buffer %s to intermediates",
+                name,
+            )
+
     if not intermediates:
         V.graph.pool_size = 0
         return nodes
@@ -206,6 +233,9 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     # Track (end_step, offset, size) so we can free blocks promptly.
     pending_frees: list[tuple[int, int, int]] = []
+    # Track allocation dict IDs already assigned to avoid double-assigning
+    # mutation aliases (e.g. a copy op and its target share one alloc dict).
+    assigned_alloc_ids: set[int] = set()
 
     for name, (start, end) in sorted_bufs:
         # Free any blocks whose live range ended before this start step.
@@ -218,14 +248,25 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
                 still_live.append(entry)
         pending_frees = still_live
 
+        buf = V.graph.get_buffer(name)
+        layout = buf.get_layout()
+        assert isinstance(layout, FixedTiledLayout)
+
+        # Skip buffers whose allocation dict was already assigned via a mutation
+        # alias (e.g. coarse_tile copy op shares its alloc dict with full_buf).
+        if id(layout.allocation) in assigned_alloc_ids:
+            logger.debug(
+                "memory_planning: %s shares alloc dict with already-assigned buffer, skipping",
+                name,
+            )
+            continue
+
         size = _compute_size_bytes(name)
         offset = allocator.allocate(size)
 
         # Assign HBM address directly to layout.allocation.
-        buf = V.graph.get_buffer(name)
-        layout = buf.get_layout()
-        assert isinstance(layout, FixedTiledLayout)
         layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
+        assigned_alloc_ids.add(id(layout.allocation))
 
         pending_frees.append((end, offset, size))
 

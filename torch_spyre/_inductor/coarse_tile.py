@@ -254,6 +254,13 @@ def _propagate_tiled_op(
     )
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
+    if not is_graph_output:
+        # Mark as pool-eligible: this buffer is an intermediate (written inside
+        # the tiled loop, read outside it) and must live in the pool, not a
+        # dedicated HBM slot.  Use sentinel value 0; memory_planning will
+        # replace it with the real pool address.
+        full_buf.layout.allocation["pool"] = 0
+
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
 
     if has_inside:
