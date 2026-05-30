@@ -1192,6 +1192,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
 
+        torch.manual_seed(0xAFFE)
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
         values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
