@@ -1346,7 +1346,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         from torch_spyre._inductor import spyre_hint
 
         torch.manual_seed(42)
-        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64  # Lk == Lq intentionally; same seq-len
 
         Q = torch.randn(B, H, Lq, D, dtype=torch.float16)
         V = torch.randn(B, H, Lk, D, dtype=torch.float16)

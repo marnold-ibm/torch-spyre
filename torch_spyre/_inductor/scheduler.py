@@ -77,24 +77,21 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     keys = list(it_space.keys())
 
     # Build a map from host-range index → iteration-space key index.
-    # The iteration space only contains symbols for non-unit ranges, so we
-    # walk op.data.ranges and assign the next it-space slot to each non-unit dim.
+    # loop_tiled_dims is only stamped on ComputedBuffer ops (Pointwise/Reduction),
+    # so data.ranges is always present here.  The iteration space simply omits
+    # unit-size dims, so we walk ranges and count only non-unit entries.
     host_to_it: dict[int, int] = {}
-    try:
-        ranges = ir_op.data.ranges
-        it_idx = 0
-        for host_idx, r in enumerate(ranges):
-            if int(r) != 1:
-                host_to_it[host_idx] = it_idx
-                it_idx += 1
-    except (AttributeError, TypeError):
-        return [keys[d] for d in dims_per_level[depth] if d < len(keys)]
+    it_idx = 0
+    for host_idx, r in enumerate(ir_op.data.ranges):
+        if int(r) != 1:
+            host_to_it[host_idx] = it_idx
+            it_idx += 1
 
     result = []
     for d in dims_per_level[depth]:
-        it_idx = host_to_it.get(d)
-        if it_idx is not None and it_idx < len(keys):
-            result.append(keys[it_idx])
+        mapped = host_to_it.get(d)
+        if mapped is not None and mapped < len(keys):
+            result.append(keys[mapped])
     return result
 
 
