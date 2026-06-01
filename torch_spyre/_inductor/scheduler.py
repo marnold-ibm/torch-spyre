@@ -57,6 +57,12 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     Uses ``loop_tiled_dims[depth]`` from the IR node and the SchedulerNode's
     ``iteration_space`` (which produces the same symbols as ``create_op_spec``
     uses to build ``OpSpec.tiled_symbols``).
+
+    ``loop_tiled_dims`` stores *host-range* dimension indices (indices into
+    ``op.data.ranges``), which include unit-size batch dimensions that are
+    skipped in the iteration space.  We must map host-range indices to
+    iteration-space key indices by walking ``op.data.ranges`` and counting
+    only the non-unit entries.
     """
     ir_op = sched_node.node
     if ir_op is None:
@@ -69,7 +75,27 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
         return []
     it_space = iteration_space(sched_node)
     keys = list(it_space.keys())
-    return [keys[d] for d in dims_per_level[depth] if d < len(keys)]
+
+    # Build a map from host-range index → iteration-space key index.
+    # The iteration space only contains symbols for non-unit ranges, so we
+    # walk op.data.ranges and assign the next it-space slot to each non-unit dim.
+    host_to_it: dict[int, int] = {}
+    try:
+        ranges = ir_op.data.ranges
+        it_idx = 0
+        for host_idx, r in enumerate(ranges):
+            if int(r) != 1:
+                host_to_it[host_idx] = it_idx
+                it_idx += 1
+    except (AttributeError, TypeError):
+        return [keys[d] for d in dims_per_level[depth] if d < len(keys)]
+
+    result = []
+    for d in dims_per_level[depth]:
+        it_idx = host_to_it.get(d)
+        if it_idx is not None and it_idx < len(keys):
+            result.append(keys[it_idx])
+    return result
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):

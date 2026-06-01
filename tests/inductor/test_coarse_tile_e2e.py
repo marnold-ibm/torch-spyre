@@ -120,6 +120,7 @@ def _groups_per_op_tiled_dim(operations: list[Operation]):
 class TestCoarseTileEndToEnd(InductorTestCase):
     def setUp(self):
         super().setUp()
+        _pnd.reset()
         torch.manual_seed(0xAFFE)
 
     # ------------------------------------------------------------------
@@ -464,6 +465,7 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
 
     def setUp(self):
         super().setUp()
+        _pnd.reset()
         torch.manual_seed(0xAFFE)
 
     # ------------------------------------------------------------------
@@ -743,6 +745,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     def setUp(self):
         super().setUp()
+        _pnd.reset()
         torch.manual_seed(0xAFFE)
 
     # ------------------------------------------------------------------
@@ -1200,19 +1203,22 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         def flash(queries, keys, values):
             scale = 1.0 / math.sqrt(math.sqrt(D))
 
-            output = torch.zeros_like(queries)
-            M = torch.full(
-                (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
-            )
+            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                output = torch.zeros_like(queries)
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                M = torch.full(
+                    (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
+                )
 
             with spyre_hint(slices={"B": 1}):
                 with spyre_hint(slices={"H": 4}):
                     with spyre_hint(slices={"Lk": Lk // block_size}):
                         keys_T = keys.transpose(-1, -2).contiguous()
 
-                        denominator = torch.zeros(
-                            (B, H, Lq), device=queries.device, dtype=torch.float16
-                        )
+                        with spyre_hint(named_dims=["B", "H", "Lq"]):
+                            denominator = torch.zeros(
+                                (B, H, Lq), device=queries.device, dtype=torch.float16
+                            )
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
                         block_max = torch.amax(scores, dim=-2)
@@ -1246,7 +1252,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             result,
             ref,
             equal_nan=True,
-            atol=2.0,
+            atol=0.2,
             rtol=0.1,
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )

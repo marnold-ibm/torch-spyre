@@ -52,30 +52,35 @@ logger = get_inductor_logger("codegen.unroll")
 def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> int:
     """Byte advance per loop iteration for a single TensorArg.
 
-    Computes the byte advance using:
-        delta[d] = coord_d(sym=tile_range, others=0) - coord_d(sym=0, others=0)
-        byte_stride = dot(delta, stride_map) * bytes_per_elem
+    For each device dimension d where the tiled symbol drives a non-zero delta,
+    the device stride (in elements) is the product of all device sizes below
+    dimension d: math.prod(device_size[d+1:]).  The total byte advance is:
 
-    This correctly handles non-linear device coordinates such as the stick
-    layout's ``floor(c/64)`` and ``Mod(c, 64)`` expressions.
+        sum over d where delta_d != 0:
+            delta_d * math.prod(device_size[d+1:]) * bytes_per_elem
+
+    Using device_size rather than stride_map is correct because the
+    device dimensions are row-major (device_size drives the strides), while
+    stride_map encodes host-memory layout information that is invalidated by
+    align_tensors reordering the device coordinates.
     """
-    assert arg.stride_map is not None, (
-        "_byte_stride_for_arg: TensorArg has no stride_map — "
-        "all TensorArgs reaching the unroller must be constructed with stride_map"
-    )
+    import math as _math
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
     sub_zero = {s: 0 for s in all_syms}
     sub_range = {**sub_zero, tiled_sym: tile_range}
     total_elem_stride = 0
+    n = len(arg.device_coordinates)
     for d, coord_expr in enumerate(arg.device_coordinates):
         at_range = int(coord_expr.subs(sub_range))
         at_zero = int(coord_expr.subs(sub_zero))
         delta = at_range - at_zero
         if delta == 0:
             continue
-        total_elem_stride += delta * arg.stride_map[d]
+        # Device stride for dim d = product of device sizes of all inner dims.
+        device_stride = _math.prod(arg.device_size[d + 1 :]) if d + 1 < n else 1
+        total_elem_stride += delta * device_stride
     return total_elem_stride * num_bytes(arg.device_dtype)
 
 
