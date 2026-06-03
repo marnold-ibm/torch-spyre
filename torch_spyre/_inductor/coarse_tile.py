@@ -29,29 +29,28 @@ A ``loop_group_id`` tuple encodes the nesting path:
 to innermost.  For a flat (depth-1) group this is a 1-element list ``[K]``.
 ``loop_tiled_dims`` is a *list of lists*, one sub-list per nesting level.
 
-Usage — flat (single loop)::
+Primary entry point — hint-driven (from spyre_hint annotations)::
+
+    groups = hints_to_coarse_tile_groups(operations)
+    coarse_tile(operations, groups=groups)
+
+Legacy entry point — explicit groups::
 
     coarse_tile(
         operations,
         groups=[
-            ([op_a, op_b], K),            # group 0: tile dim 0 by K (default)
-            ([op_c], K2, [0, 1]),          # group 1: tile dims 0 and 1 by K2
-        ],
-    )
-
-Usage — nested (two independent loops on one op)::
-
-    coarse_tile(
-        operations,
-        groups=[
-            ([op_a], [(K1, [0]), (K2, [1])]),  # outer K1 on dim 0; inner K2 on dim 1
+            ([op_a, op_b], K),             # flat: tile dim 0 by K (default)
+            ([op_c], K2, [0, 1]),           # flat: tile dims 0 and 1 by K2
+            ([op_d], [(0, K3, [0]),
+                      (1, K4, [1])]),       # nested: outer K3 on dim 0, inner K4 on dim 1
         ],
     )
 
 ``groups`` is a list of ``(ops, spec[, tiled_dims])`` tuples where ``spec`` is
 either:
-  - a scalar ``loop_count`` (optionally with a third ``tiled_dims`` element), or
-  - a list of ``(loop_count, tiled_dims)`` pairs for nested loops.
+  - a scalar ``loop_count`` (flat, optional third element overrides ``tiled_dims``), or
+  - a list of ``(hint_id, count)`` pairs (hints path, from hints_to_coarse_tile_groups),
+  - a list of ``(hint_id, count, tiled_dims)`` triples (legacy path, explicit dims).
 
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
@@ -63,6 +62,7 @@ whose results are consumed outside the loop.
 from __future__ import annotations
 
 
+import logging
 import sympy
 from sympy import Expr
 
@@ -80,8 +80,154 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from .logging_utils import get_inductor_logger
+from .propagate_hints import get_op_hints
+from .propagate_named_dims import op_out_coords, _lone_sym
 
 logger = get_inductor_logger("coarse_tile")
+hints_logger = get_inductor_logger("assign_dim_hints")
+
+
+# ---------------------------------------------------------------------------
+# Hint-driven group construction
+# ---------------------------------------------------------------------------
+
+
+def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
+    """Return the position of loop variable sym in op.data.ranges, or None.
+
+    Looks up sym in the op's output coordinates — the only reliable mapping
+    from a loop variable symbol to its data.ranges position, since dep var
+    numbering skips size-1 dims while data.ranges does not.
+    """
+    for i, coord in enumerate(out_coords):
+        if len(coord.free_symbols) == 1 and _lone_sym(coord) == sym:
+            return i
+    return None
+
+
+def _hints_levels(ops: list[Operation]) -> list[tuple]:
+    """Build (hint_id, K) level pairs from the first hinted op in the group.
+
+    All ops in the group share the same hint IDs and split counts — they are
+    inside the same spyre_hint() scopes, so the counts come from the scope
+    definition, not the op.  Any op with a non-None loop_var is representative.
+    Each op reads its own loop_var from dim_hints in _stamp_group.
+    """
+    for op in ops:
+        levels = [
+            (h.hint_id, sympy.Integer(h.split_count))
+            for h in getattr(op, "dim_hints", [])
+            if h.loop_var is not None and not h.is_reduction
+        ]
+        if levels:
+            return levels
+    return []
+
+
+def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
+    """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
+
+    coarse_tile() requires ops to be grouped: all ops in a group share the same
+    tiling spec and are tiled together inside the same loop nest.  We walk
+    operations in topological order and collect consecutive ops that carry
+    identical hints into one group, breaking whenever the hint changes or an
+    op has no hint at all.
+    """
+
+    def _key(op):
+        resolved = getattr(op, "dim_hints", [])
+        if not resolved:
+            return None
+        return frozenset(h.hint_id for h in resolved)
+
+    groups = []
+    current_ops: list[Operation] = []
+    current_key = None
+
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        key = _key(op)
+
+        if key is not None and key == current_key:
+            current_ops.append(op)
+        else:
+            if current_ops and current_key is not None:
+                levels = _hints_levels(current_ops)
+                if levels:
+                    groups.append((current_ops, levels))
+            current_ops = [op] if key is not None else []
+            current_key = key
+
+    # Flush the final group.
+    if current_ops and current_key is not None:
+        levels = _hints_levels(current_ops)
+        if levels:
+            groups.append((current_ops, levels))
+
+    if hints_logger.isEnabledFor(logging.INFO):
+        # Build an interleaved view: walk operations in order, emit group boundaries
+        # and ungrouped ops so the reader can see what breaks each consecutive run.
+        grouped_to_group_idx = {id(o): i for i, g in enumerate(groups) for o in g[0]}
+        # Pre-compute hint descriptions per group — get_op_hints is called once per
+        # group rather than once per op in the group.
+        group_hint_descs: dict[int, str] = {}
+        for g_idx, (group_ops, group_levels) in enumerate(groups):
+            spec_op = group_ops[0]
+            op_hints = get_op_hints(spec_op)
+            descs = [
+                f"hint_{hint_id}={op_hints[hint_id]}"
+                for hint_id, _ in group_levels
+                if hint_id in op_hints
+            ]
+            group_hint_descs[g_idx] = ", ".join(descs)
+
+        summary_lines = [f"coarse_tile_groups: {len(groups)} group(s) formed"]
+        pending_ungrouped: list[str] = []
+        last_group_idx: int | None = None
+        for o in operations:
+            if not isinstance(o, ComputedBuffer):
+                continue
+            g_idx = grouped_to_group_idx.get(id(o))
+            if g_idx is None:
+                hints = getattr(o, "dim_hints", [])
+                if hints:
+                    ids = sorted({h.hint_id for h in hints})
+                    reason = f"hint_ids={ids}"
+                else:
+                    reason = "no hints"
+                pending_ungrouped.append(f"{o.get_name()}({reason})")
+            else:
+                if g_idx != last_group_idx:
+                    if pending_ungrouped:
+                        summary_lines.append(
+                            f"  ungrouped: [{', '.join(pending_ungrouped)}]"
+                        )
+                        pending_ungrouped = []
+                    summary_lines.append(
+                        f"  group {g_idx} scopes=[{group_hint_descs[g_idx]}]:"
+                    )
+                    last_group_idx = g_idx
+                # Per-op tiling info.
+                tiling_dims = [
+                    f"{h.dim_names[0] if h.dim_names else '?'}x{h.split_count}"
+                    for h in getattr(o, "dim_hints", [])
+                    if h.loop_var is not None and not h.is_reduction
+                ]
+                aten_ops = [
+                    str(n.target)
+                    for n in getattr(o, "origins", [])
+                    if hasattr(n, "target")
+                ]
+                summary_lines.append(
+                    f"      {o.get_name()}  aten={aten_ops}"
+                    + (f"  tiles={tiling_dims}" if tiling_dims else "  (no tiled dims)")
+                )
+        if pending_ungrouped:
+            summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
+        hints_logger.info("%s", "\n".join(summary_lines))
+
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +263,16 @@ def coarse_tile(
         group_ops = group[0]
         levels: list[tuple[int, Expr, list[int]]] = group[1]
         group_id: tuple[int, ...] = (group_idx,)
+
+        if isinstance(spec, list):
+            # Nested spec: either (hint_id, count) pairs from hints path,
+            # or (hint_id, count, tiled_dims) triples from legacy path.
+            levels: list[tuple] = spec
+        else:
+            # Flat spec: scalar loop_count with optional tiled_dims override.
+            flat_tiled = group[2] if len(group) > 2 else tiled_dims
+            effective_dims: list[int] = [0] if flat_tiled is None else flat_tiled
+            levels = [(0, spec, effective_dims)]
 
         _stamp_group(group_ops, group_id, levels, op_to_position)
 
@@ -560,15 +716,16 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
 def _stamp_group(
     ops: list[Operation],
     group_id: tuple[int, ...],
-    levels: list[tuple[int, Expr, list[int]]],
+    levels: list[tuple],
     op_to_position: dict[str, int],
 ) -> None:
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
-    ``levels`` is a list of ``(hint_id, loop_count, tiled_dims)`` triples,
-    outermost first.  Each op's ranges are divided using its own dim_hints,
-    matched to the correct level by hint_id so that op-specific dim_index
-    values are used rather than the spec op's indices.
+    ``levels`` is either:
+    - hints path: list of ``(hint_id, count)`` pairs — each op reads its own
+      loop_var from dim_hints to find the correct ranges position.
+    - legacy path: list of ``(hint_id, count, tiled_dims)`` triples — tiled_dims
+      are positional indices applied uniformly to all ops in the group.
     """
     if not ops:
         return
@@ -587,21 +744,25 @@ def _stamp_group(
             )
             continue
 
-        # Each op carries its own dim_hints with per-op dim_index values (ops in
-        # the same group can have different iteration spaces, e.g. a broadcast op
-        # may lack the tiled dimension entirely).  Use the op's own dim_index;
-        # fall back to empty when the op has no matching dim for a level.
         op_hints = getattr(op, "dim_hints", [])
-        hint_id_to_dim_index: dict[int, int] = {
-            h.hint_id: h.dim_index
-            for h in op_hints
-            if h.dim_index is not None and not h.is_reduction
-        }
+        hint_id_to_ranges_pos: dict[int, int] = {}
+        if op_hints:
+            op_out = op_out_coords(op)
+            hint_id_to_ranges_pos = {
+                h.hint_id: pos
+                for h in op_hints
+                if h.loop_var is not None and not h.is_reduction
+                if (pos := _loop_var_to_ranges_pos(op_out, h.loop_var)) is not None
+            }
         op_tiled_dims: list[list[int]] = []
-        for hint_id, count, spec_dims in levels:
-            dim_index = hint_id_to_dim_index.get(hint_id)
-            if dim_index is not None:
-                effective = [dim_index]  # use this op's own dim_index
+        for hint_id, count, *rest in levels:
+            spec_dims = rest[0] if rest else None
+            if spec_dims is not None and not op_hints:
+                # Legacy path: uniform tiled_dims for all ops.
+                effective = spec_dims
+            elif (ranges_pos := hint_id_to_ranges_pos.get(hint_id)) is not None:
+                # Hints path: each op uses its own loop_var.
+                effective = [ranges_pos]
             else:
                 effective = []  # op has no dim for this level — loop-invariant
             op_tiled_dims.append(effective)
@@ -632,7 +793,7 @@ def _divide_ranges(
     op.data.reduction_ranges are left untouched.
 
     ``tiled_dims`` is a list of positional indices into ``data.ranges``.
-    Out-of-bounds indices are silently skipped.
+    All indices must be valid; an out-of-bounds index is a caller bug.
 
     Also updates ``op.layout.size``, ``op.layout.stride``, and
     ``op.layout.device_layout`` so the layout describes the smaller per-tile
@@ -649,15 +810,17 @@ def _divide_ranges(
         return
 
     for i in tiled_dims:
-        if i < 0 or i >= len(ranges):
-            continue
+        assert 0 <= i < len(ranges), (
+            f"coarse_tile: op {op.get_name()!r} tiled dim {i} out of bounds "
+            f"(ranges has {len(ranges)} entries)"
+        )
         r = ranges[i]
         if isinstance(r, (int, sympy.Integer)) and isinstance(
             loop_count, (int, sympy.Integer)
         ):
             if int(r) % int(loop_count) != 0:
                 raise RuntimeError(
-                    f"coarse_tile: op {op.get_name()!r} dimension {i} range {r} "
+                    f"coarse_tile: op {op.get_name()!r} loop var d{i} range {r} "
                     f"is not divisible by loop_count {loop_count}.  All tiled "
                     f"dimensions must be evenly divisible by the loop trip count."
                 )
@@ -679,8 +842,7 @@ def _divide_ranges(
 
     new_size = list(layout.size)
     for i in tiled_dims:
-        if 0 <= i < len(new_size):
-            new_size[i] = ranges[i]
+        new_size[i] = ranges[i]
     layout.size = new_size
 
     # Recompute contiguous strides for the smaller buffer.
