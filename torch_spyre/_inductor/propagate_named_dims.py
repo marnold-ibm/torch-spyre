@@ -243,7 +243,9 @@ def _compute_named_dims(op, inputs):
 
 def _log_dep_debug(label: str, dep: MemoryDep) -> None:
     buf = _get_buffer(dep)
-    layout = buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
+    layout = (
+        buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
+    )
     dpi = _get_dim_prop_info(dep)
     named_dims = dpi.named_dims if dpi is not None else []
     logger.debug(f"  {label} {dep.name}: named_dims={named_dims}")
@@ -266,7 +268,9 @@ def _log_op_inputs(op: ComputedBuffer) -> None:
             named_dims = dpi.named_dims if dpi is not None else "?"
             buf = _get_buffer(dep)
             host_size = (
-                list(buf.get_layout().size) if buf is not None and hasattr(buf, "get_layout") else "?"
+                list(buf.get_layout().size)
+                if buf is not None and hasattr(buf, "get_layout")
+                else "?"
             )
             logger.info(
                 f"    input {dep.name}: named_dims={named_dims}  host_size={host_size}"
@@ -323,7 +327,7 @@ def propagate_named_dims(
     global _enabled
     if not _enabled:
         return
-    if len(V.graph.graph_input_names) > 0:
+    if V.graph.graph_input_names:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
                 tb = V.graph.graph_inputs[name]
@@ -375,15 +379,16 @@ def propagate_named_dims(
             )
             rw = op.get_read_writes()
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
-            for dep in inputs:
-                _log_dep_debug("input", dep)
-            for dep in rw.writes:
-                if isinstance(dep, MemoryDep):
-                    _log_dep_debug("output", dep)
+            if logger.isEnabledFor(logging.DEBUG):
+                for dep in inputs:
+                    _log_dep_debug("input", dep)
+                for dep in rw.writes:
+                    if isinstance(dep, MemoryDep):
+                        _log_dep_debug("output", dep)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:
-                logger.warning(f"Warning: unhandled node type {type(op.data)}")
+                logger.warning(f"unhandled node type {type(op.data)}")
                 _set_no_named_dims(op)
         elif isinstance(op, SpyreConstantFallback):
             _set_no_named_dims(op)
@@ -391,19 +396,18 @@ def propagate_named_dims(
             logger.warning(f"unhandled operation type {type(op)}")
             _set_no_named_dims(op)
 
-    # LOG THE RESULTS
-    logger.info("DECLARED DIMS")
-    for name, size in _named_dims.items():
-        logger.info(f"  {name} = {size}")
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("DECLARED DIMS")
+        for name, size in _named_dims.items():
+            logger.info(f"  {name} = {size}")
 
-    logger.info("INPUT TENSORS")
-    for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
-        if isinstance(tb, TensorBox):
-            dp = getattr(tb, "_dim_prop_info", None)
-            logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
+        logger.info("INPUT TENSORS")
+        for name in V.graph.graph_input_names:
+            tb = V.graph.graph_inputs[name]
+            if isinstance(tb, TensorBox):
+                dp = getattr(tb, "_dim_prop_info", None)
+                logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
 
-    logger.info("OPS")
     for op in operations:
         _log_op(op)
     # Reset _enabled so that it does not leak True into the next compilation
@@ -429,21 +433,14 @@ def assign_dim_hints(operations: list[Operation]) -> None:
         if not isinstance(op, ComputedBuffer):
             continue
         dp = getattr(op, "_dim_prop_info", None)
-        if dp is None:
-            # No _dim_prop_info means propagate_named_dims didn't run or
-            # set no info — nothing to delete.
-            op.dim_hints = []  # type: ignore[attr-defined]
-            continue
-        if not dp.loop_var_dims:
-            op.dim_hints = []  # type: ignore[attr-defined]
-            del op._dim_prop_info  # type: ignore[attr-defined]
-            continue
-        op_hints = get_op_hints(op)
+        op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
         if not op_hints:
             op.dim_hints = []  # type: ignore[attr-defined]
-            del op._dim_prop_info  # type: ignore[attr-defined]
+            if dp is not None:
+                del op._dim_prop_info  # type: ignore[attr-defined]
             continue
 
+        assert dp is not None  # guaranteed by op_hints check above
         reduction_dims = set(dp.reduction_named_dims or [])
 
         coord_for_name: dict[str, sympy.Symbol] = {}
@@ -457,11 +454,11 @@ def assign_dim_hints(operations: list[Operation]) -> None:
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):
             # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim.
-            dims = next(
+            dims: dict[str, int] = next(
                 (
-                    hint_dict.get(k)
+                    v
                     for k in ("tiles", "slices", "num_tiles_per_dim")
-                    if hint_dict.get(k)
+                    if (v := hint_dict.get(k))
                 ),
                 {},
             )
