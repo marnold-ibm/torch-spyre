@@ -33,6 +33,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .pass_utils import host_coordinates, device_coordinates, op_out_coords
+from .ir import SpyreConstantFallback
 from .propagate_hints import DimHint, get_op_hints
 from .views import matching_dim, compute_coordinates
 from torch_spyre._C import SpyreTensorLayout
