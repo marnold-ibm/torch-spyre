@@ -66,7 +66,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
-from .propagate_named_dims import op_out_coords, _lone_sym
+from .pass_utils import op_out_coords
 
 logger = get_inductor_logger("coarse_tile")
 hints_logger = get_inductor_logger("assign_dim_hints")
@@ -85,7 +85,7 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     numbering skips size-1 dims while data.ranges does not.
     """
     for i, coord in enumerate(out_coords):
-        if len(coord.free_symbols) == 1 and _lone_sym(coord) == sym:
+        if len(coord.free_symbols) == 1 and next(iter(coord.free_symbols)) == sym:
             return i
     return None
 
@@ -124,6 +124,12 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
             levels = _hints_levels(current_ops)
             if levels:
                 groups.append((current_ops, levels))
+            else:
+                hints_logger.warning(
+                    "spyre_hint on [%s]: no op iterates over the hinted dimension "
+                    "— hint ignored",
+                    ", ".join(o.get_name() for o in current_ops),
+                )
 
     groups: list[tuple] = []
     current_ops: list[Operation] = []

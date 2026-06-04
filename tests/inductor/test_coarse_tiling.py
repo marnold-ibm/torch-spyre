@@ -168,12 +168,10 @@ def _make_op(data, name="op0"):
 def _make_hinted_op(data, name="op0", hints=((0, 0),)):
     """Return a fake ComputedBuffer with DimHints for use with coarse_tile().
 
-    coarse_tile() reads op.dim_hints to resolve which dimension each spec level
-    tiles.  ``hints`` is a sequence of (hint_id, dim_index) pairs, one per
-    tiling level.  hint_id must match the hint_id in the corresponding group
-    spec triple; dim_index is the index into op.data.ranges to tile.
-
-    loop_var uses the cN symbol convention — valid for mock ops where no
+    ``hints`` is a sequence of ``(hint_id, dim_index)`` pairs, one per tiling
+    level.  Each pair produces a DimHint whose ``loop_var`` is the symbol
+    ``c{dim_index}``, matching the mock output coords built by this helper
+    (``coords[i] = c{i}``).  This convention is valid for mock ops where no
     size-1 dims precede the tiled dimension.
     """
     import sympy

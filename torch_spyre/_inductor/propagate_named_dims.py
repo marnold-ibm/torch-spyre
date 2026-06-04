@@ -32,7 +32,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from .errors import Unsupported
-from .pass_utils import SpyreConstantFallback, host_coordinates, device_coordinates
+from .pass_utils import host_coordinates, device_coordinates, op_out_coords
 from .propagate_hints import DimHint, get_op_hints
 from .views import matching_dim, compute_coordinates
 from torch_spyre._C import SpyreTensorLayout
@@ -144,11 +144,6 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
                 f"continuing using range {actual_range}"
             )
     return result
-
-
-def op_out_coords(op: ComputedBuffer) -> list:
-    output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep)
 
 
 def coords_to_named_dims(coords: list, loop_var_dims: dict) -> list:
@@ -462,6 +457,15 @@ def assign_dim_hints(operations: list[Operation]) -> None:
                 ),
                 {},
             )
+            # TODO: support multiple dimensions per spyre_hint() call.
+            # hint_id_to_ranges_pos in _stamp_group would need to become
+            # dict[int, list[int]] and _hints_levels would need to deduplicate
+            # by hint_id.
+            assert len(dims) <= 1, (
+                f"spyre_hint() argument {list(hint_dict.items())} specifies "
+                f"{len(dims)} dimensions; only one is currently allowed per "
+                f"spyre_hint() call (not yet implemented)"
+            )
             for name, count in dims.items():
                 sym = coord_for_name.get(name)
                 dim_hints.append(
@@ -469,7 +473,7 @@ def assign_dim_hints(operations: list[Operation]) -> None:
                         dim_names=[name],
                         split_count=count,
                         loop_var=sym,
-                        is_reduction=name in reduction_dims and sym is not None,
+                        is_reduction=name in reduction_dims,
                         hint_id=hint_id,
                     )
                 )
