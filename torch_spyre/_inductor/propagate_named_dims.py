@@ -462,11 +462,12 @@ def assign_dim_hints(operations: list[Operation]) -> None:
             # hint_id_to_ranges_pos in _stamp_group would need to become
             # dict[int, list[int]] and _hints_levels would need to deduplicate
             # by hint_id.
-            assert len(dims) <= 1, (
-                f"spyre_hint() argument {list(hint_dict.items())} specifies "
-                f"{len(dims)} dimensions; only one is currently allowed per "
-                f"spyre_hint() call (not yet implemented)"
-            )
+            if len(dims) > 1:
+                raise NotImplementedError(
+                    f"spyre_hint() argument {list(hint_dict.items())} specifies "
+                    f"{len(dims)} dimensions; only one is currently allowed per "
+                    f"spyre_hint() call (not yet implemented)"
+                )
             for name, count in dims.items():
                 sym = coord_for_name.get(name)
                 dim_hints.append(
