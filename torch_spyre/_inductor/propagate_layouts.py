@@ -748,11 +748,12 @@ def compute_layouts(
             else []
         )
         logger.debug(f"--- compute_layouts: op={op_name} aten={aten_ops}")
+        cb = op if isinstance(op, ComputedBuffer) else None
         for i, arg in enumerate(args):
-            h_coords = host_coordinates(arg.layout, arg.dep)
+            h_coords = host_coordinates(arg.layout, arg.dep, cb)
             try:
                 dev_coords_per_stl = [
-                    device_coordinates(stl, arg.dep) for stl in arg.layouts
+                    device_coordinates(stl, arg.dep, cb) for stl in arg.layouts
                 ]
             except Exception as e:
                 dev_coords_per_stl = [f"<error: {e}>"]

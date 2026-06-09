@@ -215,19 +215,21 @@ def compute_coordinates(
     for var in vars:
         if var not in var_ranges:
             # Indirect index symbols (e.g. tmp0 from a gather) are not loop
-            # variables and have no entry in var_ranges.  Infer their range
-            # from the tensor layout: find the dimension whose stride equals
-            # this symbol's coefficient in the index, and use that dim's size.
+            # variables but carry coordinate information.  Infer their range
+            # from the layout: find the dim whose stride equals the symbol's
+            # coefficient in the index.
             term = index.xreplace({v: 0 for v in vars - {var}})
-            coeff = int(term.xreplace({var: 1}))
-            inferred_range = None
-            for dim in range(n):
-                if int(stride[dim]) == coeff and int(size[dim]) > 1:
-                    inferred_range = size[dim]
-                    break
-            if inferred_range is None:
+            try:
+                coeff = int(term.xreplace({var: 1}))
+            except (TypeError, ValueError):
                 continue
-            range_val = inferred_range
+            inferred = next(
+                (sz for st, sz in zip(stride, size) if int(st) == coeff and int(sz) > 1),
+                None,
+            )
+            if inferred is None:
+                continue
+            range_val = inferred
         else:
             range_val = var_ranges[var]
 

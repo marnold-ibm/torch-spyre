@@ -287,7 +287,43 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(op.get_layout(), output_dep)
 
 
-def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
+    """Map tmp/indirect symbols to IndexedBase[source_index] exprs for this op.
+
+    Finds deps whose indices have no indirect symbols — these are the sources
+    that fed the tmp symbols in other deps.  Matches positionally by order.
+    """
+    from sympy import IndexedBase
+    import regex as re
+
+    is_indirect = re.compile(r"indirect|tmp").search
+    rw = op.get_read_writes()
+    out_ranges = next(iter(rw.writes)).ranges
+
+    direct_deps = [
+        d for d in rw.reads
+        if isinstance(d, MemoryDep)
+        and not any(is_indirect(str(s)) for s in d.index.free_symbols)
+    ]
+    indirect_syms = sorted(
+        {s for d in rw.reads if isinstance(d, MemoryDep)
+         for s in d.index.free_symbols if s not in out_ranges},
+        key=str,
+    )
+    if not indirect_syms:
+        return {}
+
+    return {
+        sym: IndexedBase(dep.name)[dep.index]
+        for sym, dep in zip(indirect_syms, direct_deps)
+    }
+
+
+def host_coordinates(
+    layout: FixedLayout,
+    dep: MemoryDep,
+    op: "ComputedBuffer | None" = None,
+) -> list[sympy.Expr]:
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
     # coordinate expressions remain symbolic.
@@ -296,7 +332,12 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
+    coords = compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
+    if op is not None:
+        subs = _build_indirect_subs(op)
+        if subs:
+            coords = [c.xreplace(subs) for c in coords]
+    return coords
 
 
 def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
@@ -339,7 +380,11 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
         )
 
 
-def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def device_coordinates(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    op: "ComputedBuffer | None" = None,
+) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
@@ -349,6 +394,10 @@ def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Exp
         dep.ranges,
         index,
     )
+    if op is not None:
+        subs = _build_indirect_subs(op)
+        if subs:
+            coords = [c.xreplace(subs) for c in coords]
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
 
