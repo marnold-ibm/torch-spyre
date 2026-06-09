@@ -213,13 +213,23 @@ def compute_coordinates(
         add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
     for var in vars:
-        # Skip symbols that are not loop variables (e.g. size symbols
-        # injected by dynamic shapes that appear in the index expression
-        # but are not iteration variables).
         if var not in var_ranges:
-            continue
-
-        range_val = var_ranges[var]
+            # Indirect index symbols (e.g. tmp0 from a gather) are not loop
+            # variables and have no entry in var_ranges.  Infer their range
+            # from the tensor layout: find the dimension whose stride equals
+            # this symbol's coefficient in the index, and use that dim's size.
+            term = index.xreplace({v: 0 for v in vars - {var}})
+            coeff = int(term.xreplace({var: 1}))
+            inferred_range = None
+            for dim in range(n):
+                if int(stride[dim]) == coeff and int(size[dim]) > 1:
+                    inferred_range = size[dim]
+                    break
+            if inferred_range is None:
+                continue
+            range_val = inferred_range
+        else:
+            range_val = var_ranges[var]
 
         # Skip vars with trivial range.  For symbolic ranges we cannot
         # statically determine triviality, so we assume they are non-trivial.

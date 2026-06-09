@@ -740,6 +740,37 @@ def compute_layouts(
     1. Compute candidate output STLs given a set of STLs for each input arg.
     2. Attach a restick cost function based on the type of op.
     """
+    if logger.isEnabledFor(10):  # DEBUG
+        op_name = op.get_name() if hasattr(op, "get_name") else str(op)
+        aten_ops = (
+            [str(n.target) for n in op.data.origins]
+            if hasattr(op, "data") and hasattr(op.data, "origins")
+            else []
+        )
+        logger.debug(f"--- compute_layouts: op={op_name} aten={aten_ops}")
+        for i, arg in enumerate(args):
+            h_coords = host_coordinates(arg.layout, arg.dep)
+            try:
+                dev_coords_per_stl = [
+                    device_coordinates(stl, arg.dep) for stl in arg.layouts
+                ]
+            except Exception as e:
+                dev_coords_per_stl = [f"<error: {e}>"]
+            logger.debug(
+                f"  input[{i}] name={arg.dep.name}\n"
+                f"    index={arg.dep.index}  ranges={dict(arg.dep.ranges)}\n"
+                f"    host_size={[concretize_expr(s) for s in arg.layout.size]}\n"
+                f"    host_stride={[concretize_expr(s) for s in arg.layout.stride]}\n"
+                f"    host_coordinates={h_coords}\n"
+                + "".join(
+                    f"    STL[{j}]:\n"
+                    f"      device_size={list(stl.device_size)}\n"
+                    f"      stride_map={list(stl.stride_map)}\n"
+                    f"      device_coordinates={dev_coords_per_stl[j]}\n"
+                    for j, stl in enumerate(arg.layouts)
+                )
+            )
+
     data = op.data
 
     if len(args) > 1 and isinstance(data, Pointwise):
