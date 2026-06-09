@@ -239,7 +239,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # square matrices (M==K==N) correctly.
         # See propagate_layouts._topk_layouts for the same reduction-coord derivation.
         write_dep = next(iter(rw.writes))
-        out_coords = host_coordinates(op.get_layout(), write_dep)
+        out_coords = host_coordinates(op.get_layout(), write_dep, op)
 
         x_dep = None
         y_dep = None
@@ -251,8 +251,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             layout = buf.get_layout()
             if not isinstance(layout, FixedTiledLayout):
                 continue
-            h_coords = host_coordinates(layout, dep)
-            d_coords = device_coordinates(layout.device_layout, dep)
+            h_coords = host_coordinates(layout, dep, op)
+            d_coords = device_coordinates(layout.device_layout, dep, op)
             stick_expr = d_coords[-1]
             reduction_coord = next(
                 (

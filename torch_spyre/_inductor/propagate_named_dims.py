@@ -194,9 +194,9 @@ def get_input_named_dims(inputs: list, op=None) -> dict:
     return loop_var_dims
 
 
-def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
+def get_reduction_dim(dep: MemoryDep, out_coords: list, op: "ComputedBuffer | None") -> sympy.Symbol:
     """Return the reduction loop variable: the input coord absent from the output."""
-    in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep)
+    in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep, op)
     reduction_coord = next(
         c for c in in_coords if c.free_symbols and matching_dim(out_coords, c) is None
     )
@@ -229,7 +229,7 @@ def _compute_named_dims(op, inputs):
                 loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = get_reduction_dim(inputs[0], out_coords)
+        reduction_sym = get_reduction_dim(inputs[0], out_coords, op)
         if reduction_sym not in loop_var_dims:
             size = int(inputs[0].ranges[reduction_sym])
             loop_var_dims[reduction_sym] = [
@@ -244,7 +244,7 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep) -> None:
+def _log_dep_debug(label: str, dep: MemoryDep, op: "ComputedBuffer | None") -> None:
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -256,11 +256,11 @@ def _log_dep_debug(label: str, dep: MemoryDep) -> None:
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
-        logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
+        logger.debug(f"    host_coordinates={host_coordinates(layout, dep, op)}")
     stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
-        logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
+        logger.debug(f"    device_coordinates={device_coordinates(stl, dep, op)}")
     logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
 
 
@@ -379,10 +379,10 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
             if logger.isEnabledFor(logging.DEBUG):
                 for dep in inputs:
-                    _log_dep_debug("input", dep)
+                    _log_dep_debug("input", dep, op)
                 for dep in rw.writes:
                     if isinstance(dep, MemoryDep):
-                        _log_dep_debug("output", dep)
+                        _log_dep_debug("output", dep, op)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:

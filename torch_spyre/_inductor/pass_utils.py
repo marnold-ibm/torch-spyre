@@ -284,7 +284,7 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     """Return host coordinates for the output dep of a ComputedBuffer."""
     output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep)
+    return host_coordinates(op.get_layout(), output_dep, op)
 
 
 def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
@@ -322,7 +322,7 @@ def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
 def host_coordinates(
     layout: FixedLayout,
     dep: MemoryDep,
-    op: "ComputedBuffer | None" = None,
+    op: "ComputedBuffer | None",
 ) -> list[sympy.Expr]:
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
@@ -383,7 +383,7 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    op: "ComputedBuffer | None" = None,
+    op: "ComputedBuffer | None",
 ) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
@@ -653,6 +653,7 @@ def compute_restickify_needed(
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
+    op: "ComputedBuffer | None",
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -664,8 +665,8 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    idc = device_coordinates(in_stl, in_dep)
-    out_idc = device_coordinates(out_stl, out_dep)
+    idc = device_coordinates(in_stl, in_dep, op)
+    out_idc = device_coordinates(out_stl, out_dep, op)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
