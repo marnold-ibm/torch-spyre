@@ -56,8 +56,10 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        free: bool = False,
     ):
         self.dep = dep
+        self._free = free
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
@@ -98,6 +100,8 @@ class EdgeCostMap:
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> float:
         """Return the restick cost for (in_stl, target_stl), computing it on first access."""
+        if self._free:
+            return 0.0
         if target_stl not in self._cost[in_stl]:
             self._compute_and_cache_cost(in_stl, target_stl)
         return self._cost[in_stl][target_stl]
@@ -106,6 +110,8 @@ class EdgeCostMap:
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> "SpyreTensorLayout | None":
         """Return target STL for restickifying in_stl to be compatible with target_stl, or None if no restickify needed."""
+        if self._free:
+            return None
         if target_stl not in self._cost[in_stl]:
             self._compute_and_cache_cost(in_stl, target_stl)
         return self._layout[in_stl][target_stl]
@@ -150,10 +156,14 @@ class AllSameNode(RestickNodeCost):
     """Cost node for ops that require all inputs and the output to be stick compatible (eg pointwise ops)."""
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_dep, op):
+    def from_args(cls, args, out_layouts, out_dep, op, index_dep_names=()):
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
+            EdgeCostMap(
+                arg.dep, arg.layouts, out_layouts, out_dep, op,
+                free=arg.dep.name in index_dep_names,
+            )
+            for arg in args
         ]
         return cls(edge_costs)
 

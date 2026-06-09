@@ -287,31 +287,43 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(op.get_layout(), output_dep, op)
 
 
-def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
-    """Map tmp/indirect symbols to IndexedBase[source_index] exprs for this op.
+def index_role_dep_names(op: ComputedBuffer) -> set[str]:
+    """Return names of deps whose loaded values are used as indices in other loads."""
+    return {expr.base.name for expr in _build_indirect_subs(op).values()}
 
-    Finds deps whose indices have no indirect symbols — these are the sources
-    that fed the tmp symbols in other deps.  Matches positionally by order.
+
+def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
+    """Map indirect symbols to IndexedBase[source_index] exprs for this op.
+
+    Indirect symbols are free symbols in a dep's index that are not in that
+    dep's ranges — they are values produced by a prior load used as an index.
+    Index-producers are non-indirect deps whose name matches an indirect symbol.
     """
     from sympy import IndexedBase
-    import regex as re
 
-    is_indirect = re.compile(r"indirect|tmp").search
     rw = op.get_read_writes()
-    out_ranges = next(iter(rw.writes)).ranges
 
-    direct_deps = [
-        d for d in rw.reads
-        if isinstance(d, MemoryDep)
-        and not any(is_indirect(str(s)) for s in d.index.free_symbols)
-    ]
+    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
     indirect_syms = sorted(
-        {s for d in rw.reads if isinstance(d, MemoryDep)
-         for s in d.index.free_symbols if s not in out_ranges},
+        {s for d in reads for s in d.index.free_symbols if s not in d.ranges},
         key=str,
     )
     if not indirect_syms:
         return {}
+
+    direct_deps = [
+        d for d in reads
+        if not d.is_indirect()
+    ]
+    # We assume exactly one non-indirect dep (the index producer) per op that
+    # has indirect deps. PyTorch currently always isolates the gather in its own
+    # Pointwise op, so the add/exp following it never sees both the index tensor
+    # and a data tensor together. If this assert fires, a new fusion pattern has
+    # violated that assumption and the zip pairing below would be wrong.
+    assert len(direct_deps) == 1, (
+        f"_build_indirect_subs: expected 1 direct dep but found {len(direct_deps)} "
+        f"— zip pairing assumption violated in {op.get_name()}"
+    )
 
     return {
         sym: IndexedBase(dep.name)[dep.index]

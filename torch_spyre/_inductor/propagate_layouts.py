@@ -59,6 +59,7 @@ from .pass_utils import (
     concretize_expr,
     host_coordinates,
     device_coordinates,
+    index_role_dep_names,
     is_stick_expr_offset_free,
     iter_var_id,
 )
@@ -582,13 +583,15 @@ def _multi_arg_pointwise_layouts(
        2. Compute an out STL for each; fall back to alternate output dims if none survive.
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
+    index_names = index_role_dep_names(op)
 
-    # Collect all unique non-zero stick expressions from input layouts
+    # Collect all unique non-zero stick expressions from input layouts, skipping index tensors.
     stick_exprs = {
         stick_expr
         for arg in args
         for stl in arg.layouts
-        if (stick_expr := device_coordinates(stl, arg.dep)[-1]) != 0
+        if arg.dep.name not in index_names
+        and (stick_expr := device_coordinates(stl, arg.dep)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
@@ -674,7 +677,7 @@ def _multi_arg_pointwise_layouts(
             f"Multi-arg pointwise ({op.get_name()}): producing {len(results)} candidate output layouts."
         )
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op, index_names)
     return results
 
 
