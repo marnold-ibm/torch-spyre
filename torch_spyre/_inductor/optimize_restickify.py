@@ -161,6 +161,9 @@ class AllSameNode(RestickNodeCost):
         edge_costs = [
             EdgeCostMap(
                 arg.dep, arg.layouts, out_layouts, out_dep, op,
+                # Index tensors have no stick-compatibility constraints.
+                # Mark them free so the optimizer can choose the best layout
+                # for the value tensor without the index tensor interfering.
                 free=arg.dep.name in index_dep_names,
             )
             for arg in args

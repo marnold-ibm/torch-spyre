@@ -337,7 +337,18 @@ class _IndexProducerFinder:
 
 
 def _find_index_producers(op: ComputedBuffer) -> dict[str, str]:
-    """Re-execute inner_fn and return {indirect_buf: index_buf} mapping."""
+    """
+    Re-execute inner_fn and return {indirect_buf: index_buf} mapping.
+    
+    NOTE: This is Claude's proposal on how to identify which buffer plays the role of 
+          index tensor (i.e. whose loaded value is used as an index into another buffer).
+          Value tensors are easy (just call is_indirect()) but finding the dep that produced 
+          the index is more challenging.
+
+          Also note this is only needed once we enable fusion and have more than 1 non-value
+          input, such as you will get with 'a[i] + b' (currently disabled, but will enable
+          once we have handle on SDSC generation)
+    """
     from torch._inductor.virtualized import V as _V
     finder = _IndexProducerFinder()
     with _V.set_ops_handler(finder):
@@ -393,6 +404,11 @@ def host_coordinates(
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     index = concretize_index(dep.index, set(dep.ranges.keys()))
     coords = compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
+
+    # NOTE: It is not clear we need to do this injection of indirect accesses 
+    #       for all calls to host_coordinates. It may turn out we only need this
+    #       downstream in align_tensors and OpSpec generation, so we should not be
+    #       poluting all users of host_coordinates until then.  Being investigated 
     if op is not None:
         subs = _build_indirect_subs(op)
         if subs:
@@ -454,6 +470,11 @@ def device_coordinates(
         dep.ranges,
         index,
     )
+
+    # NOTE: It is not clear we need to do this injection of indirect accesses 
+    #       for all calls to host_coordinates. It may turn out we only need this
+    #       downstream in align_tensors and OpSpec generation, so we should not be
+    #       poluting all users of host_coordinates until then.  Being investigated 
     if op is not None:
         subs = _build_indirect_subs(op)
         if subs:
