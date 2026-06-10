@@ -25,16 +25,16 @@ import torch
 
 
 class IndexLoad(Function):
-    """Sympy function representing a gather: IndexLoad(tensor_name, flat_index).
+    """Sympy function representing a gather: IndexLoad(tensor_name).
 
     Used in TensorArg.device_coordinates to encode indirect (gather) access.
-    The first argument is a Symbol whose name is the source tensor's name.
-    The second argument is the flat index expression (in terms of loop vars).
+    The argument is a Symbol whose name is the source tensor's name.
+    Means: "the value loaded from that tensor at the current iteration point".
     Survives sympify round-trips when IndexLoad is in the local namespace.
     """
 
     @classmethod
-    def eval(cls, name, index):  # noqa: ARG003
+    def eval(cls, name):  # noqa: ARG003
         return None  # keep unevaluated
 
 

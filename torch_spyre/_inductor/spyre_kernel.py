@@ -469,7 +469,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         return self
 
     def create_tensor_arg(
-        self, is_input: bool, name: str, tensor: TensorAccess
+        self,
+        is_input: bool,
+        name: str,
+        tensor: TensorAccess,
+        opspec_name: "str | None" = None,
     ) -> TensorArg:
         it_space = iteration_space(self.current_node)
         # With dynamic=True the host index may contain symbolic strides
@@ -492,7 +496,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.allocation,
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
-            name=name,
+            name=opspec_name,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -670,10 +674,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 args = []
                 for sym in sorted(indirect_syms, key=str):
                     idx_tensor = self.indirect_vars[sym]
-                    idx_arg = self.create_tensor_arg(True, idx_tensor.name, idx_tensor)
+                    idx_arg = self.create_tensor_arg(
+                        True, idx_tensor.name, idx_tensor,
+                        opspec_name=idx_tensor.name,
+                    )
                     args.append(idx_arg)
-                    flat_idx = concretize_index(idx_tensor.index, set(it_space.keys()))
-                    indirect_subs[sym] = IndexLoad(sympy.Symbol(idx_tensor.name), flat_idx)
+                    indirect_subs[sym] = IndexLoad(sympy.Symbol(idx_tensor.name))
                 value_arg = self.create_tensor_arg(True, value.name, value)
                 value_arg.device_coordinates = [
                     sympy_subs(c, indirect_subs)
@@ -785,10 +791,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         def sympy_str(x: sympy.Expr) -> str:
             from torch_spyre._inductor.op_spec import IndexLoad
             if isinstance(x, IndexLoad):
-                # IndexLoad(name_sym, idx) — emit as a direct Python call so the
-                # generated file does not need sympify to parse subscript syntax.
-                name_sym, idx = x.args
-                return f"IndexLoad(sympify('{name_sym}'), sympify('{idx}'))"
+                name_sym = x.args[0]
+                return f"IndexLoad('{name_sym}')"
             return "sympify('" + str(x) + "')"
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices

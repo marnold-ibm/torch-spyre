@@ -275,7 +275,7 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
-        if isinstance(arg, MemoryDep):
+        if isinstance(arg, MemoryDep) and not arg.is_indirect():
             buf = V.graph.get_buffer(arg.name)
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
