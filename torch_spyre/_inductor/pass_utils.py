@@ -293,42 +293,35 @@ def index_role_dep_names(op: ComputedBuffer) -> set[str]:
 
 
 def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
-    """Map indirect symbols to IndexedBase[source_index] exprs for this op.
+    """Map the single indirect symbol to IndexedBase[source_index] for this op.
 
-    Indirect symbols are free symbols in a dep's index that are not in that
-    dep's ranges — they are values produced by a prior load used as an index.
-    Index-producers are non-indirect deps whose name matches an indirect symbol.
+    An indirect symbol is a free symbol in an indirect dep's index that is not
+    in that dep's ranges — it is the runtime value loaded by the index tensor
+    and used as a gather index.  The index producer is the one non-indirect dep.
+
+    Assumes exactly one indirect symbol and one direct (index-producer) dep.
+    This holds as long as PyTorch isolates each gather in its own Pointwise op.
     """
     from sympy import IndexedBase
 
     rw = op.get_read_writes()
-
     reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
-    indirect_syms = sorted(
-        {s for d in reads for s in d.index.free_symbols if s not in d.ranges},
-        key=str,
-    )
-    if not indirect_syms:
+
+    if not any(d.is_indirect() for d in reads):
         return {}
 
-    direct_deps = [
-        d for d in reads
-        if not d.is_indirect()
-    ]
-    # We assume exactly one non-indirect dep (the index producer) per op that
-    # has indirect deps. PyTorch currently always isolates the gather in its own
-    # Pointwise op, so the add/exp following it never sees both the index tensor
-    # and a data tensor together. If this assert fires, a new fusion pattern has
-    # violated that assumption and the zip pairing below would be wrong.
-    assert len(direct_deps) == 1, (
-        f"_build_indirect_subs: expected 1 direct dep but found {len(direct_deps)} "
-        f"— zip pairing assumption violated in {op.get_name()}"
+    direct_deps = [d for d in reads if not d.is_indirect()]
+    indirect_syms = sorted(
+        {s for d in reads if d.is_indirect() for s in d.index.free_symbols if s not in d.ranges},
+        key=str,
+    )
+    assert len(direct_deps) == 1 and len(indirect_syms) == 1, (
+        f"_build_indirect_subs: expected exactly 1 direct dep and 1 indirect symbol, "
+        f"got {len(direct_deps)} direct deps and {len(indirect_syms)} indirect syms "
+        f"in {op.get_name()}"
     )
 
-    return {
-        sym: IndexedBase(dep.name)[dep.index]
-        for sym, dep in zip(indirect_syms, direct_deps)
-    }
+    return {indirect_syms[0]: IndexedBase(direct_deps[0].name)[direct_deps[0].index]}
 
 
 def host_coordinates(

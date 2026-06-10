@@ -432,6 +432,11 @@ class SpyreKernelOpsHandler(DefaultHandler):
         check: bool = True,
         wrap_neg: bool = True,
     ) -> sympy.Symbol:
+        if isinstance(index_var, TensorAccess):
+            sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
+            self.kernel._indirect_var_count += 1
+            self.kernel.indirect_vars[sym] = index_var
+            return sym
         return sympy_index_symbol(str(index_var))
 
     def scan(
@@ -453,6 +458,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
+        self.indirect_vars: dict[sympy.Symbol, TensorAccess] = {}
+        self._indirect_var_count: int = 0
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -646,13 +653,29 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info.update(value.op_info)
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
-            # Reshapes, transposes, and other dataops
-            args = [
-                self.create_tensor_arg(True, value.name, value),
-                self.create_tensor_arg(False, real_dst_name, dst),
-            ]
-            in_coords = args[0].device_coordinates
-            out_coords = args[1].device_coordinates
+            # Reshapes, transposes, and other dataops.
+            # Detect gather: any free symbol in value.index that was produced by
+            # indirect_indexing (stashed in self.indirect_vars during tracing).
+            indirect_syms = {
+                s for s in value.index.free_symbols if s in self.indirect_vars
+            }
+            if indirect_syms:
+                # Gather: add each index tensor as a first-class TensorArg input.
+                args = []
+                for sym in sorted(indirect_syms, key=str):
+                    idx_tensor = self.indirect_vars[sym]
+                    args.append(self.create_tensor_arg(True, idx_tensor.name, idx_tensor))
+                args += [
+                    self.create_tensor_arg(True, value.name, value),
+                    self.create_tensor_arg(False, real_dst_name, dst),
+                ]
+            else:
+                args = [
+                    self.create_tensor_arg(True, value.name, value),
+                    self.create_tensor_arg(False, real_dst_name, dst),
+                ]
+            in_coords = args[-2].device_coordinates
+            out_coords = args[-1].device_coordinates
             if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
                 # Broadcast: scalar input expanding to non-scalar output.
                 op = IDENTITY_OP
@@ -874,19 +897,33 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
+def _has_indirect(arg: TensorArg, it_space: dict) -> bool:
+    """Return True if any coordinate of arg contains a symbol not in it_space."""
+    return any(
+        sym not in it_space
+        for coord in arg.device_coordinates
+        for sym in coord.free_symbols
+    )
+
+
 def simplify_op_spec(op_spec):
+    it_space = op_spec.iteration_space
+
+    # Separate args with indirect symbols (gather value tensors) from the rest.
+    # align_tensors cannot handle indirect symbols — they are opaque runtime
+    # values, not loop variables. Pass only the non-indirect args through
+    # align_tensors; reintegrate the indirect args unchanged afterward.
+    indirect_set = {i for i, arg in enumerate(op_spec.args) if _has_indirect(arg, it_space)}
+    non_indirect_args = [arg for i, arg in enumerate(op_spec.args) if i not in indirect_set]
+
     new_op_space_splits, new_tensors = align_tensors(
-        op_spec.iteration_space,
-        [
-            {
-                "size": arg.device_size,
-                "coordinates": arg.device_coordinates,
-            }
-            for arg in op_spec.args
-        ],
+        it_space,
+        [{"size": arg.device_size, "coordinates": arg.device_coordinates}
+         for arg in non_indirect_args],
     )
     op_spec.iteration_space = new_op_space_splits
-    for arg, t in zip(op_spec.args, new_tensors):
+
+    for arg, t in zip(non_indirect_args, new_tensors):
         old_coords = arg.device_coordinates
         old_stride_map = arg.stride_map
         arg.device_size = t["size"]

@@ -366,6 +366,11 @@ def normalize_coordinates(
                 assert offset == 0
                 terms.append(Term(None, None, None, None, dim_size))
             continue
+        # If all free symbols are indirect (not loop vars), pass the raw
+        # coordinate through as an opaque offset on a var=None term.
+        if not vars.issubset(var_ranges.keys()):
+            terms.append(Term(None, None, None, None, dim_size, offset=coordinate))
+            continue
         dim_terms = []  # terms for current dimension
         for var in vars:
             # extract term for each var
@@ -578,10 +583,10 @@ def align_tensors(
         ]:
             # for each term except last one (stick dim)
             if var is None:
-                assert offset == sympy.S.Zero
-                # dimension is not iterated over, keep as is
+                # offset holds either 0 (broadcast/scalar dim) or an opaque
+                # indirect expression (e.g. indirect0) that must pass through unchanged.
                 size.append(dim_size)
-                coordinates.append(sympy.S.Zero)
+                coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
             low = (
