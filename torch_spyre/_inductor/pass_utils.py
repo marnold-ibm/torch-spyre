@@ -292,15 +292,65 @@ def index_role_dep_names(op: ComputedBuffer) -> set[str]:
     return {expr.base.name for expr in _build_indirect_subs(op).values()}
 
 
+class _LoadSentinel:
+    """Opaque token returned by load(); carries the buffer name through ops."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _IndexProducerFinder:
+    """Re-executes inner_fn to discover which buffer's load feeds each indirect load.
+
+    load() returns a _LoadSentinel carrying the buffer name.
+    indirect_indexing() receives that sentinel and records which buffer was
+    used as the index, so the next load() call can record the relationship.
+    All other ops delegate to MockHandler.
+
+    No tmpN symbol names, no KernelFormatterHandler, no coupling to
+    get_read_writes internals.
+    """
+
+    def __init__(self):
+        from torch._inductor.ops_handler import MockHandler
+        self._mock = MockHandler()
+        self._pending_index_buf: str | None = None
+        # indirect_buf_name -> index_buf_name
+        self.index_producer_by_buf: dict[str, str] = {}
+
+    def load(self, name: str, index):
+        # Assumes indirect_indexing is immediately followed by the indirect
+        # load with no intervening ops — true for simple gather patterns but
+        # would break for e.g. x[f(i)] where f involves additional loads.
+        if self._pending_index_buf is not None:
+            self.index_producer_by_buf[name] = self._pending_index_buf
+            self._pending_index_buf = None
+        return _LoadSentinel(name)
+
+    def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
+        if isinstance(index_var, _LoadSentinel):
+            self._pending_index_buf = index_var.name
+        return sympy.S.Zero
+
+    def __getattr__(self, attr):
+        return getattr(self._mock, attr)
+
+
+def _find_index_producers(op: ComputedBuffer) -> dict[str, str]:
+    """Re-execute inner_fn and return {indirect_buf: index_buf} mapping."""
+    from torch._inductor.virtualized import V as _V
+    finder = _IndexProducerFinder()
+    with _V.set_ops_handler(finder):
+        op.data.inner_fn(*op.data.inner_fn_args())
+    return finder.index_producer_by_buf
+
+
 def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
-    """Map the single indirect symbol to IndexedBase[source_index] for this op.
+    """Map indirect symbols in MemoryDep.index to IndexedBase[source_index] exprs.
 
-    An indirect symbol is a free symbol in an indirect dep's index that is not
-    in that dep's ranges — it is the runtime value loaded by the index tensor
-    and used as a gather index.  The index producer is the one non-indirect dep.
-
-    Assumes exactly one indirect symbol and one direct (index-producer) dep.
-    This holds as long as PyTorch isolates each gather in its own Pointwise op.
+    Re-executes inner_fn with _IndexProducerFinder to learn which buffer's
+    load produced each indirect index, then matches that to the MemoryDep for
+    the indirect buffer to build substitution expressions.
     """
     from sympy import IndexedBase
 
@@ -310,18 +360,23 @@ def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
     if not any(d.is_indirect() for d in reads):
         return {}
 
-    direct_deps = [d for d in reads if not d.is_indirect()]
-    indirect_syms = sorted(
-        {s for d in reads if d.is_indirect() for s in d.index.free_symbols if s not in d.ranges},
-        key=str,
-    )
-    assert len(direct_deps) == 1 and len(indirect_syms) == 1, (
-        f"_build_indirect_subs: expected exactly 1 direct dep and 1 indirect symbol, "
-        f"got {len(direct_deps)} direct deps and {len(indirect_syms)} indirect syms "
-        f"in {op.get_name()}"
-    )
+    # {indirect_buf_name: index_buf_name}
+    index_producer = _find_index_producers(op)
+    dep_by_name = {d.name: d for d in reads}
 
-    return {indirect_syms[0]: IndexedBase(direct_deps[0].name)[direct_deps[0].index]}
+    result = {}
+    for d in reads:
+        if not d.is_indirect():
+            continue
+        index_buf = index_producer.get(d.name)
+        if index_buf is None:
+            continue
+        index_dep = dep_by_name[index_buf]
+        for sym in d.index.free_symbols:
+            if sym not in d.ranges:
+                result[sym] = IndexedBase(index_dep.name)[index_dep.index]
+
+    return result
 
 
 def host_coordinates(
