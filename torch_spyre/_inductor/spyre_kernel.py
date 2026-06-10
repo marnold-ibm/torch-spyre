@@ -492,6 +492,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.allocation,
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
+            name=name,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -660,13 +661,26 @@ class SpyreKernel(Kernel[CSEVariable]):
                 s for s in value.index.free_symbols if s in self.indirect_vars
             }
             if indirect_syms:
-                # Gather: add each index tensor as a first-class TensorArg input.
+                # Gather: add each index tensor as a first-class TensorArg input,
+                # then replace each indirect symbol in the value tensor's coordinates
+                # with IndexedBase(index_tensor_name)[flat_index].
+                from torch_spyre._inductor.op_spec import IndexLoad
+                it_space = iteration_space(self.current_node)
+                indirect_subs: dict[sympy.Expr, sympy.Expr] = {}
                 args = []
                 for sym in sorted(indirect_syms, key=str):
                     idx_tensor = self.indirect_vars[sym]
-                    args.append(self.create_tensor_arg(True, idx_tensor.name, idx_tensor))
+                    idx_arg = self.create_tensor_arg(True, idx_tensor.name, idx_tensor)
+                    args.append(idx_arg)
+                    flat_idx = concretize_index(idx_tensor.index, set(it_space.keys()))
+                    indirect_subs[sym] = IndexLoad(sympy.Symbol(idx_tensor.name), flat_idx)
+                value_arg = self.create_tensor_arg(True, value.name, value)
+                value_arg.device_coordinates = [
+                    sympy_subs(c, indirect_subs)
+                    for c in value_arg.device_coordinates
+                ]
                 args += [
-                    self.create_tensor_arg(True, value.name, value),
+                    value_arg,
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
             else:
@@ -769,6 +783,12 @@ class SpyreKernel(Kernel[CSEVariable]):
             simplify_op_spec(op_spec)
 
         def sympy_str(x: sympy.Expr) -> str:
+            from torch_spyre._inductor.op_spec import IndexLoad
+            if isinstance(x, IndexLoad):
+                # IndexLoad(name_sym, idx) — emit as a direct Python call so the
+                # generated file does not need sympify to parse subscript syntax.
+                name_sym, idx = x.args
+                return f"IndexLoad(sympify('{name_sym}'), sympify('{idx}'))"
             return "sympify('" + str(x) + "')"
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
@@ -892,6 +912,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(f"stride_map={arg.stride_map!r},")
                             if arg.per_tile_fixed:
                                 buf.writeline("per_tile_fixed=True,")
+                            if arg.name is not None:
+                                buf.writeline(f"name={arg.name!r},")
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")

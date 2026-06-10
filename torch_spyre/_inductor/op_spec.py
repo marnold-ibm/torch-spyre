@@ -18,9 +18,24 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Sequence
 
-from sympy import Symbol, Expr
+import sympy
+from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats
 import torch
+
+
+class IndexLoad(Function):
+    """Sympy function representing a gather: IndexLoad(tensor_name, flat_index).
+
+    Used in TensorArg.device_coordinates to encode indirect (gather) access.
+    The first argument is a Symbol whose name is the source tensor's name.
+    The second argument is the flat index expression (in terms of loop vars).
+    Survives sympify round-trips when IndexLoad is in the local namespace.
+    """
+
+    @classmethod
+    def eval(cls, name, index):  # noqa: ARG003
+        return None  # keep unevaluated
 
 
 @dataclasses.dataclass
@@ -46,6 +61,7 @@ class TensorArg:
     allocation: Any
     stride_map: list[int] | None = None
     per_tile_fixed: bool = False
+    name: str | None = None
 
 
 @dataclasses.dataclass
