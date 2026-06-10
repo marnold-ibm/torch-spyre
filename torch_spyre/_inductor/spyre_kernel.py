@@ -27,7 +27,7 @@ from torch._inductor.codegen.common import (
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
-from torch._inductor.utils import IndentedBuffer, sympy_subs
+from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
 
 from .constants import (
@@ -424,6 +424,15 @@ class SpyreKernelOpsHandler(DefaultHandler):
             return ReductionOp(reduction_type, list(value))
         else:
             return ReductionOp(reduction_type, [value])
+
+    def indirect_indexing(
+        self,
+        index_var: Any,
+        size: Any,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        return sympy_index_symbol(str(index_var))
 
     def scan(
         self,
