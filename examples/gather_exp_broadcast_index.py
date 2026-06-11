@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal gather+exp: x[:, i].exp() to isolate index-select + unary fusion."""
+"""gather+exp with broadcast on index: i is expanded from (P, 1) to (P, Q)."""
 
 import torch
 import torch_spyre._inductor.propagate_named_dims as pnd
@@ -28,19 +28,18 @@ P = 3
 Q = 192
 
 x = torch.rand(M, N, dtype=torch.float16)
-i = torch.randint(0, 128, (P, Q), dtype=torch.int32)
+i_base = torch.randint(0, M, (P, 1), dtype=torch.int32)
+i = i_base.expand(P, Q)
 
 
-# CPU reference
 def kernel(x, i):
     return x[i].exp()
 
 
 ref = kernel(x, i)
 
-# Device run
 x_dev = x.to("spyre")
-i_dev = i.to("spyre")
+i_dev = i_base.to("spyre").expand(P, Q)
 
 declare_tensor_dim("M", M)
 declare_tensor_dim("N", N)

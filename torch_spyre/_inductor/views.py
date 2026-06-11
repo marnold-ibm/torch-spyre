@@ -131,6 +131,7 @@ def compute_coordinates(
     stride: Sequence[sympy.Expr],
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     index: sympy.Expr,
+    indirect_load_subs: "dict | None" = None,
 ) -> list[sympy.Expr]:
     """
     Compute an array of coordinate expressions from an index expression.
@@ -214,17 +215,21 @@ def compute_coordinates(
 
     for var in vars:
         if var not in var_ranges:
-            # Indirect index symbols (e.g. tmp0 from a gather) are not loop
-            # variables but carry coordinate information.  Infer their range
-            # from the layout: find the dim whose stride equals the symbol's
-            # coefficient in the index.
+            # Indirect index symbols (e.g. tmp0 from an indirect load) appear
+            # in the index expression but are not loop variables.  Infer their
+            # range from the layout: find the dim whose stride equals the
+            # symbol's coefficient in the index.
             term = index.xreplace({v: 0 for v in vars - {var}})
             try:
                 coeff = int(term.xreplace({var: 1}))
             except (TypeError, ValueError):
                 continue
             inferred = next(
-                (sz for st, sz in zip(stride, size) if int(st) == coeff and int(sz) > 1),
+                (
+                    sz
+                    for st, sz in zip(stride, size)
+                    if int(st) == coeff and int(sz) > 1
+                ),
                 None,
             )
             if inferred is None:
@@ -255,6 +260,8 @@ def compute_coordinates(
         limit = term.xreplace({var: range_val})
         add_term(var=var, step=step, limit=limit)
 
+    if indirect_load_subs:
+        coordinates = [c.xreplace(indirect_load_subs) for c in coordinates]
     return coordinates
 
 
@@ -266,18 +273,7 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
     Handles two cases:
     - coord == v: coord is unbounded, so any expr in v is a subset.
     - coord == Mod(v, b) and expr == Mod(v, a) with a <= b: [0,a-1] ⊆ [0,b-1].
-
-    Both coord and expr can have optional constant offsets, but they must match.
     """
-    if expr.free_symbols == {v} and coord.free_symbols == {v}:
-        # Strip constant offsets if both have them
-        expr_offset = expr.subs(v, 0)
-        coord_offset = coord.subs(v, 0)
-        if expr_offset != coord_offset:
-            return False
-        expr = expr - expr_offset
-        coord = coord - coord_offset
-
     if coord == v:
         return True
     if (
@@ -583,8 +579,8 @@ def align_tensors(
         ]:
             # for each term except last one (stick dim)
             if var is None:
-                # offset holds either 0 (broadcast/scalar dim) or an opaque
-                # indirect expression (e.g. indirect0) that must pass through unchanged.
+                # offset holds either 0 (broadcast/scalar dim) or an IndexLoad
+                # (indirect load access) that must pass through unchanged.
                 size.append(dim_size)
                 coordinates.append(offset)
                 continue

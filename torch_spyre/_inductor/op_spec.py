@@ -18,7 +18,6 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Sequence
 
-import sympy
 from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats
 import torch
@@ -31,6 +30,7 @@ class IndexLoad(Function):
     The argument is a Symbol whose name is the source tensor's name.
     Means: "the value loaded from that tensor at the current iteration point".
     Survives sympify round-trips when IndexLoad is in the local namespace.
+
     """
 
     @classmethod

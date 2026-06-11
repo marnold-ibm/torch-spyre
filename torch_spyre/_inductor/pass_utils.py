@@ -15,7 +15,7 @@
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Optional, TypeVar, Union
+from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 
 import torch
 import sympy
@@ -35,6 +35,7 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.op_spec import IndexLoad
 
 from . import config
 from .codegen.superdsc import (
@@ -284,12 +285,12 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     """Return host coordinates for the output dep of a ComputedBuffer."""
     output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep, op)
+    return host_coordinates(op.get_layout(), output_dep)
 
 
-def index_role_dep_names(op: ComputedBuffer) -> set[str]:
+def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in other loads."""
-    return {expr.base.name for expr in _build_indirect_subs(op).values()}
+    return {expr.base.name for expr in _build_indirect_load_subs(op).values()}
 
 
 class _LoadSentinel:
@@ -299,101 +300,106 @@ class _LoadSentinel:
         self.name = name
 
 
-class _IndexProducerFinder:
+class _IndirectIndexFinder:
     """Re-executes inner_fn to discover which buffer's load feeds each indirect load.
 
     load() returns a _LoadSentinel carrying the buffer name.
     indirect_indexing() receives that sentinel and records which buffer was
     used as the index, so the next load() call can record the relationship.
     All other ops delegate to MockHandler.
-
-    No tmpN symbol names, no KernelFormatterHandler, no coupling to
-    get_read_writes internals.
     """
 
     def __init__(self):
         from torch._inductor.ops_handler import MockHandler
+
         self._mock = MockHandler()
-        self._pending_index_buf: str | None = None
-        # indirect_buf_name -> index_buf_name
-        self.index_producer_by_buf: dict[str, str] = {}
+        self._pending_indirect_index_buf: str | None = None
+        self.indirect_index_by_buf: dict[str, str] = {}
 
     def load(self, name: str, index):
-        # Assumes indirect_indexing is immediately followed by the indirect
-        # load with no intervening ops — true for simple gather patterns but
-        # would break for e.g. x[f(i)] where f involves additional loads.
-        if self._pending_index_buf is not None:
-            self.index_producer_by_buf[name] = self._pending_index_buf
-            self._pending_index_buf = None
+        if self._pending_indirect_index_buf is not None:
+            self.indirect_index_by_buf[name] = self._pending_indirect_index_buf
+            self._pending_indirect_index_buf = None
         return _LoadSentinel(name)
 
     def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
         if isinstance(index_var, _LoadSentinel):
-            self._pending_index_buf = index_var.name
+            self._pending_indirect_index_buf = index_var.name
         return sympy.S.Zero
 
     def __getattr__(self, attr):
         return getattr(self._mock, attr)
 
 
-def _find_index_producers(op: ComputedBuffer) -> dict[str, str]:
-    """
-    Re-execute inner_fn and return {indirect_buf: index_buf} mapping.
-    
-    NOTE: This is Claude's proposal on how to identify which buffer plays the role of 
-          index tensor (i.e. whose loaded value is used as an index into another buffer).
-          Value tensors are easy (just call is_indirect()) but finding the dep that produced 
-          the index is more challenging.
-
-          Also note this is only needed once we enable fusion and have more than 1 non-value
-          input, such as you will get with 'a[i] + b' (currently disabled, but will enable
-          once we have handle on SDSC generation)
-    """
+def _find_indirect_index_bufs(op: ComputedBuffer) -> dict[str, str]:
+    """Re-execute inner_fn and return {data_buf: indirect_index_buf} mapping."""
     from torch._inductor.virtualized import V as _V
-    finder = _IndexProducerFinder()
+
+    finder = _IndirectIndexFinder()
     with _V.set_ops_handler(finder):
         op.data.inner_fn(*op.data.inner_fn_args())
-    return finder.index_producer_by_buf
+    return finder.indirect_index_by_buf
 
 
-def _build_indirect_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
+def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
     """Map indirect symbols in MemoryDep.index to IndexedBase[source_index] exprs.
 
-    Re-executes inner_fn with _IndexProducerFinder to learn which buffer's
-    load produced each indirect index, then matches that to the MemoryDep for
-    the indirect buffer to build substitution expressions.
+    Pre-scheduler only: re-executes inner_fn via _IndirectIndexFinder to learn
+    which buffer's load produced each indirect index.
     """
     from sympy import IndexedBase
 
     rw = op.get_read_writes()
     reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
-
     if not any(d.is_indirect() for d in reads):
         return {}
-
-    # {indirect_buf_name: index_buf_name}
-    index_producer = _find_index_producers(op)
+    indirect_index_buf_map = _find_indirect_index_bufs(op)
     dep_by_name = {d.name: d for d in reads}
-
     result = {}
     for d in reads:
         if not d.is_indirect():
             continue
-        index_buf = index_producer.get(d.name)
-        if index_buf is None:
+        indirect_index_buf = indirect_index_buf_map.get(d.name)
+        if indirect_index_buf is None:
             continue
-        index_dep = dep_by_name[index_buf]
+        indirect_index_dep = dep_by_name[indirect_index_buf]
         for sym in d.index.free_symbols:
             if sym not in d.ranges:
-                result[sym] = IndexedBase(index_dep.name)[index_dep.index]
-
+                result[sym] = IndexedBase(indirect_index_dep.name)[
+                    indirect_index_dep.index
+                ]
     return result
+
+
+def indirect_load_subs_from_op(op: ComputedBuffer) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Build {indirect_sym → IndexLoad(name)} for a ComputedBuffer (pre-scheduler).
+
+    Used before scheduling, when indirect_vars is not yet available.
+    Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
+    load produced each indirect index. The resulting subs can be passed to
+    device_coordinates() to replace indirect symbols with IndexLoad(name).
+    """
+    raw = _build_indirect_load_subs(op)
+    return {sym: IndexLoad(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()}
+
+
+def indirect_load_subs_from_kernel(
+    indirect_vars: "dict[sympy.Symbol, Any]",
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Build {indirect_sym → IndexLoad(name)} from SpyreKernel.indirect_vars (post-scheduler).
+
+    Used after scheduling, where indirect_vars directly maps the fresh symbol
+    returned by indirect_indexing() to its source TensorAccess.
+    No re-execution of inner_fn needed — the mapping is available live.
+    The resulting subs can be passed to device_coordinates() or applied
+    directly to already-computed coordinate expressions.
+    """
+    return {sym: IndexLoad(sympy.Symbol(ta.name)) for sym, ta in indirect_vars.items()}
 
 
 def host_coordinates(
     layout: FixedLayout,
     dep: MemoryDep,
-    op: "ComputedBuffer | None",
 ) -> list[sympy.Expr]:
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
@@ -403,27 +409,11 @@ def host_coordinates(
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    coords = compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
-
-    # NOTE: It is not clear we need to do this injection of indirect accesses 
-    #       for all calls to host_coordinates. It may turn out we only need this
-    #       downstream in align_tensors and OpSpec generation, so we should not be
-    #       poluting all users of host_coordinates until then.  Being investigated 
-    if op is not None:
-        subs = _build_indirect_subs(op)
-        if subs:
-            coords = [c.xreplace(subs) for c in coords]
-    return coords
+    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
-    """Check if a stick expression is free of constant offsets.
-
-    Returns True for stick expressions with no additive offset:
-    - Mod(var, elems_per_stick) where var is a single symbol
-    - A bare variable (symbol)
-    - Zero
-    """
+def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
@@ -431,36 +421,25 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    return is_supported_mod or is_bare_var or is_zero
-
-
-def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
-    """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
-    if not isinstance(stick_expr, sympy.Add):
-        return False
-    free_args = [a for a in stick_expr.args if a.free_symbols]
-    return len(free_args) == 1 and is_stick_expr_offset_free(
-        free_args[0], elems_per_stick
-    )
-
-
-def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
-    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
-    offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
-    has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
-    if not (offset_free or has_offset):
+    if not (is_supported_mod or is_bare_var or is_zero):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"Mod(var, {elems_per_stick}), a bare variable, or 0"
         )
 
 
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    op: "ComputedBuffer | None",
+    indirect_load_subs: "dict[sympy.Symbol, sympy.Expr] | None" = None,
 ) -> list[sympy.Expr]:
+    """Compute device-space coordinates for a tensor access.
+
+    indirect_load_subs: optional {indirect_sym → IndexLoad(name)} mapping produced by
+        indirect_load_subs_from_op() (pre-scheduler) or indirect_load_subs_from_kernel()
+        (post-scheduler). When provided, indirect symbols in the coordinates are
+        replaced with IndexLoad expressions, giving gather-aware coordinates.
+    """
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
@@ -469,16 +448,8 @@ def device_coordinates(
         stl.stride_map,
         dep.ranges,
         index,
+        indirect_load_subs,
     )
-
-    # NOTE: It is not clear we need to do this injection of indirect accesses 
-    #       for all calls to host_coordinates. It may turn out we only need this
-    #       downstream in align_tensors and OpSpec generation, so we should not be
-    #       poluting all users of host_coordinates until then.  Being investigated 
-    if op is not None:
-        subs = _build_indirect_subs(op)
-        if subs:
-            coords = [c.xreplace(subs) for c in coords]
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
 
@@ -734,40 +705,31 @@ def compute_restickify_needed(
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
-    op: "ComputedBuffer | None",
+    op: "ComputedBuffer | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
     in_dep and out_dep may differ when the output buffer is accessed with a
     different index than the input (e.g. a transposed read).
 
+    op: when provided, index-role deps (gather indices) are never stick-constrained
+    and always return (False, None).
+
     Returns:
       (False, None)   — stick-compatible: no restickify needed
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    idc = device_coordinates(in_stl, in_dep, op)
-    out_idc = device_coordinates(out_stl, out_dep, op)
+    if op is not None and in_dep.name in indirect_index_dep_names(op):
+        return False, None
+    idc = device_coordinates(in_stl, in_dep)
+    out_idc = device_coordinates(out_stl, out_dep)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    # Input stick with an offset always needs restickify to remove the offset.
-    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
-    if in_stick_offset_free and stick_compatible([idc, out_idc]):
+    if stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
-    target_stick = out_idc[-1]
-
-    if target_stick == sympy.S.Zero and not in_stick_offset_free:
-        # No output dim carries the input's stick var, so compute_restickify_target_layout
-        # would fail to match. Promote the reduction var to the stick dimension so the
-        # restickify removes the offset.
-        reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
-        if reduction_vars:
-            red_var = next(iter(reduction_vars))
-            target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
-    return True, compute_restickify_target_layout(
-        in_stl, in_host, target_stick, ic, idc
-    )
+    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

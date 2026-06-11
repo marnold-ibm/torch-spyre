@@ -46,6 +46,7 @@ from .pass_utils import (
     concretize_index,
     apply_splits_from_index_coeff,
     iteration_space,
+    indirect_load_subs_from_kernel,
 )
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
@@ -481,11 +482,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         # can correctly isolate each loop variable's contribution.
 
         index = concretize_index(tensor.index, set(it_space.keys()))
+        indirect_load_subs = (
+            indirect_load_subs_from_kernel(self.indirect_vars)
+            if self.indirect_vars
+            else None
+        )
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
             it_space,
             index,
+            indirect_load_subs,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -659,34 +666,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
-            # Detect gather: any free symbol in value.index that was produced by
-            # indirect_indexing (stashed in self.indirect_vars during tracing).
-            indirect_syms = {
-                s for s in value.index.free_symbols if s in self.indirect_vars
-            }
-            if indirect_syms:
-                # Gather: add each index tensor as a first-class TensorArg input,
-                # then replace each indirect symbol in the value tensor's coordinates
-                # with IndexedBase(index_tensor_name)[flat_index].
-                from torch_spyre._inductor.op_spec import IndexLoad
-                it_space = iteration_space(self.current_node)
-                indirect_subs: dict[sympy.Expr, sympy.Expr] = {}
-                args = []
-                for sym in sorted(indirect_syms, key=str):
-                    idx_tensor = self.indirect_vars[sym]
-                    idx_arg = self.create_tensor_arg(
-                        True, idx_tensor.name, idx_tensor,
+            if self.indirect_vars:
+                # Gather: create_tensor_arg applies indirect_load_subs automatically
+                # (via compute_coordinates) so all args come out with correct coordinates.
+                args = [
+                    self.create_tensor_arg(
+                        True,
+                        idx_tensor.name,
+                        idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    args.append(idx_arg)
-                    indirect_subs[sym] = IndexLoad(sympy.Symbol(idx_tensor.name))
-                value_arg = self.create_tensor_arg(True, value.name, value)
-                value_arg.device_coordinates = [
-                    sympy_subs(c, indirect_subs)
-                    for c in value_arg.device_coordinates
+                    for idx_tensor in sorted(
+                        self.indirect_vars.values(),
+                        key=lambda t: t.name,
+                    )
                 ]
                 args += [
-                    value_arg,
+                    self.create_tensor_arg(True, value.name, value),
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
             else:
@@ -790,6 +786,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         def sympy_str(x: sympy.Expr) -> str:
             from torch_spyre._inductor.op_spec import IndexLoad
+
             if isinstance(x, IndexLoad):
                 name_sym = x.args[0]
                 return f"IndexLoad('{name_sym}')"
@@ -923,33 +920,19 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
-def _has_indirect(arg: TensorArg, it_space: dict) -> bool:
-    """Return True if any coordinate of arg contains a symbol not in it_space."""
-    return any(
-        sym not in it_space
-        for coord in arg.device_coordinates
-        for sym in coord.free_symbols
-    )
-
-
 def simplify_op_spec(op_spec):
     it_space = op_spec.iteration_space
 
-    # Separate args with indirect symbols (gather value tensors) from the rest.
-    # align_tensors cannot handle indirect symbols — they are opaque runtime
-    # values, not loop variables. Pass only the non-indirect args through
-    # align_tensors; reintegrate the indirect args unchanged afterward.
-    indirect_set = {i for i, arg in enumerate(op_spec.args) if _has_indirect(arg, it_space)}
-    non_indirect_args = [arg for i, arg in enumerate(op_spec.args) if i not in indirect_set]
-
     new_op_space_splits, new_tensors = align_tensors(
         it_space,
-        [{"size": arg.device_size, "coordinates": arg.device_coordinates}
-         for arg in non_indirect_args],
+        [
+            {"size": arg.device_size, "coordinates": arg.device_coordinates}
+            for arg in op_spec.args
+        ],
     )
     op_spec.iteration_space = new_op_space_splits
 
-    for arg, t in zip(non_indirect_args, new_tensors):
+    for arg, t in zip(op_spec.args, new_tensors):
         old_coords = arg.device_coordinates
         old_stride_map = arg.stride_map
         arg.device_size = t["size"]

@@ -195,9 +195,9 @@ def get_input_named_dims(inputs: list, op=None) -> dict:
     return loop_var_dims
 
 
-def get_reduction_dim(dep: MemoryDep, out_coords: list, op: "ComputedBuffer | None") -> sympy.Symbol:
+def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
     """Return the reduction loop variable: the input coord absent from the output."""
-    in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep, op)
+    in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep)
     reduction_coord = next(
         c for c in in_coords if c.free_symbols and matching_dim(out_coords, c) is None
     )
@@ -230,7 +230,7 @@ def _compute_named_dims(op, inputs):
                 loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = get_reduction_dim(inputs[0], out_coords, op)
+        reduction_sym = get_reduction_dim(inputs[0], out_coords)
         if reduction_sym not in loop_var_dims:
             size = int(inputs[0].ranges[reduction_sym])
             loop_var_dims[reduction_sym] = [
@@ -257,11 +257,11 @@ def _log_dep_debug(label: str, dep: MemoryDep, op: "ComputedBuffer | None") -> N
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
-        logger.debug(f"    host_coordinates={host_coordinates(layout, dep, op)}")
+        logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
     stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
-        logger.debug(f"    device_coordinates={device_coordinates(stl, dep, op)}")
+        logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
     logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
 
 

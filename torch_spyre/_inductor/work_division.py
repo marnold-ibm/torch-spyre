@@ -64,11 +64,10 @@ class TensorDep:
 
     dep: MemoryDep
     layout: FixedTiledLayout
-    op: "ComputedBuffer | None" = dataclasses.field(default=None)
     device_coords: list[Expr] = dataclasses.field(init=False)
 
     def __post_init__(self):
-        self.device_coords = device_coordinates(self.layout.device_layout, self.dep, self.op)
+        self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
 
 
 def core_split(size: int, max_cores: int) -> int:
@@ -477,9 +476,9 @@ def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
 ) -> tuple[list[TensorDep], TensorDep]:
     """Build TensorDep lists for inputs and the output of op."""
-    input_tds = [TensorDep(a.dep, a.layout, op) for a in args]
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op), op)
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
     return input_tds, output_td
 
 

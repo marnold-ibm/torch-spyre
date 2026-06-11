@@ -106,12 +106,12 @@ def enable_spyre_context(
     old_loop = Loops.has_large_inner_fn
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-
         # FUSION DISABLED FOR NOW WHILE DEBUGGING SDSC GENERATION
         if True:
             return True
         try:
             from torch._inductor.dependencies import MemoryDep
+
             for dep in self.get_reads():
                 if isinstance(dep, MemoryDep) and dep.is_indirect():
                     return False
