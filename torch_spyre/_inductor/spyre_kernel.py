@@ -659,7 +659,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
-            if self.indirect_vars:
+            indirect_syms = _indirect_syms_used(value, self.indirect_vars)
+            if indirect_syms:
                 args += [
                     self.create_tensor_arg(
                         True,
@@ -667,10 +668,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for idx_tensor in sorted(
-                        self.indirect_vars.values(),
-                        key=lambda t: t.name,
-                    )
+                    for sym in sorted(indirect_syms, key=str)
+                    for idx_tensor in [self.indirect_vars[sym]]
                 ]
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
@@ -841,6 +840,19 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+
+def _indirect_syms_used(
+    value: "PointwiseOp", indirect_vars: "dict[sympy.Symbol, TensorAccess]"
+) -> "set[sympy.Symbol]":
+    """Return the subset of indirect_vars keys that appear in value's argument indices."""
+    return {
+        s
+        for inp in value.arguments
+        if isinstance(inp, TensorAccess)
+        for s in inp.index.free_symbols
+        if s in indirect_vars
+    }
 
 
 def _is_indirect_index_arg(arg: TensorArg, args: Sequence[TensorArg]) -> bool:
