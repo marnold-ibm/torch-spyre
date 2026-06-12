@@ -106,9 +106,10 @@ def enable_spyre_context(
     old_loop = Loops.has_large_inner_fn
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # FUSION DISABLED FOR NOW WHILE DEBUGGING SDSC GENERATION
-        if True:
-            return True
+        # Fusion of indirect-load ops with their consumer is disabled until
+        # superdsc.py gains support for IndexLoad in device_coordinates.
+        # To enable, remove the early return below.
+        return True
         try:
             from torch._inductor.dependencies import MemoryDep
 

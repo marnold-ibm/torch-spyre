@@ -51,6 +51,7 @@ from .pass_utils import (
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import (
+    IndexLoad,
     LoopSpec,
     OpSpec,
     TensorArg,
@@ -520,6 +521,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_info: dict[str, Any],
     ) -> OpSpec:
         for arg in args:
+            if _is_indirect_index_arg(arg, args):
+                continue
             if not (
                 op == IDENTITY_OP
                 or DtypeOpTable.is_dtype_op(op)
@@ -656,6 +659,19 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
+            if self.indirect_vars:
+                args += [
+                    self.create_tensor_arg(
+                        True,
+                        idx_tensor.name,
+                        idx_tensor,
+                        opspec_name=idx_tensor.name,
+                    )
+                    for idx_tensor in sorted(
+                        self.indirect_vars.values(),
+                        key=lambda t: t.name,
+                    )
+                ]
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input))
@@ -825,6 +841,23 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+
+def _is_indirect_index_arg(arg: TensorArg, args: Sequence[TensorArg]) -> bool:
+    """Return True if arg is an indirect index tensor in this op spec.
+
+    An arg is an indirect index tensor if it has a name and that name appears
+    as the argument of an IndexLoad in another arg's device_coordinates.
+    """
+    if arg.name is None:
+        return False
+    return any(
+        arg.name == sym.name
+        for a in args
+        for coord in a.device_coordinates
+        for il in coord.atoms(IndexLoad)
+        for sym in il.args
+    )
 
 
 def _iter_op_specs(specs):
