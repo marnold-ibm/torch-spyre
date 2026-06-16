@@ -88,8 +88,8 @@ the pipeline stage:
 
 | Helper | When to use | How it works |
 |---|---|---|
-| `indirect_load_subs_from_op(op)` | Pre-scheduler (`propagate_layouts`) | Re-executes `inner_fn` via `_IndirectIndexFinder` to discover which buffer's load fed each indirect symbol |
-| `indirect_load_subs_from_kernel(indirect_vars)` | Post-scheduler (`SpyreKernel`) | Reads `SpyreKernel.indirect_vars`, which `SpyreKernelOpsHandler.indirect_indexing()` populates live during codegen |
+| `indirect_access_subs_from_op(op)` | Pre-scheduler (`propagate_layouts`) | Re-executes `inner_fn` via `_IndirectIndexFinder` to discover which buffer's load fed each indirect symbol |
+| `indirect_access_subs_from_kernel(indirect_vars)` | Post-scheduler (`SpyreKernel`) | Reads `SpyreKernel.indirect_vars`, which `SpyreKernelOpsHandler.indirect_indexing()` populates live during codegen |
 
 Both return the same dict shape, so every downstream caller sees a uniform
 interface regardless of when it runs.
@@ -140,7 +140,7 @@ through the following stages.
 ### 1. propagate_layouts (pre-scheduler)
 
 `compute_layouts` is called for the `Pointwise` node.
-`indirect_load_subs_from_op` re-executes `inner_fn` via `_IndirectIndexFinder`
+`indirect_access_subs_from_op` re-executes `inner_fn` via `_IndirectIndexFinder`
 and returns `{tmp0: IndirectAccess(Symbol('arg1_1'))}`.
 
 The resulting device coordinates (logged when `TORCH_LOGS="+inductor"` is set)
@@ -168,7 +168,7 @@ self.kernel._indirect_var_count += 1
 self.kernel.indirect_vars[sym] = index_var   # TensorAccess for arg1_1
 ```
 
-`indirect_load_subs_from_kernel(self.indirect_vars)` then converts this to
+`indirect_access_subs_from_kernel(self.indirect_vars)` then converts this to
 `{sym: IndirectAccess(Symbol('arg1_1'))}` — the same shape as the pre-scheduler
 dict, so `create_tensor_arg` can use it directly.
 
