@@ -134,6 +134,7 @@ def compute_coordinates(
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     index: sympy.Expr,
     indirect_load_subs: "dict | None" = None,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> list[sympy.Expr]:
     """
     Compute an array of coordinate expressions from an index expression.
@@ -221,28 +222,31 @@ def compute_coordinates(
         # but are not iteration variables).
         if var not in var_ranges:
             # Indirect index symbols (e.g. tmp0 from an indirect load) appear
-            # in the index expression but are not loop variables.  Infer their
-            # range from the layout: find the dim whose stride equals the
-            # symbol's coefficient in the index.
-            term = index.xreplace({v: 0 for v in vars - {var}})
-            try:
-                coeff = int(term.xreplace({var: 1}))
-            except (TypeError, ValueError):
-                continue
-            inferred = next(
-                (
-                    sz
-                    for st, sz in zip(stride, size)
-                    if int(st) == coeff and int(sz) > 1
-                ),
-                None,
-            )
-            if inferred is None:
-                raise Unsupported(
-                    f"indirect symbol {var} (coeff={coeff}) in index {index} "
-                    f"has no matching stride in layout {list(zip(stride, size))}"
+            # in the index expression but are not loop variables.  Use the size
+            # captured from indirect_indexing() if available; otherwise fall back
+            # to inferring from the layout stride.
+            if indirect_sizes and var in indirect_sizes:
+                range_val = indirect_sizes[var]
+            else:
+                term = index.xreplace({v: 0 for v in vars - {var}})
+                try:
+                    coeff = int(term.xreplace({var: 1}))
+                except (TypeError, ValueError):
+                    continue
+                inferred = next(
+                    (
+                        sz
+                        for st, sz in zip(stride, size)
+                        if int(st) == coeff and int(sz) > 1
+                    ),
+                    None,
                 )
-            range_val = inferred
+                if inferred is None:
+                    raise Unsupported(
+                        f"indirect symbol {var} (coeff={coeff}) in index {index} "
+                        f"has no matching stride in layout {list(zip(stride, size))}"
+                    )
+                range_val = inferred
         else:
             range_val = var_ranges[var]
 

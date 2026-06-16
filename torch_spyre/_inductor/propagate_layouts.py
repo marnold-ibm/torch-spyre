@@ -64,6 +64,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     indirect_index_dep_names,
     indirect_load_subs_from_op,
+    indirect_sizes_from_op,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -588,18 +589,22 @@ def _multi_arg_pointwise_layouts(
     """
 
     indirect_index_names = indirect_index_dep_names(op)
+    ind_sizes = indirect_sizes_from_op(op)
     # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
         stick_expr
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in indirect_index_names
-        and (stick_expr := device_coordinates(stl, arg.dep)[-1]) != 0
+        and (
+            stick_expr := device_coordinates(stl, arg.dep, indirect_sizes=ind_sizes)[-1]
+        )
+        != 0
     }
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
+    in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
     out_coords = host_coordinates(output, output_dep)
     can_use_same_layout = True
 
@@ -630,7 +635,7 @@ def _multi_arg_pointwise_layouts(
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )
-            coord = device_coordinates(in_stl, arg.dep)
+            coord = device_coordinates(in_stl, arg.dep, indirect_sizes=ind_sizes)
             if not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
         return True
@@ -769,6 +774,42 @@ def compute_layouts(
                     logger.debug(
                         f"  indirect index {arg.dep.name} STL[{j}] substituted d_coords={d_coords}"
                     )
+
+        # Print everything about all input tensors and the output
+        logger.debug(f"  === compute_layouts for {op.get_name()} ===")
+        for arg in args:
+            logger.debug(f"  arg {arg.dep.name}:")
+            logger.debug(f"    host_size={list(arg.layout.size)}")
+            logger.debug(f"    host_stride={list(arg.layout.stride)}")
+            logger.debug(f"    dep.index={arg.dep.index}  dep.ranges={arg.dep.ranges}")
+            h_coords: object
+            try:
+                h_coords = host_coordinates(arg.layout, arg.dep)
+            except Exception as e:
+                h_coords = f"<error: {e}>"
+            logger.debug(f"    host_coordinates={h_coords}")
+            for j, stl in enumerate(arg.layouts):
+                logger.debug(
+                    f"    STL[{j}]: device_size={stl.device_size}  stride_map={stl.stride_map}"
+                )
+                d_coords_plain: object
+                try:
+                    d_coords_plain = device_coordinates(stl, arg.dep)
+                except Exception as e:
+                    d_coords_plain = f"<error: {e}>"
+                logger.debug(f"    STL[{j}] device_coordinates={d_coords_plain}")
+        logger.debug(f"  output {output_dep.name}:")
+        logger.debug(f"    host_size={list(output.size)}")
+        logger.debug(f"    host_stride={list(output.stride)}")
+        logger.debug(
+            f"    dep.index={output_dep.index}  dep.ranges={output_dep.ranges}"
+        )
+        out_h_coords: object
+        try:
+            out_h_coords = host_coordinates(output, output_dep)
+        except Exception as e:
+            out_h_coords = f"<error: {e}>"
+        logger.debug(f"    host_coordinates={out_h_coords}")
 
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)

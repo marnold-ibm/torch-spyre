@@ -438,6 +438,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
             sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
             self.kernel._indirect_var_count += 1
             self.kernel.indirect_vars[sym] = index_var
+            self.kernel.indirect_sizes[sym] = int(size)
             return sym
         return sympy_index_symbol(str(index_var))
 
@@ -461,6 +462,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
         self.indirect_vars: dict[sympy.Symbol, TensorAccess] = {}
+        self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
 
     def __enter__(self) -> Self:
@@ -494,6 +496,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             it_space,
             index,
             indirect_load_subs,
+            self.indirect_sizes if self.indirect_sizes else None,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -519,9 +522,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         is_reduction: bool,
         args: Sequence[TensorArg],
         op_info: dict[str, Any],
+        indirect_var_names: "frozenset[str] | None" = None,
     ) -> OpSpec:
         for arg in args:
             if _is_indirect_index_arg(arg, args):
+                continue
+            if indirect_var_names and arg.name in indirect_var_names:
                 continue
             if not (
                 op == IDENTITY_OP
@@ -714,7 +720,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
-            op_spec = self.create_op_spec(op, False, args, op_info)
+            indirect_var_names = (
+                frozenset(t.name for t in self.indirect_vars.values())
+                if self.indirect_vars
+                else None
+            )
+            op_spec = self.create_op_spec(op, False, args, op_info, indirect_var_names)
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
