@@ -682,8 +682,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             if self.indirect_vars:
-                # Gather: create_tensor_arg applies indirect_load_subs automatically
+                # Gather/scatter: create_tensor_arg applies indirect_access_subs automatically
                 # (via compute_coordinates) so all args come out with correct coordinates.
+                # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
                 args = [
                     self.create_tensor_arg(
                         True,

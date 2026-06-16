@@ -313,7 +313,15 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     except ValueError:
         return set()
 
-    indices = cells.get("indices", [])
+    if "indices" not in cells:
+        logger.warning(
+            "Scatter.output_indexer closure has no 'indices' variable — "
+            "Inductor may have renamed it. Scatter index tensors will not be "
+            "excluded from stick compatibility checks. (freevars: %s)",
+            list(freevars),
+        )
+        return set()
+    indices = cells["indices"]
     names = set()
     for idx_tensor in indices:
         if idx_tensor is None:
