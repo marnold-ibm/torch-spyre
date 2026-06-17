@@ -758,42 +758,6 @@ def compute_layouts(
                         f"  indirect value {arg.dep.name} STL[{j}] d_coords (with IndirectAccess subs)={d_coords}"
                     )
 
-        # Print everything about all input tensors and the output
-        logger.debug(f"  === compute_layouts for {op.get_name()} ===")
-        for arg in args:
-            logger.debug(f"  arg {arg.dep.name}:")
-            logger.debug(f"    host_size={list(arg.layout.size)}")
-            logger.debug(f"    host_stride={list(arg.layout.stride)}")
-            logger.debug(f"    dep.index={arg.dep.index}  dep.ranges={arg.dep.ranges}")
-            h_coords: object
-            try:
-                h_coords = host_coordinates(arg.layout, arg.dep)
-            except Exception as e:
-                h_coords = f"<error: {e}>"
-            logger.debug(f"    host_coordinates={h_coords}")
-            for j, stl in enumerate(arg.layouts):
-                logger.debug(
-                    f"    STL[{j}]: device_size={stl.device_size}  stride_map={stl.stride_map}"
-                )
-                d_coords_plain: object
-                try:
-                    d_coords_plain = device_coordinates(stl, arg.dep)
-                except Exception as e:
-                    d_coords_plain = f"<error: {e}>"
-                logger.debug(f"    STL[{j}] device_coordinates={d_coords_plain}")
-        logger.debug(f"  output {output_dep.name}:")
-        logger.debug(f"    host_size={list(output.size)}")
-        logger.debug(f"    host_stride={list(output.stride)}")
-        logger.debug(
-            f"    dep.index={output_dep.index}  dep.ranges={output_dep.ranges}"
-        )
-        out_h_coords: object
-        try:
-            out_h_coords = host_coordinates(output, output_dep)
-        except Exception as e:
-            out_h_coords = f"<error: {e}>"
-        logger.debug(f"    host_coordinates={out_h_coords}")
-
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
