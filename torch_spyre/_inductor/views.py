@@ -133,7 +133,7 @@ def compute_coordinates(
     stride: Sequence[sympy.Expr],
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     index: sympy.Expr,
-    indirect_load_subs: "dict | None" = None,
+    indirect_access_subs: "dict | None" = None,
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> list[sympy.Expr]:
     """
@@ -272,8 +272,8 @@ def compute_coordinates(
         limit = term.xreplace({var: range_val})
         add_term(var=var, step=step, limit=limit)
 
-    if indirect_load_subs:
-        coordinates = [c.xreplace(indirect_load_subs) for c in coordinates]
+    if indirect_access_subs:
+        coordinates = [c.xreplace(indirect_access_subs) for c in coordinates]
     return coordinates
 
 

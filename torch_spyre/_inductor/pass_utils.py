@@ -551,12 +551,12 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    indirect_load_subs: "dict[sympy.Symbol, sympy.Expr] | None" = None,
+    indirect_access_subs: "dict[sympy.Symbol, sympy.Expr] | None" = None,
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> list[sympy.Expr]:
     """Compute device-space coordinates for a tensor access.
 
-    indirect_load_subs: optional {indirect_sym → IndirectAccess(name)} mapping produced by
+    indirect_access_subs: optional {indirect_sym → IndirectAccess(name)} mapping produced by
         indirect_access_subs_from_op() (pre-scheduler) or indirect_access_subs_from_kernel()
         (post-scheduler). When provided, indirect symbols in the coordinates are
         replaced with IndirectAccess expressions, giving indirect-aware coordinates.
@@ -573,7 +573,7 @@ def device_coordinates(
         stl.stride_map,
         dep.ranges,
         index,
-        indirect_load_subs,
+        indirect_access_subs,
         indirect_sizes,
     )
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
