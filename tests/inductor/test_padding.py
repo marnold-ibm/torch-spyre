@@ -684,6 +684,9 @@ class TestInsertPaddingIR(unittest.TestCase):
         reduction = mm.data
         assert isinstance(reduction, Reduction)
         self.assertEqual(int(reduction.reduction_ranges[0]), K)
+        # ops_before contains a restickify op for x in addition to the 4-op
+        # padding sequence for y, so _assert_constant_pad_nd_ops (which expects
+        # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
 

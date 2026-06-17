@@ -142,7 +142,7 @@ def _rebuild_matmul(
         _y_loader=y_padded_loader,
         _y_batch_ndim=y_batch_ndim,
     ):
-        # Call the original inner_fn to get x's value, then override y.
+        # x_val comes from the original inner_fn; discard its y and replace below.
         x_val, _ = _orig_inner_fn(index, reduction_index)
         y_index = list(index[:_y_batch_ndim]) + list(reduction_index) + [index[-1]]
         y_val = _y_loader(y_index)
