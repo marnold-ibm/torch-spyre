@@ -128,7 +128,17 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             for sym, size in dep.ranges.items()
         }
     named_size, named_stride = _compute_named_layout(buf_named_dims)
-    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
+    try:
+        coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
+    except Unsupported:
+        # Indirect index — can't compute named-dim coordinates without indirect_sizes.
+        # Fall back to untracked names so propagation continues.
+        context = f"{op.get_name()}/{dep.name}" if op is not None else dep.name
+        return {
+            sym: [_untracked_name(context, sym, int(size))]
+            for sym, size in dep.ranges.items()
+            if sym in dep.index.free_symbols
+        }
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:
@@ -261,11 +271,17 @@ def _log_dep_debug(
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
-        logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
+        try:
+            logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
+        except Unsupported as e:
+            logger.debug(f"    host_coordinates=<unsupported: {e}>")
     stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
-        logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
+        try:
+            logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
+        except Unsupported as e:
+            logger.debug(f"    device_coordinates=<unsupported: {e}>")
     logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
 
 

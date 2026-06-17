@@ -744,18 +744,29 @@ def compute_layouts(
         indirect_index_names = indirect_index_dep_names(op)
         if indirect_index_names:
             indirect_subs = indirect_access_subs_from_op(op)
+            ind_sizes = indirect_sizes_from_op(op)
             for arg in args:
                 if arg.dep.name in indirect_index_names:
                     continue
                 for j, stl in enumerate(arg.layouts):
+                    d_coords_raw: object
+                    d_coords_subs: object
                     try:
-                        d_coords: object = device_coordinates(
-                            stl, arg.dep, indirect_subs
+                        d_coords_raw = device_coordinates(
+                            stl, arg.dep, indirect_sizes=ind_sizes
                         )
-                    except Exception:
-                        d_coords = "<error>"
+                    except Exception as e:
+                        d_coords_raw = f"<error: {e}>"
+                    try:
+                        d_coords_subs = device_coordinates(
+                            stl, arg.dep, indirect_subs, ind_sizes
+                        )
+                    except Exception as e:
+                        d_coords_subs = f"<error: {e}>"
                     logger.debug(
-                        f"  indirect value {arg.dep.name} STL[{j}] d_coords (with IndirectAccess subs)={d_coords}"
+                        f"  indirect value {arg.dep.name} STL[{j}]"
+                        f"\n    d_coords={d_coords_raw}"
+                        f"\n    d_coords (with IndirectAccess subs)={d_coords_subs}"
                     )
 
     if len(args) > 1 and isinstance(data, Pointwise):
