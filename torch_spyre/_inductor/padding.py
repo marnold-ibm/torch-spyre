@@ -38,9 +38,9 @@ Deduplication of identical constants across multiple pad calls happens later
 at the IR level via dedup_and_promote_constants.
 
 x and y are identified via identify_matmul_inputs() using the BatchMatmul
-preserved_dim definition: x is the input that shares a dimension with the
-output that y does not (M).  This avoids positional assumptions and handles
-square matrices (M==K==N) correctly.
+generated_dim definition: y is the input whose index contains a symbol
+present in the output but absent from x (N).  This handles M==K==N and
+M=1 (decode phase) correctly.
 """
 
 import torch
@@ -166,8 +166,9 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
     space is unchanged.  The K→K_padded widening happens at SDSC codegen time.
 
     x and y are identified via identify_matmul_inputs() using the BatchMatmul
-    preserved_dim definition: x is the input that shares a dimension with the
-    output that y does not (M).
+    generated_dim definition: y is the input whose index contains a symbol
+    present in the output but absent from x (N).  This handles M==K==N and
+    M=1 (decode phase) correctly.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.

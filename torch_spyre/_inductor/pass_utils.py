@@ -426,10 +426,13 @@ def identify_matmul_inputs(
       preserved_dim: in Input1, Output,  NOT Input2
       noreuse_dim:   in Input1, Input2,  Output
 
-    Input1 (x) is uniquely identified by having a preserved_dim.
-    Input2 (y) is the other input.
+    Identifies y by its generated_dim (N): present in y and the output, absent
+    from x.  This is more robust than identifying x by its preserved_dim (M):
+    when M=1, M is constant-folded out of both x's and the output's index
+    simultaneously, making the preserved_dim test blind.  N is immune — even
+    N=1 ranges stay in the output's index expression.
 
-    Returns (None, None) if x cannot be identified.
+    Returns (None, None) if y cannot be identified.
     """
     assert len(inputs) == 2
     a, b = inputs[0], inputs[1]
@@ -437,9 +440,11 @@ def identify_matmul_inputs(
     syms_a = a.index.free_symbols
     syms_b = b.index.free_symbols
 
-    if (syms_a & out_syms) - syms_b:
-        return a, b
+    # b has generated_dim → b is y, a is x
     if (syms_b & out_syms) - syms_a:
+        return a, b
+    # a has generated_dim → a is y, b is x
+    if (syms_a & out_syms) - syms_b:
         return b, a
     return None, None
 
