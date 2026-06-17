@@ -507,9 +507,14 @@ def _matmul_layouts(
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep)
 
-    x, y = identify_matmul_inputs(args, output_dep, get_dep=lambda a: a.dep)
-    if x is None or y is None:
+    x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
+    if x_dep is None or y_dep is None:
         raise Unsupported(f"{data.reduction_type}: could not identify Input1/Input2")
+    # Map identified deps back to PropArgs.
+    if x_dep is args[0].dep:
+        x, y = args[0], args[1]
+    else:
+        x, y = args[1], args[0]
 
     # Hardware stick constraints (DF16):
     #   Input1 (x): stick on reduction_var (loop var absent from output)

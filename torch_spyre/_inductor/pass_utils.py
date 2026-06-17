@@ -414,15 +414,10 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-_T = TypeVar("_T")
-
-
 def identify_matmul_inputs(
-    inputs: list[_T],
+    inputs: list[MemoryDep],
     write_dep: MemoryDep,
-    *,
-    get_dep: Callable[[_T], MemoryDep] = lambda x: x,  # type: ignore[assignment]
-) -> tuple[_T, _T] | tuple[None, None]:
+) -> tuple[MemoryDep, MemoryDep] | tuple[None, None]:
     """Identify Input1 (x) and Input2 (y) of a BatchMatmul op.
 
     Uses the BatchMatmul semantic dimension definitions:
@@ -434,16 +429,13 @@ def identify_matmul_inputs(
     Input1 (x) is uniquely identified by having a preserved_dim.
     Input2 (y) is the other input.
 
-    ``get_dep`` extracts a MemoryDep from each element — defaults to identity
-    so callers passing MemoryDep lists directly need not supply it.
-
     Returns (None, None) if x cannot be identified.
     """
     assert len(inputs) == 2
     a, b = inputs[0], inputs[1]
     out_syms = write_dep.index.free_symbols
-    syms_a = get_dep(a).index.free_symbols
-    syms_b = get_dep(b).index.free_symbols
+    syms_a = a.index.free_symbols
+    syms_b = b.index.free_symbols
 
     if (syms_a & out_syms) - syms_b:
         return a, b
