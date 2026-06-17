@@ -813,8 +813,13 @@ class SpyreKernel(Kernel[CSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        indirect_access_subs = (
+            indirect_access_subs_from_kernel(self.indirect_vars)
+            if self.indirect_vars
+            else None
+        )
         for op_spec in _iter_op_specs(self.op_specs):
-            simplify_op_spec(op_spec)
+            simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
 
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, IndirectAccess):
@@ -980,7 +985,7 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
-def simplify_op_spec(op_spec):
+def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     it_space = op_spec.iteration_space
 
     new_op_space_splits, new_tensors = align_tensors(
@@ -989,6 +994,7 @@ def simplify_op_spec(op_spec):
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
             for arg in op_spec.args
         ],
+        indirect_sizes,
     )
     op_spec.iteration_space = new_op_space_splits
 
@@ -997,6 +1003,13 @@ def simplify_op_spec(op_spec):
         old_stride_map = arg.stride_map
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
+
+        # Apply indirect_access_subs after align_tensors, so that indirect symbols
+        # are decomposed as regular variables before substitution.
+        if indirect_access_subs:
+            arg.device_coordinates = [
+                c.xreplace(indirect_access_subs) for c in arg.device_coordinates
+            ]
         # Invariant: stride_map[d] must be the host-element stride for
         # device dimension d.  align_tensors may reorder device_coordinates
         # without touching stride_map, breaking this invariant.  Restore it

@@ -256,8 +256,9 @@ def compute_coordinates(
         limit = term.xreplace({var: range_val})
         add_term(var=var, step=step, limit=limit)
 
-    if indirect_access_subs:
-        coordinates = [c.xreplace(indirect_access_subs) for c in coordinates]
+    # NOTE: indirect_access_subs substitution is NOT applied here. It is deferred to
+    # after align_tensors() so that indirect symbols are decomposed as regular variables.
+    # The substitution is applied in simplify_op_spec() after align_tensors completes.
     return coordinates
 
 
@@ -334,6 +335,7 @@ def normalize_coordinates(
     size: Sequence[sympy.Expr],
     coordinates: Sequence[sympy.Expr],
     synthetic_var_fn: Callable[[], sympy.Symbol],
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> list[Term]:
     """
     Normalize coordinate expressions obtained from compute_coordinates.
@@ -369,19 +371,35 @@ def normalize_coordinates(
                 assert offset == 0
                 terms.append(Term(None, None, None, None, dim_size))
             continue
-        # If all free symbols are indirect (not loop vars), pass the raw
-        # coordinate through as an opaque offset on a var=None term.
+        # If any free symbols are not loop vars, check if they're indirect symbols
+        # with known sizes (from indirect_sizes). If so, treat them like loop vars.
         if not vars.issubset(var_ranges.keys()):
-            terms.append(Term(None, None, None, None, dim_size, offset=coordinate))
-            continue
+            unknown_vars = vars - var_ranges.keys()
+            if not (indirect_sizes and unknown_vars.issubset(indirect_sizes.keys())):
+                # Symbols with unknown ranges: pass the raw coordinate through
+                # as an opaque offset on a var=None term.
+                terms.append(Term(None, None, None, None, dim_size, offset=coordinate))
+                continue
+            # All unknown symbols are indirect with known sizes. Fall through to
+            # decompose them like loop variables, using indirect_sizes for their ranges.
         dim_terms = []  # terms for current dimension
         for var in vars:
+            # Resolve the range for this variable: loop var from var_ranges, or indirect from indirect_sizes
+            if var in var_ranges:
+                var_range = var_ranges[var]
+            elif indirect_sizes and var in indirect_sizes:
+                var_range = indirect_sizes[var]
+            else:
+                raise Unsupported(
+                    f"Variable {var} in coordinate {expr} has no entry in var_ranges or indirect_sizes"
+                )
+
             # extract term for each var
             term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
             # pattern match expression tree, there is small number of possibilities
             if term.is_symbol:
                 dim_terms.append(
-                    Term(sympy.S.One, sympy.S.One, var, var_ranges[var], dim_size)
+                    Term(sympy.S.One, sympy.S.One, var, var_range, dim_size)
                 )
             elif term.func == sympy.Mod:
                 dim_terms.append(
@@ -389,7 +407,7 @@ def normalize_coordinates(
                 )
             elif term.func == sympy.Mul and term.args[0].is_rational:
                 expr0, expr1 = term.args
-                mod = expr1.args[1] if expr1.func == sympy.Mod else var_ranges[var]
+                mod = expr1.args[1] if expr1.func == sympy.Mod else var_range
                 # TODO: handle non-unit fractions
                 # https://github.com/torch-spyre/torch-spyre/issues/1353
                 assert expr0.numerator == 1 or expr0.denominator == 1, (
@@ -465,6 +483,7 @@ def normalize_coordinates(
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> tuple[
     (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
 ]:
@@ -479,7 +498,7 @@ def align_tensors(
     # TODO(issue#1373): make align_tensors symbolic-aware so concretization can
     #              be removed.
 
-    repeat_info: set[sympy.Symbol] = getattr(V.graph, "_repeat_info", set())
+    repeat_info: dict = getattr(V.graph, "_repeat_info", {})
 
     var_ranges = {
         var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()
@@ -510,7 +529,11 @@ def align_tensors(
     for tensor in tensors:
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
         terms = normalize_coordinates(
-            var_ranges, tensor["size"], tensor["coordinates"], synthetic_var
+            var_ranges,
+            tensor["size"],
+            tensor["coordinates"],
+            synthetic_var,
+            indirect_sizes,
         )
         stick_dim.append(terms[-1].var)
         stick_size.append(terms[-1].dim_size)
@@ -520,7 +543,14 @@ def align_tensors(
 
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
-    splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in var_ranges.keys()}
+    # Collect all variables that appear in terms (loop vars + indirect symbols)
+    all_vars = set(var_ranges.keys())
+    for terms in all_terms:
+        for term in terms:
+            if term.var is not None:
+                all_vars.add(term.var)
+
+    splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
@@ -536,7 +566,8 @@ def align_tensors(
                     # add mod to splits unless stick dim and stick size
                     splits[var].add(mod)
 
-    V.graph._repeat_info.clear()
+    if hasattr(V.graph, "_repeat_info"):
+        V.graph._repeat_info.clear()
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
     for var in new_vars:
@@ -571,7 +602,15 @@ def align_tensors(
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
-            new_var_ranges[var] = var_ranges[var]
+            # var can be a loop var or an indirect symbol
+            if var in var_ranges:
+                new_var_ranges[var] = var_ranges[var]
+            elif indirect_sizes and var in indirect_sizes:
+                new_var_ranges[var] = indirect_sizes[var]
+            else:
+                raise Unsupported(
+                    f"Variable {var} has no range in var_ranges or indirect_sizes"
+                )
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
@@ -672,8 +711,12 @@ def align_tensors(
                         t["coordinates"][-1] = stick_dim_var % t["size"][-1]
                         break
 
+    # Iteration space should only contain loop variables, not indirect symbols.
+    # Filter out any indirect symbols that were added during normalization.
     new_iteration_space = {
-        k: (v, new_op_it_space_splits[k]) for k, v in new_var_ranges.items()
+        k: (v, new_op_it_space_splits[k])
+        for k, v in new_var_ranges.items()
+        if k in var_ranges  # Only include original loop variables
     }
 
     return new_iteration_space, new_tensors
