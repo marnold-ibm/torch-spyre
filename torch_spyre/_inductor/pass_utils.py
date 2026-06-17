@@ -368,12 +368,11 @@ class _LoadSentinel:
 
 
 class _IndirectIndexFinder:
-    """Re-executes inner_fn to discover which buffer's load feeds each indirect load.
+    """Re-executes inner_fn to map each indirect load to its index buffer and valid range.
 
-    load() returns a _LoadSentinel carrying the buffer name.
-    indirect_indexing() receives that sentinel and records which buffer was
-    used as the index, so the next load() call can record the relationship.
-    All other ops delegate to MockHandler.
+    Inductor bakes the index range into the inner_fn closure as the size argument to
+    ops.indirect_indexing() — invisible in printed IR, only accessible by re-execution.
+    This handler intercepts those calls to recover both the source buffer name and the size.
     """
 
     def __init__(self):
