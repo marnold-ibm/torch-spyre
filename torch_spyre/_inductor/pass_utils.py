@@ -343,6 +343,23 @@ def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
     return names
 
 
+def indirect_sizes_from_op(
+    op: ComputedBuffer,
+) -> "dict[sympy.Symbol, int]":
+    """Build {indirect_sym → size} for a ComputedBuffer (pre-scheduler).
+
+    Returns the valid index range for each indirect symbol, captured from the
+    size argument of indirect_indexing() during inner_fn re-execution.
+
+    Note: call sites that also need indirect_index_dep_names() will re-execute
+    inner_fn twice. This is intentional — inner_fn re-execution is a cheap
+    mock-handler walk at compile time, and keeping the helpers single-purpose
+    is clearer than merging them.
+    """
+    _, sizes = _build_indirect_load_subs(op)
+    return sizes
+
+
 class _LoadSentinel:
     """Opaque token returned by load(); carries the buffer name through ops."""
 
@@ -455,18 +472,6 @@ def indirect_access_subs_from_op(
     return {
         sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
     }
-
-
-def indirect_sizes_from_op(
-    op: ComputedBuffer,
-) -> "dict[sympy.Symbol, int]":
-    """Build {indirect_sym → size} for a ComputedBuffer (pre-scheduler).
-
-    Returns the valid index range for each indirect symbol, captured from the
-    size argument of indirect_indexing() during inner_fn re-execution.
-    """
-    _, sizes = _build_indirect_load_subs(op)
-    return sizes
 
 
 def indirect_access_subs_from_kernel(
