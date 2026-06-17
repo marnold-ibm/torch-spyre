@@ -222,31 +222,16 @@ def compute_coordinates(
         # but are not iteration variables).
         if var not in var_ranges:
             # Indirect index symbols (e.g. tmp0 from an indirect load) appear
-            # in the index expression but are not loop variables.  Use the size
-            # captured from indirect_indexing() if available; otherwise fall back
-            # to inferring from the layout stride.
+            # in the index expression but are not loop variables. Their range is
+            # captured from ops.indirect_indexing() during inner_fn re-execution
+            # and must be passed in via indirect_sizes.
             if indirect_sizes and var in indirect_sizes:
                 range_val = indirect_sizes[var]
             else:
-                term = index.xreplace({v: 0 for v in vars - {var}})
-                try:
-                    coeff = int(term.xreplace({var: 1}))
-                except (TypeError, ValueError):
-                    continue
-                inferred = next(
-                    (
-                        sz
-                        for st, sz in zip(stride, size)
-                        if int(st) == coeff and int(sz) > 1
-                    ),
-                    None,
+                raise Unsupported(
+                    f"indirect symbol {var} in index {index} has no entry in "
+                    f"indirect_sizes — pass indirect_sizes to compute_coordinates"
                 )
-                if inferred is None:
-                    raise Unsupported(
-                        f"indirect symbol {var} (coeff={coeff}) in index {index} "
-                        f"has no matching stride in layout {list(zip(stride, size))}"
-                    )
-                range_val = inferred
         else:
             range_val = var_ranges[var]
 
