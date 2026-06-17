@@ -528,6 +528,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             if _is_indirect_index_arg(arg, args):
                 continue
             if indirect_var_names and arg.name in indirect_var_names:
+                # _is_indirect_index_arg catches the gather op itself, but when an
+                # index tensor is included in a fused kernel that also has a restickify
+                # (or other op that doesn't embed IndirectAccess in its coordinates),
+                # _is_indirect_index_arg returns False for that op. This guard catches
+                # it via the kernel-level indirect_vars set, which is always ground truth.
                 continue
             if not (
                 op == IDENTITY_OP
