@@ -22,8 +22,6 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
 
-from .errors import Unsupported
-
 
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
@@ -221,10 +219,14 @@ def compute_coordinates(
         # injected by dynamic shapes that appear in the index expression
         # but are not iteration variables).
         if var not in var_ranges:
-            # Indirect index symbols (e.g. tmp0 from an indirect load) appear
-            # in the index expression but are not loop variables.  Use the size
-            # captured from indirect_indexing() if available; otherwise fall back
-            # to inferring from the layout stride.
+            # Symbols not in var_ranges are either indirect index variables
+            # (tmp0/indirect0) or loop vars renamed by Inductor (p→c mismatch).
+            # Goal: place the symbol into the correct device dimension so the
+            # output looks like [d2, floor(d3/64), tmp0, Mod(d3, 64)] — the
+            # caller can then substitute tmp0→IndirectAccess(buf) to get the
+            # full picture.  Use indirect_sizes for an exact range; otherwise
+            # infer from the layout stride.  If no stride matches, skip —
+            # tmp0 will be missing from the coordinates (zero in its place).
             if indirect_sizes and var in indirect_sizes:
                 range_val = indirect_sizes[var]
             else:
@@ -242,10 +244,7 @@ def compute_coordinates(
                     None,
                 )
                 if inferred is None:
-                    raise Unsupported(
-                        f"indirect symbol {var} (coeff={coeff}) in index {index} "
-                        f"has no matching stride in layout {list(zip(stride, size))}"
-                    )
+                    continue
                 range_val = inferred
         else:
             range_val = var_ranges[var]

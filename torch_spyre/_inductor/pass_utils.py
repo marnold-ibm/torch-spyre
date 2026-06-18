@@ -350,11 +350,6 @@ def indirect_sizes_from_op(
 
     Returns the valid index range for each indirect symbol, captured from the
     size argument of indirect_indexing() during inner_fn re-execution.
-
-    Note: call sites that also need indirect_index_dep_names() will re-execute
-    inner_fn twice. This is intentional — inner_fn re-execution is a cheap
-    mock-handler walk at compile time, and keeping the helpers single-purpose
-    is clearer than merging them.
     """
     _, sizes = _build_indirect_load_subs(op)
     return sizes
@@ -447,13 +442,14 @@ def _build_indirect_load_subs(
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
         size = indirect_index_size_map.get(d.name)
-        for sym in d.index.free_symbols:
-            if sym not in d.ranges:
-                subs[sym] = IndexedBase(indirect_index_dep.name)[
-                    indirect_index_dep.index
-                ]
-                if size is not None:
-                    sizes[sym] = size
+        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
+        assert len(indirect_syms) <= 1, (
+            f"expected at most one indirect symbol in {d.name}, got {indirect_syms}"
+        )
+        for sym in indirect_syms:
+            subs[sym] = IndexedBase(indirect_index_dep.name)[indirect_index_dep.index]
+            if size is not None:
+                sizes[sym] = size
     return subs, sizes
 
 

@@ -749,16 +749,11 @@ def compute_layouts(
                 if arg.dep.name in indirect_index_names:
                     continue
                 for j, stl in enumerate(arg.layouts):
-                    d_coords_raw: object
-                    d_coords_subs: object
+                    d_coords_raw = device_coordinates(
+                        stl, arg.dep, indirect_sizes=ind_sizes
+                    )
                     try:
-                        d_coords_raw = device_coordinates(
-                            stl, arg.dep, indirect_sizes=ind_sizes
-                        )
-                    except Exception as e:
-                        d_coords_raw = f"<error: {e}>"
-                    try:
-                        d_coords_subs = device_coordinates(
+                        d_coords_subs: object = device_coordinates(
                             stl, arg.dep, indirect_subs, ind_sizes
                         )
                     except Exception as e:
