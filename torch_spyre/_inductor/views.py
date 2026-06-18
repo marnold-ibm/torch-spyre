@@ -17,6 +17,7 @@
 from dataclasses import dataclass, astuple
 import math
 import sympy
+import warnings
 from typing import Optional, Sequence, Dict, Tuple, Callable
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
@@ -219,33 +220,17 @@ def compute_coordinates(
         # injected by dynamic shapes that appear in the index expression
         # but are not iteration variables).
         if var not in var_ranges:
-            # Symbols not in var_ranges are either indirect index variables
-            # (tmp0/indirect0) or loop vars renamed by Inductor (p→c mismatch).
-            # Goal: place the symbol into the correct device dimension so the
-            # output looks like [d2, floor(d3/64), tmp0, Mod(d3, 64)] — the
-            # caller can then substitute tmp0→IndirectAccess(buf) to get the
-            # full picture.  Use indirect_sizes for an exact range; otherwise
-            # infer from the layout stride.  If no stride matches, skip —
-            # tmp0 will be missing from the coordinates (zero in its place).
+            # Indirect index variables (tmp0/indirect0) are not loop vars.
+            # Their range must be passed via indirect_sizes.  If missing,
+            # skip and warn — the symbol will be absent from the coordinates.
             if indirect_sizes and var in indirect_sizes:
                 range_val = indirect_sizes[var]
             else:
-                term = index.xreplace({v: 0 for v in vars - {var}})
-                try:
-                    coeff = int(term.xreplace({var: 1}))
-                except (TypeError, ValueError):
-                    continue
-                inferred = next(
-                    (
-                        sz
-                        for st, sz in zip(stride, size)
-                        if int(st) == coeff and int(sz) > 1
-                    ),
-                    None,
+                warnings.warn(
+                    f"compute_coordinates: symbol {var} not in var_ranges or "
+                    f"indirect_sizes (index={index}) — skipping"
                 )
-                if inferred is None:
-                    continue
-                range_val = inferred
+                continue
         else:
             range_val = var_ranges[var]
 
