@@ -23,6 +23,8 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
 
+from .errors import Unsupported
+
 
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
