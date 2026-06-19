@@ -485,6 +485,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # can correctly isolate each loop variable's contribution.
 
         index = concretize_index(tensor.index, set(it_space.keys()))
+        ind_sizes = self.indirect_sizes if self.indirect_sizes else None
         indirect_access_subs = (
             indirect_access_subs_from_kernel(self.indirect_vars)
             if self.indirect_vars
@@ -496,7 +497,19 @@ class SpyreKernel(Kernel[CSEVariable]):
             it_space,
             index,
             indirect_access_subs,
-            self.indirect_sizes if self.indirect_sizes else None,
+            ind_sizes,
+        )
+        raw_coords = (
+            compute_coordinates(
+                tensor.layout.device_layout.device_size,
+                tensor.layout.device_layout.stride_map,
+                it_space,
+                index,
+                None,
+                ind_sizes,
+            )
+            if indirect_access_subs is not None
+            else None
         )
         tensor_arg = TensorArg(
             is_input,
@@ -508,7 +521,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             name=opspec_name,
-            indirect_sizes=dict(self.indirect_sizes) if self.indirect_sizes else None,
+            raw_coordinates=raw_coords,
+            indirect_sizes=dict(ind_sizes) if ind_sizes else None,
         )
         if (
             "lx" not in tensor.layout.allocation

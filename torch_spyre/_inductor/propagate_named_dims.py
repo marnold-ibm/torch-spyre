@@ -50,6 +50,15 @@ _named_dims: dict[str, int] = {}
 _named_tensor_dims = WeakTensorKeyDictionary()
 _enabled = False
 
+# Named dims of the last op output from the most recent pass run.
+# Intended for test assertions only.
+_last_output_named_dims: list = []
+
+
+def get_last_output_named_dims() -> list:
+    """Return named dims of the final op output from the last pass run."""
+    return list(_last_output_named_dims)
+
 
 def reset():
     global _enabled
@@ -86,7 +95,11 @@ def _get_dim_prop_info(dep):
 
 
 def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
-    return next(iter(coord.free_symbols))
+    syms = coord.free_symbols
+    assert len(syms) == 1, (
+        f"_lone_sym: expected exactly 1 free symbol, got {syms} in {coord!r}"
+    )
+    return next(iter(syms))
 
 
 def _untracked_name(context: str, sym, size: int) -> str:
@@ -113,8 +126,45 @@ def _compute_named_layout(named_dims):
     return list(reversed(size)), list(reversed(stride[:-1]))
 
 
+def _decompose_coord(
+    coord: sympy.Expr,
+    named_dims: list[str],
+    dep_ranges: dict,
+    result: "dict[sympy.Symbol, list[str]]",
+) -> None:
+    """Map a single coordinate expression to named dims, recursing for view dims.
+
+    dep.index is always written against the buffer's physical strides, so
+    host_coordinates (which uses physical strides) correctly inverts it into
+    one coordinate per physical dim.  When all named dims have a 1-to-1
+    correspondence with physical dims the coordinate has exactly one free
+    symbol and maps directly to the named dim.
+
+    For view/reshape buffers a single physical dim spans multiple named dims.
+    The coordinate for that physical dim contains multiple free symbols — one
+    per named dim that was collapsed into it.  We detect this and sub-decompose
+    using the canonical strides of those named dims (which were declared to
+    exactly tile the physical dim) to recover the individual symbol→name
+    mappings.
+    """
+    if not coord.free_symbols:
+        return
+    if len(coord.free_symbols) == 1:
+        sym = next(iter(coord.free_symbols))
+        if sym in dep_ranges:
+            for name in named_dims:
+                result.setdefault(sym, []).append(name)
+        return
+    # Multiple free symbols: this physical dim was collapsed from several named
+    # dims.  Sub-decompose using canonical strides for those named dims.
+    sub_size, sub_stride = _compute_named_layout(named_dims)
+    sub_coords = compute_coordinates(sub_size, sub_stride, dep_ranges, coord)
+    for sub_coord, sub_name in zip(sub_coords, named_dims):
+        _decompose_coord(sub_coord, [sub_name], dep_ranges, result)
+
+
 def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
-    """Map loop vars to named dim names for a single input dep, using named-space coords."""
+    """Map loop vars to named dim names for a single input dep."""
     dpi = _get_dim_prop_info(dep)
     buf_named_dims = dpi.named_dims if dpi is not None else None
     if not buf_named_dims:
@@ -127,15 +177,47 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             sym: [_untracked_name(context, sym, int(size))]
             for sym, size in dep.ranges.items()
         }
-    named_size, named_stride = _compute_named_layout(buf_named_dims)
     ind_sizes = indirect_sizes_from_op(op) if op is not None else None
-    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index, indirect_sizes=ind_sizes)
+    buf = _get_buffer(dep)
+    layout = buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
+    if layout is not None:
+        # Always use physical strides: dep.index is generated against them.
+        # host_coordinates inverts dep.index into one coordinate per physical
+        # dim.  Each coordinate has one free symbol (normal case) or multiple
+        # (view/reshape: that physical dim spans several named dims).
+        phys_coords = host_coordinates(layout, dep, indirect_sizes=ind_sizes)
+    else:
+        # Graph input: _get_buffer returns None (inputs live in graph_inputs,
+        # not graph.buffers).  Graph inputs are always contiguous, so canonical
+        # strides equal physical strides.
+        named_size, named_stride = _compute_named_layout(buf_named_dims)
+        phys_coords = compute_coordinates(
+            named_size, named_stride, dep.ranges, dep.index, indirect_sizes=ind_sizes
+        )
+    # Assign physical-dim coordinates to named dims.  A physical dim that spans
+    # multiple named dims (view case) is handled by _decompose_coord.
+    # Group named dims by physical dim: one physical coord per physical dim, but
+    # named_dims may have more entries (view) or the same count (normal).
+    n_phys = len(phys_coords)
+    n_named = len(buf_named_dims)
     result: dict[sympy.Symbol, list[str]] = {}
-    for i, coord in enumerate(coords):
-        if coord.free_symbols:
-            sym = _lone_sym(coord)
-            if sym in dep.ranges:
-                result.setdefault(sym, []).append(buf_named_dims[i])
+    if n_phys == n_named:
+        for coord, name in zip(phys_coords, buf_named_dims):
+            _decompose_coord(coord, [name], dep.ranges, result)
+    else:
+        # View: distribute named dims across physical coords by size product.
+        # Walk named dims left-to-right, consuming them as their product fills
+        # each physical dim's size.
+        named_idx = 0
+        for phys_idx, coord in enumerate(phys_coords):
+            phys_size = int(layout.size[phys_idx])
+            group: list[str] = []
+            product = 1
+            while named_idx < n_named and product < phys_size:
+                product *= _named_dims[buf_named_dims[named_idx]]
+                group.append(buf_named_dims[named_idx])
+                named_idx += 1
+            _decompose_coord(coord, group, dep.ranges, result)
     for sym, names in result.items():
         actual_range = int(dep.ranges[sym])
         product = 1
@@ -244,6 +326,8 @@ def _compute_named_dims(op, inputs):
         loop_var_dims=loop_var_dims,
         reduction_named_dims=reduction_named_dims,
     )
+    global _last_output_named_dims
+    _last_output_named_dims = list(named_dims)
 
 
 def _log_dep_debug(
@@ -330,6 +414,8 @@ def _log_op(op: Operation) -> None:
 
 
 def _propagate_named_dims_impl(graph: GraphLowering) -> None:
+    global _last_output_named_dims
+    _last_output_named_dims = []
     operations = graph.operations
     if graph.graph_input_names:
         for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):

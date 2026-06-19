@@ -49,6 +49,13 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
+                IndirectAccess(name) nodes encode runtime-gathered indices; used by codegen.
+        raw_coordinates: Like device_coordinates but without IndirectAccess substitution — indirect
+                symbols appear as plain sympy Symbols.  Used for stride arithmetic (byte stride,
+                tile device size) where indirect symbols are treated as having their range from
+                indirect_sizes.  None when there is no indirect access.
+        indirect_sizes: Maps each indirect symbol to its valid index range.  Used together with
+                raw_coordinates for stride arithmetic.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
     """
 
@@ -61,7 +68,8 @@ class TensorArg:
     stride_map: list[int] | None = None
     per_tile_fixed: bool = False
     name: str | None = None
-    indirect_sizes: dict | None = None
+    raw_coordinates: "list[Expr] | None" = None
+    indirect_sizes: "dict[Symbol, int] | None" = None
 
 
 @dataclasses.dataclass

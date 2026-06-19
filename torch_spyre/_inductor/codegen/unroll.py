@@ -40,7 +40,7 @@ import copy
 import sympy
 from sympy import Symbol
 
-from torch_spyre._inductor.op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -61,25 +61,15 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
         "_byte_stride_for_arg: TensorArg has no stride_map — "
         "all TensorArgs reaching the unroller must be constructed with stride_map"
     )
-    all_syms: set = set()
-    for expr in arg.device_coordinates:
-        all_syms |= expr.free_symbols
-    # Treat IndirectAccess(name) as the full range of the indirect symbol so
-    # that the coordinate delta is computed correctly (same logic as
-    # compute_coordinates uses indirect_sizes for range).
-    indirect_subs_zero: dict = {}
-    indirect_subs_range: dict = {}
+    coords = arg.raw_coordinates if arg.raw_coordinates is not None else arg.device_coordinates
     ind_sizes = arg.indirect_sizes or {}
-    for expr in arg.device_coordinates:
-        for ia in expr.atoms(IndirectAccess):
-            sym = ia.args[0]
-            size = ind_sizes.get(sym, 0)
-            indirect_subs_zero[ia] = 0
-            indirect_subs_range[ia] = size
-    sub_zero = {**{s: 0 for s in all_syms}, **indirect_subs_zero}
-    sub_range = {**sub_zero, tiled_sym: tile_range, **indirect_subs_range}
+    all_syms: set = set()
+    for expr in coords:
+        all_syms |= expr.free_symbols
+    sub_zero = {**{s: 0 for s in all_syms}, **{s: 0 for s in ind_sizes}}
+    sub_range = {**sub_zero, tiled_sym: tile_range, **ind_sizes}
     total_elem_stride = 0
-    for d, coord_expr in enumerate(arg.device_coordinates):
+    for d, coord_expr in enumerate(coords):
         at_range = int(coord_expr.xreplace(sub_range))
         at_zero = int(coord_expr.xreplace(sub_zero))
         delta = at_range - at_zero
@@ -104,7 +94,7 @@ def _tile_device_size(
 
     Concretely: only update ``device_size[d]`` for dimensions whose delta is
     driven solely by row-like tiled symbols — symbols that do NOT appear in
-    ``device_coordinates[-1]`` (the within-stick coordinate).  The stick
+    ``raw_coordinates[-1]`` (the within-stick coordinate).  The stick
     column symbol appears in both the sticks-per-row coordinate and the
     within-stick coordinate, so it is excluded from this update.
     """
@@ -112,19 +102,17 @@ def _tile_device_size(
         "_tile_device_size: TensorArg has no stride_map — "
         "all TensorArgs reaching the unroller must be constructed with stride_map"
     )
+    coords = arg.raw_coordinates if arg.raw_coordinates is not None else arg.device_coordinates
+    ind_sizes = arg.indirect_sizes or {}
     all_syms: set = set()
-    for expr in arg.device_coordinates:
+    for expr in coords:
         all_syms |= expr.free_symbols
-    indirect_subs_zero: dict = {}
-    for expr in arg.device_coordinates:
-        for ia in expr.atoms(IndirectAccess):
-            indirect_subs_zero[ia] = 0
-    sub_zero = {**{s: 0 for s in all_syms}, **indirect_subs_zero}
+    sub_zero = {**{s: 0 for s in all_syms}, **{s: 0 for s in ind_sizes}}
 
     # Symbols that appear in the within-stick coordinate are column/stick
     # symbols; their sticks-per-row dimension encodes the row stride and must
     # not be shrunk to tile size.
-    stick_syms: set = arg.device_coordinates[-1].free_symbols
+    stick_syms: set = coords[-1].free_symbols
 
     result = list(arg.device_size)
     for tiled_sym in tiled_syms:
@@ -132,7 +120,7 @@ def _tile_device_size(
             continue
         tile_range = int(iteration_space[tiled_sym][0])
         sub_range = {**sub_zero, tiled_sym: tile_range}
-        for d, coord_expr in enumerate(arg.device_coordinates):
+        for d, coord_expr in enumerate(coords):
             at_range = int(coord_expr.xreplace(sub_range))
             at_zero = int(coord_expr.xreplace(sub_zero))
             delta = at_range - at_zero
