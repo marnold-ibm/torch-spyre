@@ -508,6 +508,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             name=opspec_name,
+            indirect_sizes=dict(self.indirect_sizes) if self.indirect_sizes else None,
         )
         if (
             "lx" not in tensor.layout.allocation

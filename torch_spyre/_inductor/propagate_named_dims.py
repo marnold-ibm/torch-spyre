@@ -33,7 +33,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
-from .pass_utils import host_coordinates, device_coordinates, op_out_coords
+from .pass_utils import host_coordinates, device_coordinates, op_out_coords, indirect_sizes_from_op
 from .ir import SpyreConstantFallback
 from .propagate_hints import DimHint, get_op_hints
 from .views import matching_dim, compute_coordinates
@@ -128,7 +128,8 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             for sym, size in dep.ranges.items()
         }
     named_size, named_stride = _compute_named_layout(buf_named_dims)
-    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
+    ind_sizes = indirect_sizes_from_op(op) if op is not None else None
+    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index, indirect_sizes=ind_sizes)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:

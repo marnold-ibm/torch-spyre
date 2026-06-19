@@ -40,7 +40,7 @@ import copy
 import sympy
 from sympy import Symbol
 
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -64,12 +64,24 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
-    sub_zero = {s: 0 for s in all_syms}
-    sub_range = {**sub_zero, tiled_sym: tile_range}
+    # Treat IndirectAccess(name) as the full range of the indirect symbol so
+    # that the coordinate delta is computed correctly (same logic as
+    # compute_coordinates uses indirect_sizes for range).
+    indirect_subs_zero: dict = {}
+    indirect_subs_range: dict = {}
+    ind_sizes = arg.indirect_sizes or {}
+    for expr in arg.device_coordinates:
+        for ia in expr.atoms(IndirectAccess):
+            sym = ia.args[0]
+            size = ind_sizes.get(sym, 0)
+            indirect_subs_zero[ia] = 0
+            indirect_subs_range[ia] = size
+    sub_zero = {**{s: 0 for s in all_syms}, **indirect_subs_zero}
+    sub_range = {**sub_zero, tiled_sym: tile_range, **indirect_subs_range}
     total_elem_stride = 0
     for d, coord_expr in enumerate(arg.device_coordinates):
-        at_range = int(coord_expr.subs(sub_range))
-        at_zero = int(coord_expr.subs(sub_zero))
+        at_range = int(coord_expr.xreplace(sub_range))
+        at_zero = int(coord_expr.xreplace(sub_zero))
         delta = at_range - at_zero
         if delta == 0:
             continue
@@ -103,7 +115,11 @@ def _tile_device_size(
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
-    sub_zero = {s: 0 for s in all_syms}
+    indirect_subs_zero: dict = {}
+    for expr in arg.device_coordinates:
+        for ia in expr.atoms(IndirectAccess):
+            indirect_subs_zero[ia] = 0
+    sub_zero = {**{s: 0 for s in all_syms}, **indirect_subs_zero}
 
     # Symbols that appear in the within-stick coordinate are column/stick
     # symbols; their sticks-per-row dimension encodes the row stride and must
@@ -117,8 +133,8 @@ def _tile_device_size(
         tile_range = int(iteration_space[tiled_sym][0])
         sub_range = {**sub_zero, tiled_sym: tile_range}
         for d, coord_expr in enumerate(arg.device_coordinates):
-            at_range = int(coord_expr.subs(sub_range))
-            at_zero = int(coord_expr.subs(sub_zero))
+            at_range = int(coord_expr.xreplace(sub_range))
+            at_zero = int(coord_expr.xreplace(sub_zero))
             delta = at_range - at_zero
             if delta > 0:
                 result[d] = delta

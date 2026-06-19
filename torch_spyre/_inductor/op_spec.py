@@ -61,6 +61,7 @@ class TensorArg:
     stride_map: list[int] | None = None
     per_tile_fixed: bool = False
     name: str | None = None
+    indirect_sizes: dict | None = None
 
 
 @dataclasses.dataclass
