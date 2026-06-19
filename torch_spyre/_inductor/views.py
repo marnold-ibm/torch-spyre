@@ -715,10 +715,11 @@ def align_tensors(
 
     # Iteration space should only contain loop variables, not indirect symbols.
     # Filter out any indirect symbols that were added during normalization.
+    indirect_syms = set(indirect_sizes.keys()) if indirect_sizes else set()
     new_iteration_space = {
         k: (v, new_op_it_space_splits[k])
         for k, v in new_var_ranges.items()
-        if k in var_ranges  # Only include original loop variables
+        if k not in indirect_syms
     }
 
     return new_iteration_space, new_tensors
