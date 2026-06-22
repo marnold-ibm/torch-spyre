@@ -545,14 +545,7 @@ def align_tensors(
 
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
-    # Collect all variables that appear in terms (loop vars + indirect symbols)
-    all_vars = set(var_ranges.keys())
-    for terms in all_terms:
-        for term in terms:
-            if term.var is not None:
-                all_vars.add(term.var)
-
-    splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
+    splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in var_ranges.keys()}
 
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
