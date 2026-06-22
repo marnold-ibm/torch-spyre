@@ -757,7 +757,7 @@ def compute_layouts(
 
     # Log substituted device coordinates for indirect index args. Useful for
     # debugging gather/scatter layout propagation, and also the canonical
-    # example of how to call device_coordinates() with indirect_load_subs
+    # example of how to call device_coordinates() with indirect_access_subs
     # pre-scheduler (keeping indirect_access_subs_from_op exercised and visible).
     if logger.isEnabledFor(logging.DEBUG):
         indirect_index_names = indirect_index_dep_names(op)

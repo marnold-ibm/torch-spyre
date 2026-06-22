@@ -128,24 +128,29 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             for sym, size in dep.ranges.items()
         }
     named_size, named_stride = _compute_named_layout(buf_named_dims)
-    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
+    # For Pointwise ops the iteration space is the output (write dep), so use the
+    # write index — it and dep.ranges are both output-space and consistent.
+    # For Reduction the iteration space is the input (read dep), so use the read
+    # index — already consistent with dep.ranges.
+    is_pointwise = op is not None and isinstance(op.data, Pointwise)
+    if is_pointwise:
+        write_dep = next(iter(op.get_read_writes().writes))
+        # Restrict write index to syms that appear in this input's read index.
+        # The write index spans the full output space; syms absent from the read
+        # index belong to other inputs (broadcast dims) and must be zeroed out.
+        read_syms = dep.index.free_symbols
+        index = write_dep.index.xreplace(
+            {s: sympy.S.Zero for s in write_dep.index.free_symbols - read_syms}
+        )
+    else:
+        index = dep.index
+    coords = compute_coordinates(named_size, named_stride, dep.ranges, index)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:
             sym = _lone_sym(coord)
             if sym in dep.ranges:
                 result.setdefault(sym, []).append(buf_named_dims[i])
-    for sym, names in result.items():
-        actual_range = int(dep.ranges[sym])
-        product = 1
-        for n in names:
-            product *= _named_dims.get(n, actual_range)
-        if actual_range != product:
-            logger.warning(
-                f"{dep.name}: loop var {sym} has range {actual_range} "
-                f"but maps to {names} with product {product} -- partial/sliced dim, "
-                f"continuing using range {actual_range}"
-            )
     return result
 
 
