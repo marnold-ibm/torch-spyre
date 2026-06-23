@@ -33,7 +33,12 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
-from .pass_utils import host_coordinates, device_coordinates, op_out_coords, find_reduction_var
+from .pass_utils import (
+    host_coordinates,
+    device_coordinates,
+    op_out_coords,
+    find_reduction_var,
+)
 from .ir import SpyreConstantFallback
 from .propagate_hints import DimHint, get_op_hints
 from .views import compute_coordinates
@@ -129,7 +134,7 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             for sym, size in dep.ranges.items()
         }
     named_size, named_stride = _compute_named_layout(buf_named_dims)
-    
+
     # Pointwise loop vars come from the output (write dep); see iteration_space_from_op.
     # For Pointwise intermediates, dep.index may use non-contiguous strides (e.g.
     # permute+contiguous), so use the write dep's index. Graph inputs and Reduction
@@ -226,8 +231,8 @@ def _compute_named_dims(op, inputs):
     for coord in out_coords:
         sym = _lone_sym(coord)
         if sym is not None and sym not in loop_var_dims:
-                size = int(output_dep.ranges[sym])
-                loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+            size = int(output_dep.ranges[sym])
+            loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
         reduction_sym = get_reduction_dim(inputs[0], output_dep)
@@ -245,11 +250,7 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(
-    label: str, dep: MemoryDep
-) -> (
-    None
-):  
+def _log_dep_debug(label: str, dep: MemoryDep) -> None:
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
