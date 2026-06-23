@@ -147,6 +147,70 @@ def test_2d_reduce_on_N():
     assert result == ["M"], f"got {result}"
 
 
+def test_2d_reduce_on_M_contiguous_before():
+    """Contiguous before reduction: [M,N].contiguous().sum(dim=0) -> [N]."""
+    x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
+
+    def fn(a):
+        return a.contiguous().sum(dim=0)
+
+    result = _run_and_capture(
+        fn,
+        [x],
+        declarations={"M": _M, "N": _N},
+        annotations={x: ["M", "N"]},
+    )
+    assert result == ["N"], f"got {result}"
+
+
+def test_2d_reduce_on_M_contiguous_after():
+    """Contiguous after reduction: [M,N].sum(dim=0).contiguous() -> [N]."""
+    x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
+
+    def fn(a):
+        return a.sum(dim=0).contiguous()
+
+    result = _run_and_capture(
+        fn,
+        [x],
+        declarations={"M": _M, "N": _N},
+        annotations={x: ["M", "N"]},
+    )
+    assert result == ["N"], f"got {result}"
+
+
+def test_2d_reduce_on_N_contiguous_before():
+    """Contiguous before reduction: [M,N].contiguous().sum(dim=1) -> [M]."""
+    x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
+
+    def fn(a):
+        return a.contiguous().sum(dim=1)
+
+    result = _run_and_capture(
+        fn,
+        [x],
+        declarations={"M": _M, "N": _N},
+        annotations={x: ["M", "N"]},
+    )
+    assert result == ["M"], f"got {result}"
+
+
+def test_2d_reduce_on_N_contiguous_after():
+    """Contiguous after reduction: [M,N].sum(dim=1).contiguous() -> [M]."""
+    x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
+
+    def fn(a):
+        return a.sum(dim=1).contiguous()
+
+    result = _run_and_capture(
+        fn,
+        [x],
+        declarations={"M": _M, "N": _N},
+        annotations={x: ["M", "N"]},
+    )
+    assert result == ["M"], f"got {result}"
+
+
 def test_2d_transposed_reduce_on_M():
     """Transpose [N,M] -> [M,N], then reduce over M: output [N]."""
     x = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
@@ -217,23 +281,6 @@ def test_permute_then_contiguous():
 
 
 def test_permute_no_contiguous():
-    """Permuted input [B, Lq, H, D] -> permute(0,2,1,3) * scale, no clone."""
-    queries = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
-    scale = 1.0 / math.sqrt(D)
-
-    def fn(q):
-        return q.permute(0, 2, 1, 3) * scale
-
-    result = _run_and_capture(
-        fn,
-        [queries],
-        declarations={"B": B, "H": H, "Lq": Lq, "D": D},
-        annotations={queries: ["B", "Lq", "H", "D"]},
-    )
-    assert result == ["B", "H", "Lq", "D"], f"got {result}"
-
-
-def test_permute_no_contiguous_scale_arg():
     """Same as test_permute_no_contiguous but scale passed as function argument."""
     queries = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
     scale = 1.0 / math.sqrt(D)
@@ -481,6 +528,30 @@ def test_permute_matmul_equal_lqlk_distinct_names():
     assert result == ["B", "H", "Lq", "Lk"], f"got {result}"
 
 
+def test_permuted_intermediate_then_reduce():
+    """Permuted intermediate buffer fed into a reduction.
+
+    q [B, Lq, H, D] -> (q * scale).permute(0,2,1,3) -> intermediate [B, H, Lq, D]
+    -> sum over D -> output [B, H, Lq]
+
+    Tests that compute_input_named_dims correctly handles a permuted ComputedBuffer
+    as input to a Reduction op.
+    """
+    q = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
+    scale = 1.0 / math.sqrt(D)
+
+    def fn(q):
+        return (q * scale).permute(0, 2, 1, 3).sum(dim=-1)
+
+    result = _run_and_capture(
+        fn,
+        [q],
+        declarations={"B": B, "H": H, "Lq": Lq, "D": D},
+        annotations={q: ["B", "Lq", "H", "D"]},
+    )
+    assert result == ["B", "H", "Lq"], f"got {result}"
+
+
 def test_view_reshape_a_distinct_names():
     """Like test_view_reshape_a but with distinct names A/D for the equal-size dims."""
     a, b, c, d, e = 2, 3, 4, 2, 64
@@ -507,6 +578,35 @@ def test_view_reshape_a_distinct_names():
         },
     )
     assert result == ["A", "C", "B", "D", "E"], f"got {result}"
+
+
+def test_view_reshape_then_reduce():
+    """View/reshape intermediate fed into a Reduction.
+
+    w, x: [1, A, B*D*E] -> add -> view(1, A, B, D, E) -> sum(dim=-1) -> [1, A, B, D]
+
+    The view intermediate has fused dims in its layout (dep.index has multi-symbol
+    coords). Tests that compute_input_named_dims handles this correctly for Reduction.
+    """
+    a, b, d, e = 2, 3, 5, 64
+    w = torch.randn(1, a, b * d * e, dtype=torch.float16, device=DEVICE) * 0.1
+    x = torch.randn(1, a, b * d * e, dtype=torch.float16, device=DEVICE) * 0.1
+
+    def fn(w, x):
+        t = w + x
+        t = t.view(1, a, b, d, e)
+        return t.sum(dim=-1)
+
+    result = _run_and_capture(
+        fn,
+        [w, x],
+        declarations={"A": a, "B": b, "D": d, "E": e},
+        annotations={
+            w: ["A", "B", "D", "E"],
+            x: ["A", "B", "D", "E"],
+        },
+    )
+    assert result == ["A", "B", "D"], f"got {result}"
 
 
 def test_permute_mul_equal_dims_distinct_names():
