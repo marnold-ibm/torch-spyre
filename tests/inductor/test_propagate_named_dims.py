@@ -243,7 +243,7 @@ def test_2d_transposed_reduce_on_N():
     assert result == ["M"], f"got {result}"
 
 
-# -------- Tests --------
+# -------- 4-D attention-shaped tests --------
 
 
 def test_no_permute():
@@ -281,7 +281,7 @@ def test_permute_then_contiguous():
 
 
 def test_permute_no_contiguous():
-    """Same as test_permute_no_contiguous but scale passed as function argument."""
+    """Permuted input [B, Lq, H, D] -> permute(0,2,1,3) * scale, no contiguous."""
     queries = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
     scale = 1.0 / math.sqrt(D)
 
@@ -502,7 +502,7 @@ def test_permute_mul_equal_dims():
     assert result == ["B", "L", "L", "D"], f"got {result}"
 
 
-# -------- Equal-size dim variants with distinct names (expected to fail) --------
+# -------- Equal-size dims with distinct names --------
 
 
 def test_permute_matmul_equal_lqlk_distinct_names():

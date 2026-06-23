@@ -143,7 +143,7 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     if is_intermediate and op is not None and isinstance(op.data, Pointwise):
         write_dep = next(iter(op.get_read_writes().writes))
         read_syms = dep.index.free_symbols
-        # Zero out syms not in this input's read index (broadcast dims from other inputs).
+        # Zero out output-space syms absent from this input's read index.
         index = write_dep.index.xreplace(
             {s: sympy.S.Zero for s in write_dep.index.free_symbols - read_syms}
         )
@@ -205,11 +205,6 @@ def get_input_named_dims(inputs: list, op=None) -> dict:
     return loop_var_dims
 
 
-def get_reduction_dim(dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
-    """Return the reduction loop variable: present in the input index but not the output."""
-    return find_reduction_var(dep, out_dep)
-
-
 @dataclasses.dataclass
 class _DimPropInfo:
     named_dims: list = dataclasses.field(default_factory=list)
@@ -235,7 +230,7 @@ def _compute_named_dims(op, inputs):
             loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = get_reduction_dim(inputs[0], output_dep)
+        reduction_sym = find_reduction_var(inputs[0], output_dep)
         if reduction_sym not in loop_var_dims:
             size = int(inputs[0].ranges[reduction_sym])
             loop_var_dims[reduction_sym] = [
