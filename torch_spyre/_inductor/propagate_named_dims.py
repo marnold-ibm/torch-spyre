@@ -161,7 +161,7 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             # Skip: size-1 dims are not annotated.  Broadcast dims (e.g. a [1,N]
             # buffer annotated ["M","N"]) silently become _untracked_ — we cannot
             # raise here without breaking legitimate unannotated size-1 dims.
-            # See test_broadcast_expand_* 
+            # See test_broadcast_expand_*
             continue
         names = _consume_names(remaining, dim_size)
         if not names:
