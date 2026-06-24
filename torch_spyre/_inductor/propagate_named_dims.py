@@ -120,6 +120,9 @@ def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
         product *= _named_dims.get(name, 1)
         if product == layout_size:
             return remaining[: i + 1]
+    logger.warning(
+        f"_consume_names: no prefix of {remaining} multiplies to {layout_size}"
+    )
     return []
 
 

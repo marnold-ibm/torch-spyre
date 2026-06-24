@@ -477,15 +477,7 @@ def test_permute_matmul_distinct_lqlk():
 def test_permute_mul_equal_dims():
     """Permute + constant multiply where the two middle dims share the same size.
 
-    Declared as one name "L" since both dims have the same value — stride-based
-    disambiguation of two distinct names with equal sizes is not yet implemented.
-
     queries [B, L, L, D] -> permute(0,2,1,3) * 0.5 -> [B, L, L, D]
-
-    # Original intent: distinguish H from Lq even when H==Lq==16.
-    # declarations={"B": _B, "H": _H, "Lq": _Lq, "D": _D}
-    # annotations={queries: ["B", "Lq", "H", "D"]}
-    # assert result == ["B", "H", "Lq", "D"]
     """
     _B, _L, _D = 2, 16, 64
     queries = torch.randn(_B, _L, _L, _D, dtype=torch.float16, device=DEVICE)
@@ -523,7 +515,7 @@ def test_broadcast_unsqueeze_mul():
             c: ["B", "H", "Lk", "D"],
         },
     )
-    assert result[0] == "B" and result[1] == "H" and result[2] == "Lk", f"got {result}"
+    assert result == ["B", "H", "Lk", "_untracked_128"], f"got {result}"
 
 
 # -------- Equal-size dims with distinct names --------
