@@ -486,6 +486,8 @@ def test_broadcast_unsqueeze_mul():
 
     amax forces c_reduced to materialize as a ComputedBuffer. Without the fix,
     zeroing the missing D sym inflates strides by D=128, mapping H to the wrong loop var.
+
+    x is left unannotated to exercise the untracked fallback path.
     """
     x = torch.randn(B, H, Lq, D, dtype=torch.float16, device=DEVICE)
     c = torch.randn(B, H, Lk, D, dtype=torch.float16, device=DEVICE)
