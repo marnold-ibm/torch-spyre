@@ -133,27 +133,19 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             sym: [_untracked_name(context, sym, int(size))]
             for sym, size in dep.ranges.items()
         }
-    named_size, named_stride = _compute_named_layout(buf_named_dims)
+    # Use the buffer's actual layout strides when available — they reflect the real
+    # storage order (including permuted views) and match dep.index directly.
+    # Fall back to _compute_named_layout only when layout is absent or rank-mismatched
+    # (e.g. view/reshape where the buffer has fewer storage dims than named dims).
+    buf = _get_buffer(dep)
+    layout = getattr(buf, "layout", None)
+    if layout is not None and len(layout.size) == len(buf_named_dims):
+        named_size = [int(s) for s in layout.size]
+        named_stride = [int(s) for s in layout.stride]
+    else:
+        named_size, named_stride = _compute_named_layout(buf_named_dims)
 
-    # compute_coordinates needs an index whose strides match named_stride (contiguous
-    # storage order). dep.index uses the buffer's actual storage strides — correct when
-    # the buffer is contiguous, but wrong when it's non-contiguous (e.g. permuted).
-    # For Pointwise intermediates, use write_dep.index (contiguous output-space strides)
-    # unless the input has fewer symbols than the output (broadcast/unsqueeze): zeroing
-    # the missing syms inflates all remaining strides by the product of the missing dims.
-    # dep has *more* symbols than write_dep when an extra reduction dim leaks into the
-    # read index — use write_dep.index there too (missing_syms tracks write→dep gap only).
-    index = dep.index
-    if (
-        isinstance(_get_buffer(dep), ComputedBuffer)
-        and op is not None
-        and isinstance(op.data, Pointwise)
-    ):
-        write_dep = next(iter(op.get_read_writes().writes))
-        missing_syms = write_dep.index.free_symbols - dep.index.free_symbols
-        if not missing_syms:
-            index = write_dep.index
-    coords = compute_coordinates(named_size, named_stride, dep.ranges, index)
+    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
         sym = _lone_sym(coord)

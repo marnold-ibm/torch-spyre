@@ -576,6 +576,35 @@ def test_permuted_intermediate_then_reduce():
     assert result == ["B", "H", "Lq"], f"got {result}"
 
 
+def test_permuted_intermediate_then_pointwise():
+    """Permuted ComputedBuffer fed into a second Pointwise op (no contiguous between).
+
+    q [B, Lq, H, D] -> (q * scale).permute(0,2,1,3) -> exp() -> intermediate [B,H,Lq,D]
+    -> * bias -> output [B, H, Lq, D]
+
+    The exp() intermediate is a ComputedBuffer with non-contiguous (permuted) strides.
+    dep.index for that buffer has the same free symbols as write_dep.index but different
+    strides. The missing_syms check correctly uses write_dep.index; the simpler == check
+    would also use write_dep.index here. This test validates the permuted-intermediate
+    case that originally motivated write_dep.index substitution.
+    """
+    q = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
+    bias = torch.randn(B, H, Lq, D, dtype=torch.float16, device=DEVICE)
+    scale = 1.0 / math.sqrt(D)
+
+    def fn(q, bias):
+        inter = (q * scale).permute(0, 2, 1, 3).exp()
+        return inter * bias
+
+    result = _run_and_capture(
+        fn,
+        [q, bias],
+        declarations={"B": B, "H": H, "Lq": Lq, "D": D},
+        annotations={q: ["B", "Lq", "H", "D"]},
+    )
+    assert result == ["B", "H", "Lq", "D"], f"got {result}"
+
+
 def test_view_reshape_a_distinct_names():
     """Like test_view_reshape_a but with distinct names A/D for the equal-size dims."""
     a, b, c, d, e = 2, 3, 4, 2, 64
