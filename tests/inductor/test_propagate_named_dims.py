@@ -502,6 +502,30 @@ def test_permute_mul_equal_dims():
     assert result == ["B", "L", "L", "D"], f"got {result}"
 
 
+def test_broadcast_unsqueeze_mul():
+    """Regression: broadcast intermediate must not use write-dep index substitution.
+
+    amax forces c_reduced to materialize as a ComputedBuffer. Without the fix,
+    zeroing the missing D sym inflates strides by D=128, mapping H to the wrong loop var.
+    """
+    x = torch.randn(B, H, Lq, D, dtype=torch.float16, device=DEVICE)
+    c = torch.randn(B, H, Lk, D, dtype=torch.float16, device=DEVICE)
+
+    def fn(a, c_full):
+        c_reduced = c_full.amax(dim=-1)  # [B,H,Lk,D] -> [B,H,Lk]
+        return c_reduced.unsqueeze(-1) * a
+
+    result = _run_and_capture(
+        fn,
+        [x, c],
+        declarations={"B": B, "H": H, "Lq": Lq, "Lk": Lk, "D": D},
+        annotations={
+            c: ["B", "H", "Lk", "D"],
+        },
+    )
+    assert result[0] == "B" and result[1] == "H" and result[2] == "Lk", f"got {result}"
+
+
 # -------- Equal-size dims with distinct names --------
 
 

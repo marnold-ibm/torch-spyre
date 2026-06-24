@@ -139,14 +139,17 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     # For Pointwise intermediates, dep.index may use non-contiguous strides (e.g.
     # permute+contiguous), so use the write dep's index. Graph inputs and Reduction
     # inputs are already consistent with the iteration space.
+    # Exception: broadcast inputs (unsqueeze) have fewer free symbols than the write dep.
+    # Zeroing the missing syms inflates all remaining strides by the product of the missing
+    # dims, producing wrong coordinate mappings. Use dep.index directly in that case.
     is_intermediate = isinstance(_get_buffer(dep), ComputedBuffer)
     if is_intermediate and op is not None and isinstance(op.data, Pointwise):
         write_dep = next(iter(op.get_read_writes().writes))
-        read_syms = dep.index.free_symbols
-        # Zero out output-space syms absent from this input's read index.
-        index = write_dep.index.xreplace(
-            {s: sympy.S.Zero for s in write_dep.index.free_symbols - read_syms}
-        )
+        missing_syms = write_dep.index.free_symbols - dep.index.free_symbols
+        if missing_syms:
+            index = dep.index
+        else:
+            index = write_dep.index
     else:
         index = dep.index
     coords = compute_coordinates(named_size, named_stride, dep.ranges, index)
