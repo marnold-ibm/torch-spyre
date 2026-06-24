@@ -117,7 +117,12 @@ def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
     """Return the prefix of remaining whose declared sizes multiply to layout_size."""
     product = 1
     for i, name in enumerate(remaining):
-        product *= _named_dims.get(name, 1)
+        if name not in _named_dims:
+            raise KeyError(
+                f"Named dim '{name}' used in name_tensor_dims but not declared -- "
+                f"call declare_tensor_dim('{name}', size) before compiling"
+            )
+        product *= _named_dims[name]
         if product == layout_size:
             return remaining[: i + 1]
     logger.warning(
@@ -149,23 +154,34 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             break
         dim_size = int(layout.size[i])
         if dim_size == 1:
+            # Size-1 dims carry no information and are not annotated by the user.
             continue
         names = _consume_names(remaining, dim_size)
         if not names:
             break
         remaining = remaining[len(names) :]
-        syms = sorted(
+        # Loop vars for this layout dim: symbols in the coord that are also
+        # loop variables of this dep (dep.ranges.keys()), sorted by coefficient
+        # descending so the outermost (largest-stride) var comes first.
+        loop_vars = sorted(
             coord.free_symbols & dep.ranges.keys(),
             key=lambda s: int(abs(coord.coeff(s))),
             reverse=True,
         )
-        if len(syms) == 1:
+        if len(loop_vars) == 1:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
-            result.setdefault(syms[0], []).extend(names)
+            result.setdefault(loop_vars[0], []).extend(names)
+        elif len(loop_vars) > len(names):
+            # More loop vars than named dims: a single named dim was split by reshape.
+            raise Unsupported(
+                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars but only "
+                f"{len(names)} name(s) {names} -- reshape split a named dim, "
+                f"re-annotate after the reshape"
+            )
         else:
-            # Multi-symbol coord: match each sym to one name by coefficient order
-            for sym, name in zip(syms, names):
-                result.setdefault(sym, []).append(name)
+            # Multi-loop-var coord: match each loop var to one name by coefficient order
+            for loop_var, name in zip(loop_vars, names):
+                result.setdefault(loop_var, []).append(name)
     return result
 
 
@@ -221,6 +237,7 @@ def _compute_named_dims(op, inputs):
             size = int(output_dep.ranges[sym])
             loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
     out_coords = op_out_coords(op)
+
     named_dims = []
     for coord in out_coords:
         sym = _lone_sym(coord)

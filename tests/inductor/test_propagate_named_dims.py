@@ -22,6 +22,7 @@
 
 import math
 
+import pytest
 import torch
 from torch._inductor.ir import ComputedBuffer
 from unittest.mock import patch
@@ -320,12 +321,6 @@ def test_permute_matmul():
     queries [B, L, H, D] -> permute -> [B, H, L, D]
     keys    [B, L, H, D] -> permute -> [B, H, D, L]
     output  matmul -> [B, H, L, L]
-
-    # Original used separate Lq/Lk names with Lq==Lk==256, which requires
-    # stride-based disambiguation that is not yet implemented.
-    # declarations={"B": B, "H": H, "Lq": Lq, "Lk": Lk, "D": D}
-    # annotations={queries: ["B", "Lq", "H", "D"], keys: ["B", "Lk", "H", "D"]}
-    # assert result == ["B", "H", "Lq", "Lk"]
     """
     queries = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
     keys = torch.randn(B, Lk, H, D, dtype=torch.float16, device=DEVICE)
@@ -356,14 +351,6 @@ def test_view_reshape_a():
     y:    [1, AD, C, AD, E] annotated ["AD", "C", "AD", "E"]
     z:    [1, AD, C, 1, 1, 1] annotated ["AD", "C"]
     output shape: [1, AD, C, B, AD, E]
-
-    # Original used separate names A and D both of size 2, which requires
-    # stride-based disambiguation not yet implemented.
-    # a, b, c, d, e = 2, 3, 4, 2, 64
-    # declarations={"A": a, "B": b, "C": c, "D": d, "E": e}
-    # annotations={w: ["A","B","D","E"], x: ["A","B","D","E"],
-    #              y: ["A","C","D","E"], z: ["A","C"]}
-    # assert result == ["A", "C", "B", "D", "E"]
     """
     ad, b, c, e = 2, 3, 4, 64
     w = torch.randn(1, ad, b * ad * e, dtype=torch.float16, device=DEVICE) * 0.1
@@ -669,3 +656,23 @@ def test_permute_mul_equal_dims_distinct_names():
         annotations={queries: ["B", "Lq", "H", "D"]},
     )
     assert result == ["B", "H", "Lq", "D"], f"got {result}"
+
+
+def test_reshape_1d_to_2d_exp():
+    """1-D tensor [4096] annotated ['A'] -> reshape(64,64) raises Unsupported.
+
+    A single named dim split by reshape cannot be propagated accurately.
+    """
+    _A = 4096
+    x = torch.randn(_A, dtype=torch.float16, device=DEVICE)
+
+    def fn(x):
+        return x.reshape(64, 64).exp()
+
+    with pytest.raises(Exception, match="reshape split a named dim"):
+        _run_and_capture(
+            fn,
+            [x],
+            declarations={"A": _A},
+            annotations={x: ["A"]},
+        )
