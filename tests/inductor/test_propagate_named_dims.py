@@ -676,3 +676,75 @@ def test_reshape_1d_to_2d_exp():
             declarations={"A": _A},
             annotations={x: ["A"]},
         )
+
+
+# -------- Stride-0 broadcast (torch.expand) tests --------
+
+
+def test_broadcast_expand_leading_dim():
+    """Broadcast annotation not yet supported: [1,N] annotated ["M","N"] produces _untracked_.
+
+    The size-1 leading dim is skipped; _consume_names(["M","N"], 128) fails because
+    "M"=64 is at the front of remaining. Both loop vars fall back to _untracked_.
+    See broadcast_named_dims_fix.txt for the full fix.
+    """
+    x = torch.randn(1, _N, dtype=torch.float16, device=DEVICE)
+    y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
+
+    def fn(a, b):
+        return a.expand(_M, _N) + b
+
+    result = _run_and_capture(
+        fn,
+        [x, y],
+        declarations={"M": _M, "N": _N},
+        annotations={x: ["M", "N"]},
+    )
+    assert result == ["_untracked_64", "_untracked_128"], f"got {result}"
+
+
+def test_broadcast_expand_trailing_dims():
+    """Broadcast annotation not yet supported: [M,1] annotated ["M","N"] produces _untracked_.
+
+    The M dim is assigned correctly; the trailing size-1 dim is skipped and "N"
+    remains in remaining. Inductor elides the N loop var from dep.ranges entirely
+    so it is never found. Falls back to _untracked_ for N.
+    See broadcast_named_dims_fix.txt for the full fix.
+    """
+    x = torch.randn(_M, 1, dtype=torch.float16, device=DEVICE)
+    y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
+
+    def fn(a, b):
+        return a.expand(_M, _N) + b
+
+    result = _run_and_capture(
+        fn,
+        [x, y],
+        declarations={"M": _M, "N": _N},
+        annotations={x: ["M", "N"]},
+    )
+    assert result == ["M", "_untracked_128"], f"got {result}"
+
+
+def test_broadcast_expand_middle_dim():
+    """Broadcast annotation not yet supported: [B,1,D] annotated ["B","H","D"] mis-maps.
+
+    B is assigned correctly; the middle size-1 dim is skipped and "H" stays in
+    remaining. _consume_names(["H","D"], D2=64) fails because "H"=32 is at the
+    front. D falls back to _untracked_ as well.
+    See broadcast_named_dims_fix.txt for the full fix.
+    """
+    _B2, _H2, _D2 = 4, 32, 64
+    x = torch.randn(_B2, 1, _D2, dtype=torch.float16, device=DEVICE)
+    y = torch.randn(_B2, _H2, _D2, dtype=torch.float16, device=DEVICE)
+
+    def fn(a, b):
+        return a.expand(_B2, _H2, _D2) + b
+
+    result = _run_and_capture(
+        fn,
+        [x, y],
+        declarations={"B2": _B2, "H2": _H2, "D2": _D2},
+        annotations={x: ["B2", "H2", "D2"]},
+    )
+    assert result == ["B2", "_untracked_32", "_untracked_64"], f"got {result}"

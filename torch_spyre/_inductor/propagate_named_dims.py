@@ -84,7 +84,11 @@ def _get_layout(dep) -> "FixedLayout | None":
     if buf is not None and hasattr(buf, "get_layout"):
         return buf.get_layout()
     tb = V.graph.graph_inputs.get(dep.name)
-    if tb is not None:
+    if (
+        isinstance(tb, TensorBox)
+        and isinstance(tb.data, StorageBox)
+        and isinstance(tb.data.data, InputBuffer)
+    ):
         return tb.data.data.layout
     return None
 
@@ -154,7 +158,10 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
             break
         dim_size = int(layout.size[i])
         if dim_size == 1:
-            # Size-1 dims carry no information and are not annotated by the user.
+            # Skip: size-1 dims are not annotated.  Broadcast dims (e.g. a [1,N]
+            # buffer annotated ["M","N"]) silently become _untracked_ — we cannot
+            # raise here without breaking legitimate unannotated size-1 dims.
+            # See test_broadcast_expand_* and broadcast_named_dims_fix.txt.
             continue
         names = _consume_names(remaining, dim_size)
         if not names:
@@ -177,6 +184,14 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
                 f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars but only "
                 f"{len(names)} name(s) {names} -- reshape split a named dim, "
                 f"re-annotate after the reshape"
+            )
+        elif len(loop_vars) < len(names):
+            # Fewer loop vars than names: a size-1 declared dim was fused into
+            # this layout dim and zip would silently drop the trailing name(s).
+            raise Unsupported(
+                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop var(s) "
+                f"but {len(names)} name(s) {names} -- a declared size-1 name "
+                f"may be fused here; omit size-1 names from the annotation"
             )
         else:
             # Multi-loop-var coord: match each loop var to one name by coefficient order
