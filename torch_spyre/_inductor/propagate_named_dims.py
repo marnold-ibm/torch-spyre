@@ -135,23 +135,24 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
         }
     named_size, named_stride = _compute_named_layout(buf_named_dims)
 
-    # Pointwise loop vars come from the output (write dep); see iteration_space_from_op.
-    # For Pointwise intermediates, dep.index may use non-contiguous strides (e.g.
-    # permute+contiguous), so use the write dep's index. Graph inputs and Reduction
-    # inputs are already consistent with the iteration space.
-    # Exception: broadcast inputs (unsqueeze) have fewer free symbols than the write dep.
-    # Zeroing the missing syms inflates all remaining strides by the product of the missing
-    # dims, producing wrong coordinate mappings. Use dep.index directly in that case.
-    is_intermediate = isinstance(_get_buffer(dep), ComputedBuffer)
-    if is_intermediate and op is not None and isinstance(op.data, Pointwise):
+    # compute_coordinates needs an index whose strides match named_stride (contiguous
+    # storage order). dep.index uses the buffer's actual storage strides — correct when
+    # the buffer is contiguous, but wrong when it's non-contiguous (e.g. permuted).
+    # For Pointwise intermediates, use write_dep.index (contiguous output-space strides)
+    # unless the input has fewer symbols than the output (broadcast/unsqueeze): zeroing
+    # the missing syms inflates all remaining strides by the product of the missing dims.
+    # dep has *more* symbols than write_dep when an extra reduction dim leaks into the
+    # read index — use write_dep.index there too (missing_syms tracks write→dep gap only).
+    index = dep.index
+    if (
+        isinstance(_get_buffer(dep), ComputedBuffer)
+        and op is not None
+        and isinstance(op.data, Pointwise)
+    ):
         write_dep = next(iter(op.get_read_writes().writes))
         missing_syms = write_dep.index.free_symbols - dep.index.free_symbols
-        if missing_syms:
-            index = dep.index
-        else:
+        if not missing_syms:
             index = write_dep.index
-    else:
-        index = dep.index
     coords = compute_coordinates(named_size, named_stride, dep.ranges, index)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
