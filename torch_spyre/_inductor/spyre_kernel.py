@@ -1016,4 +1016,3 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
             arg.device_coordinates = [
                 c.xreplace(indirect_access_subs) for c in arg.device_coordinates
             ]
- 
