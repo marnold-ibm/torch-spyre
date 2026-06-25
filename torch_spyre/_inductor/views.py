@@ -226,6 +226,10 @@ def compute_coordinates(
             # code that doesn't yet support indirect access to proceed.
             if indirect_sizes and var in indirect_sizes:
                 range_val = indirect_sizes[var]
+            elif indirect_sizes is not None:
+                raise Unsupported(
+                    f"indirect symbol {var} not found in indirect_sizes {indirect_sizes}"
+                )
             else:
                 continue
         else:

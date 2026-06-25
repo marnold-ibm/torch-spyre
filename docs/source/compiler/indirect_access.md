@@ -88,10 +88,10 @@ built differs between pipeline stages:
 | Post-scheduler (`SpyreKernel`) | `indirect0`, `indirect1`, … (Spyre-assigned) | `SpyreKernel.indirect_sizes` — populated by `SpyreKernelOpsHandler.indirect_indexing()` during kernel body execution; passed to `compute_coordinates` from `create_tensor_arg` |
 
 If `indirect_sizes` is not passed — as is currently the case for callers like
-`propagate_named_dims` — the indirect symbol is skipped with a warning and its
-contribution is left as zero in the output coordinates.  Whether this is
-acceptable or whether `indirect_sizes` should be required is TBD; making it
-mandatory would force all callers to supply it and surface any gaps.
+`propagate_named_dims` — the indirect symbol is silently skipped and its
+contribution is left as zero in the output coordinates. If `indirect_sizes` is
+passed but does not contain a symbol that appears in the index, `Unsupported`
+is raised immediately rather than producing silently wrong coordinates.
 
 ### Naming indirect symbols: `IndirectAccess`
 

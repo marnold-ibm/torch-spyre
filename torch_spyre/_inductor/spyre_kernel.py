@@ -469,6 +469,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
 
+    def indirect_var_names(self) -> "frozenset[str] | None":
+        if not self.indirect_vars:
+            return None
+        return frozenset(t.name for t in self.indirect_vars.values())
+
     def __enter__(self) -> Self:
         super().__enter__()
         self.exit_stack.enter_context(
@@ -699,7 +704,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
             op_info.update(value.op_info)
-            self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
+            self.op_specs.append(
+                self.create_op_spec(
+                    value.op, False, args, op_info, self.indirect_var_names()
+                )
+            )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             if self.indirect_vars:
@@ -736,12 +745,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
-            indirect_var_names = (
-                frozenset(t.name for t in self.indirect_vars.values())
-                if self.indirect_vars
-                else None
-            )
-            op_spec = self.create_op_spec(op, False, args, op_info, indirect_var_names)
+            op_spec = self.create_op_spec(op, False, args, op_info, self.indirect_var_names())
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")

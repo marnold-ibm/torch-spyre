@@ -468,9 +468,10 @@ def _build_indirect_load_subs(
         indirect_index_dep = dep_by_name[indirect_index_buf]
         size = indirect_index_size_map.get(d.name)
         indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
-        assert len(indirect_syms) <= 1, (
-            f"expected at most one indirect symbol in {d.name}, got {indirect_syms}"
-        )
+        if len(indirect_syms) > 1:
+            raise Unsupported(
+                f"multiple indirect symbols in {d.name}: {indirect_syms}"
+            )
         for sym in indirect_syms:
             subs[sym] = IndexedBase(indirect_index_dep.name)[indirect_index_dep.index]
             if size is not None:
@@ -931,6 +932,10 @@ def compute_restickify_needed(
     )
     if op is not None and in_dep.name in ind_names:
         return False, None
+    # Pass None (not {}) when there are no indirect symbols: compute_coordinates
+    # treats indirect_sizes=None as "caller doesn't track indirect ops, skip
+    # unknown symbols silently", while indirect_sizes={} would raise Unsupported
+    # on any dynamic-shape symbol that isn't a loop variable.
     idc = device_coordinates(in_stl, in_dep, indirect_sizes=ind_sizes or None)
     out_idc = device_coordinates(out_stl, out_dep, indirect_sizes=ind_sizes or None)
     assert idc, "device_coordinates returned empty list for input"
