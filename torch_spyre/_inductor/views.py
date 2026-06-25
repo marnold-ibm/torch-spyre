@@ -17,7 +17,6 @@
 from dataclasses import dataclass, astuple
 import math
 import sympy
-import warnings
 from typing import Optional, Sequence, Dict, Tuple, Callable
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
@@ -223,15 +222,11 @@ def compute_coordinates(
         # but are not iteration variables).
         if var not in var_ranges:
             # Indirect index variables (tmp0/indirect0) are not loop vars.
-            # Their range must be passed via indirect_sizes.  If missing,
-            # skip and warn — the symbol will be absent from the coordinates.
+            # Skip if indirect_sizes not provided — allows pre-scheduler
+            # code that doesn't yet support indirect access to proceed.
             if indirect_sizes and var in indirect_sizes:
                 range_val = indirect_sizes[var]
             else:
-                warnings.warn(
-                    f"compute_coordinates: symbol {var} not in var_ranges or "
-                    f"indirect_sizes (index={index}) — skipping"
-                )
                 continue
         else:
             range_val = var_ranges[var]

@@ -65,9 +65,7 @@ from .pass_utils import (
     host_coordinates,
     device_coordinates,
     is_stick_expr_offset_free,
-    indirect_index_dep_names,
-    indirect_access_subs_from_op,
-    indirect_sizes_from_op,
+    indirect_info_from_op,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -571,8 +569,7 @@ def _multi_arg_pointwise_layouts(
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
-    indirect_index_names = indirect_index_dep_names(op)
-    ind_sizes = indirect_sizes_from_op(op)
+    indirect_index_names, _, ind_sizes = indirect_info_from_op(op)
     # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
         stick_expr
@@ -741,10 +738,8 @@ def compute_layouts(
     # example of how to call device_coordinates() with indirect_access_subs
     # pre-scheduler (keeping indirect_access_subs_from_op exercised and visible).
     if logger.isEnabledFor(logging.DEBUG):
-        indirect_index_names = indirect_index_dep_names(op)
+        indirect_index_names, indirect_subs, ind_sizes = indirect_info_from_op(op)
         if indirect_index_names:
-            indirect_subs = indirect_access_subs_from_op(op)
-            ind_sizes = indirect_sizes_from_op(op)
             for arg in args:
                 if arg.dep.name in indirect_index_names:
                     continue

@@ -344,11 +344,23 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     return names
 
 
+def indirect_info_from_op(
+    op: ComputedBuffer,
+) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int]]":
+    """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass."""
+
+    subs, sizes = _build_indirect_load_subs(op)
+    names: set[str] = {expr.base.name for expr in subs.values()}
+    names |= _find_scatter_index_buf_names(op)
+    access_subs = {
+        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in subs.items()
+    }
+    return names, access_subs, sizes
+
+
 def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in loads or stores."""
-    subs, _ = _build_indirect_load_subs(op)
-    names = {expr.base.name for expr in subs.values()}
-    names |= _find_scatter_index_buf_names(op)
+    names, _, _ = indirect_info_from_op(op)
     return names
 
 
@@ -360,7 +372,7 @@ def indirect_sizes_from_op(
     Returns the valid index range for each indirect symbol, captured from the
     size argument of indirect_indexing() during inner_fn re-execution.
     """
-    _, sizes = _build_indirect_load_subs(op)
+    _, _, sizes = indirect_info_from_op(op)
     return sizes
 
 
@@ -476,10 +488,8 @@ def indirect_access_subs_from_op(
     load produced each indirect index. The resulting subs can be passed to
     device_coordinates() to replace indirect symbols with IndirectAccess(name).
     """
-    raw, _ = _build_indirect_load_subs(op)
-    return {
-        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
-    }
+    _, access_subs, _ = indirect_info_from_op(op)
+    return access_subs
 
 
 def indirect_access_subs_from_kernel(
@@ -916,11 +926,13 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    ind_sizes = indirect_sizes_from_op(op) if op is not None else None
-    if op is not None and in_dep.name in indirect_index_dep_names(op):
+    ind_names, _, ind_sizes = (
+        indirect_info_from_op(op) if op is not None else (set(), {}, {})
+    )
+    if op is not None and in_dep.name in ind_names:
         return False, None
-    idc = device_coordinates(in_stl, in_dep, indirect_sizes=ind_sizes)
-    out_idc = device_coordinates(out_stl, out_dep, indirect_sizes=ind_sizes)
+    idc = device_coordinates(in_stl, in_dep, indirect_sizes=ind_sizes or None)
+    out_idc = device_coordinates(out_stl, out_dep, indirect_sizes=ind_sizes or None)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
