@@ -1048,7 +1048,6 @@ def test_broadcast_expand_middle_dim():
         tensor_dims={x: ["B2", "H2", "D2"]},
         expected_propagated_dims=["B2", "_untracked_32", "_untracked_64"],
     )
-    assert result == ["B2", "_untracked_32", "_untracked_64"], f"got {result}"
 
 
 # -------- Indirect-access (gather) tests --------
