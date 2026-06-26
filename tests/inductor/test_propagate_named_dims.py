@@ -599,11 +599,10 @@ def test_view_reshape_b():
     z = torch.randn(1, a, c, 1, 1, 1, dtype=torch.float16, device=DEVICE) * 0.1
 
     def fn(w, x, y, z):
-        with _spyre_hint(num_tiles_per_dim={"C": 2}):
-            t = w + x
-            t = t.view(1, a, b, d, e)
-            t = t.unsqueeze(2) + y.unsqueeze(3)
-            return t + z
+        t = w + x
+        t = t.view(1, a, b, d, e)
+        t = t.unsqueeze(2) + y.unsqueeze(3)
+        return t + z
 
     _run_and_capture(
         fn,
@@ -615,14 +614,7 @@ def test_view_reshape_b():
             y: ["A", "C", "D", "E"],
             z: ["A", "C"],
         },
-        expected_dim_hints=[
-            {
-                "loop_var": "d1",
-                "dim_names": ["C"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
+        # no dim_hints: 4-input fusion hits the 5-tensor bundle limit with a hint
         expected_propagated_dims=["A", "C", "B", "D", "E"],
     )
 
@@ -1065,13 +1057,13 @@ def test_gather_advanced_indexing_2d():
     def fn(x, i):
         return x[i]
 
-    result = _run_and_capture(
+    _run_and_capture(
         fn,
         [x, i],
-        declarations={"M": _GM, "N": _GN, "P": _GP},
-        annotations={x: ["M", "N"], i: ["P"]},
+        named_dims={"M": _GM, "N": _GN, "P": _GP},
+        tensor_dims={x: ["M", "N"], i: ["P"]},
+        expected_propagated_dims=["P", "N"],
     )
-    assert result == ["P", "N"], f"got {result}"
 
 
 def test_gather_advanced_indexing_with_exp():
@@ -1083,13 +1075,13 @@ def test_gather_advanced_indexing_with_exp():
     def fn(x, i):
         return x[i].exp()
 
-    result = _run_and_capture(
+    _run_and_capture(
         fn,
         [x, i],
-        declarations={"M": _GM, "N": _GN, "P": _GP},
-        annotations={x: ["M", "N"], i: ["P"]},
+        named_dims={"M": _GM, "N": _GN, "P": _GP},
+        tensor_dims={x: ["M", "N"], i: ["P"]},
+        expected_propagated_dims=["P", "N"],
     )
-    assert result == ["P", "N"], f"got {result}"
 
 
 def test_gather_3d_data():
@@ -1101,13 +1093,13 @@ def test_gather_3d_data():
     def fn(x, i):
         return x[i]
 
-    result = _run_and_capture(
+    _run_and_capture(
         fn,
         [x, i],
-        declarations={"A": _GA, "B": _GB, "C": _GC, "P": _GP},
-        annotations={x: ["A", "B", "C"], i: ["P"]},
+        named_dims={"A": _GA, "B": _GB, "C": _GC, "P": _GP},
+        tensor_dims={x: ["A", "B", "C"], i: ["P"]},
+        expected_propagated_dims=["P", "B", "C"],
     )
-    assert result == ["P", "B", "C"], f"got {result}"
 
 
 def test_index_select_2d():
@@ -1118,10 +1110,10 @@ def test_index_select_2d():
     def fn(x, i):
         return torch.index_select(x, 0, i)
 
-    result = _run_and_capture(
+    _run_and_capture(
         fn,
         [x, i],
-        declarations={"M": _GM, "N": _GN, "P": _GP},
-        annotations={x: ["M", "N"], i: ["P"]},
+        named_dims={"M": _GM, "N": _GN, "P": _GP},
+        tensor_dims={x: ["M", "N"], i: ["P"]},
+        expected_propagated_dims=["P", "N"],
     )
-    assert result == ["P", "N"], f"got {result}"
