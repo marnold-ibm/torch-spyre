@@ -499,7 +499,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.stride_map,
             it_space,
             index,
-            self.indirect_sizes if self.indirect_sizes else None,
+            self.indirect_sizes,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -529,17 +529,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         from torch_spyre._inductor.constants import SPYRE_FP8_OPS
 
         for arg in args:
-            if _is_indirect_index_arg(arg, args):
-                continue
-            if indirect_var_names and arg.name in indirect_var_names:
-                # _is_indirect_index_arg catches the gather op itself, but when an
-                # index tensor is included in a fused kernel that also has a restickify
-                # (or other op that doesn't embed IndirectAccess in its coordinates),
-                # _is_indirect_index_arg returns False for that op: IDENTITY_OP /
-                # RESTICKIFY_OP coordinates are plain loop variables with no
-                # IndirectAccess wrapper, so the check never fires. This guard catches
-                # the case via the kernel-level indirect_vars set, which is always
-                # ground truth.
+            if _is_indirect_index_arg(arg, indirect_var_names):
                 continue
             # Check if operation supports the argument's dtype
             if not (
@@ -709,8 +699,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             if self.indirect_vars:
-                # Gather/scatter: create_tensor_arg applies indirect_access_subs automatically
-                # (via compute_coordinates) so all args come out with correct coordinates.
+                # Gather/scatter: coordinates are built with raw indirect symbols here;
+                # indirect_access_subs is applied later in codegen_kernel → simplify_op_spec.
                 # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
                 args = [
                     self.create_tensor_arg(
@@ -888,20 +878,17 @@ def _indirect_syms_used(
     }
 
 
-def _is_indirect_index_arg(arg: TensorArg, args: Sequence[TensorArg]) -> bool:
-    """Return True if arg is an indirect index tensor in this op spec.
+def _is_indirect_index_arg(
+    arg: TensorArg, indirect_var_names: "frozenset[str] | None"
+) -> bool:
+    """Return True if arg is an indirect index tensor (i.e. a gather index buffer).
 
-    An arg is an indirect index tensor if it has a name and that name appears
-    as the argument of an IndirectAccess in another arg's device_coordinates.
+    Uses the kernel-level indirect_var_names set, which is populated before
+    create_op_spec is called and is always ground truth regardless of whether
+    IndirectAccess substitution has run.
     """
-    if arg.name is None:
-        return False
-    return any(
-        arg.name == sym.name
-        for a in args
-        for coord in a.device_coordinates
-        for il in coord.atoms(IndirectAccess)
-        for sym in il.args
+    return arg.name is not None and bool(
+        indirect_var_names and arg.name in indirect_var_names
     )
 
 
@@ -997,6 +984,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
 
 
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
+    # Both parameters must be provided together for gather kernels — indirect_sizes
+    # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
     it_space = op_spec.iteration_space
 
     new_op_space_splits, new_tensors = align_tensors(

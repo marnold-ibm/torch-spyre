@@ -223,7 +223,7 @@ def compute_coordinates(
             # Indirect index variables (tmp0/indirect0) are not loop vars.
             # Skip if indirect_sizes not provided — allows pre-scheduler
             # code that doesn't yet support indirect access to proceed.
-            if indirect_sizes and var in indirect_sizes:
+            if indirect_sizes is not None and var in indirect_sizes:
                 range_val = indirect_sizes[var]
             elif indirect_sizes is not None:
                 raise Unsupported(
@@ -375,19 +375,20 @@ def normalize_coordinates(
         # with known sizes (from indirect_sizes). If so, treat them like loop vars.
         if not vars.issubset(var_ranges.keys()):
             unknown_vars = vars - var_ranges.keys()
-            if not (indirect_sizes and unknown_vars.issubset(indirect_sizes.keys())):
+            if not (
+                indirect_sizes is not None
+                and unknown_vars.issubset(indirect_sizes.keys())
+            ):
                 # Symbols with unknown ranges: pass the raw coordinate through
                 # as an opaque offset on a var=None term.
                 terms.append(Term(None, None, None, None, dim_size, offset=coordinate))
                 continue
-            # All unknown symbols are indirect with known sizes. Fall through to
-            # decompose them like loop variables, using indirect_sizes for their ranges.
         dim_terms = []  # terms for current dimension
         for var in vars:
             # Resolve the range for this variable: loop var from var_ranges, or indirect from indirect_sizes
             if var in var_ranges:
                 var_range = var_ranges[var]
-            elif indirect_sizes and var in indirect_sizes:
+            elif indirect_sizes is not None and var in indirect_sizes:
                 var_range = indirect_sizes[var]
             else:
                 raise Unsupported(
@@ -605,7 +606,7 @@ def align_tensors(
             # var can be a loop var or an indirect symbol
             if var in var_ranges:
                 new_var_ranges[var] = var_ranges[var]
-            elif indirect_sizes and var in indirect_sizes:
+            elif indirect_sizes is not None and var in indirect_sizes:
                 new_var_ranges[var] = indirect_sizes[var]
             else:
                 raise Unsupported(

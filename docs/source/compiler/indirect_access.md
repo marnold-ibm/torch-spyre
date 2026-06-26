@@ -87,11 +87,12 @@ built differs between pipeline stages:
 | Pre-scheduler (`propagate_layouts`) | `tmp0`, `tmp1`, … (Inductor-assigned) | `indirect_sizes_from_op(op)` in `pass_utils.py` — re-executes `inner_fn` via `_IndirectIndexFinder`, which intercepts `indirect_indexing()` calls and captures the size argument |
 | Post-scheduler (`SpyreKernel`) | `indirect0`, `indirect1`, … (Spyre-assigned) | `SpyreKernel.indirect_sizes` — populated by `SpyreKernelOpsHandler.indirect_indexing()` during kernel body execution; passed to `compute_coordinates` from `create_tensor_arg` |
 
-If `indirect_sizes` is not passed — as is currently the case for callers like
-`propagate_named_dims` — the indirect symbol is silently skipped and its
-contribution is left as zero in the output coordinates. If `indirect_sizes` is
-passed but does not contain a symbol that appears in the index, `Unsupported`
-is raised immediately rather than producing silently wrong coordinates.
+If `indirect_sizes=None` is passed — as is the case for structural callers that
+only check stick compatibility or layout shape — the indirect symbol is silently
+skipped and its contribution is left as zero in the output coordinates. If
+`indirect_sizes` is a dict but does not contain a symbol that appears in the
+index, `Unsupported` is raised immediately rather than producing silently wrong
+coordinates.
 
 ### Naming indirect symbols: `IndirectAccess`
 

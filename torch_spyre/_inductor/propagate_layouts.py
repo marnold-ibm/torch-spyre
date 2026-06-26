@@ -763,10 +763,13 @@ def compute_layouts(
                 if arg.dep.name in indirect_index_names:
                     continue
                 for j, stl in enumerate(arg.layouts):
-                    d_coords = device_coordinates(stl, arg.dep, ind_sizes)
+                    try:
+                        d_coords_str = str(device_coordinates(stl, arg.dep, ind_sizes))
+                    except Unsupported:
+                        d_coords_str = "<unsupported>"
                     logger.debug(
                         f"  indirect value {arg.dep.name} STL[{j}]"
-                        f"\n    d_coords={d_coords}"
+                        f"\n    d_coords={d_coords_str}"
                     )
 
     if len(args) > 1 and isinstance(data, Pointwise):

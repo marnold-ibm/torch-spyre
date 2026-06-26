@@ -352,7 +352,10 @@ def indirect_info_from_op(
     Pass op=None when there is no ComputedBuffer (e.g. structural callers that only
     check stick compatibility or layout shape). Returns (set(), {}, None), where
     sizes=None tells compute_coordinates to skip unknown symbols silently rather than
-    raising Unsupported.
+    raising Unsupported. None is returned when op has no indirect reads. If indirect
+    reads exist but none resolve to a known buffer (unexpected), sizes={} is returned;
+    in normalize_coordinates this still produces opaque-Term fallback (same as None),
+    but in compute_coordinates an unknown symbol would raise Unsupported.
     """
     if op is None:
         return set(), {}, None
@@ -404,7 +407,11 @@ class _IndirectIndexFinder:
 
     def load(self, name: str, index):
         if self._pending_indirect_index_buf is not None:
-            assert self._pending_indirect_index_size is not None
+            if self._pending_indirect_index_size is None:
+                raise Unsupported(
+                    f"indirect_indexing() set pending buf {self._pending_indirect_index_buf!r} "
+                    "but did not set pending size; single-slot protocol violated"
+                )
             self.indirect_index_by_buf[name] = self._pending_indirect_index_buf
             self.indirect_index_size_by_buf[name] = self._pending_indirect_index_size
             self._pending_indirect_index_buf = None
@@ -416,11 +423,12 @@ class _IndirectIndexFinder:
         # lowering always emits indirect_indexing() directly before the
         # consuming load(), so the single slot is never overwritten in between.
         if isinstance(index_var, _LoadSentinel):
-            assert self._pending_indirect_index_buf is None, (
-                f"indirect_indexing({index_var.name}) called before load() consumed "
-                f"the previous pending slot ({self._pending_indirect_index_buf}); "
-                "single-slot protocol violated"
-            )
+            if self._pending_indirect_index_buf is not None:
+                raise Unsupported(
+                    f"indirect_indexing({index_var.name}) called before load() consumed "
+                    f"the previous pending slot ({self._pending_indirect_index_buf}); "
+                    "chained indirect indexing is not supported"
+                )
             self._pending_indirect_index_buf = index_var.name
             self._pending_indirect_index_size = int(size)
         return sympy.S.Zero
@@ -443,7 +451,7 @@ def _find_indirect_index_bufs(
 
 def _build_indirect_load_subs(
     op: ComputedBuffer,
-) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int]]":
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
     """Map indirect symbols to (IndexedBase subs, sizes).
 
     Pre-scheduler only: re-executes inner_fn via _IndirectIndexFinder to learn
@@ -459,7 +467,7 @@ def _build_indirect_load_subs(
         if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
     ]
     if not any(d.is_indirect() for d in reads):
-        return {}, {}
+        return {}, None
     indirect_index_buf_map, indirect_index_size_map = _find_indirect_index_bufs(op)
     dep_by_name = {d.name: d for d in reads}
     subs = {}
