@@ -1129,10 +1129,10 @@ def test_gather_2d_index():
     def fn(x, i):
         return x[i]
 
-    result = _run_and_capture(
+    _run_and_capture(
         fn,
         [x, i],
-        declarations={"M": _GM, "N": _GN, "P": _GP, "Q": _GQ},
-        annotations={x: ["M", "N"], i: ["P", "Q"]},
+        named_dims={"M": _GM, "N": _GN, "P": _GP, "Q": _GQ},
+        tensor_dims={x: ["M", "N"], i: ["P", "Q"]},
+        expected_propagated_dims=["P", "Q", "N"],
     )
-    assert result == ["P", "Q", "N"], f"got {result}"
