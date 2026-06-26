@@ -535,8 +535,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # _is_indirect_index_arg catches the gather op itself, but when an
                 # index tensor is included in a fused kernel that also has a restickify
                 # (or other op that doesn't embed IndirectAccess in its coordinates),
-                # _is_indirect_index_arg returns False for that op. This guard catches
-                # it via the kernel-level indirect_vars set, which is always ground truth.
+                # _is_indirect_index_arg returns False for that op: IDENTITY_OP /
+                # RESTICKIFY_OP coordinates are plain loop variables with no
+                # IndirectAccess wrapper, so the check never fires. This guard catches
+                # the case via the kernel-level indirect_vars set, which is always
+                # ground truth.
                 continue
             # Check if operation supports the argument's dtype
             if not (

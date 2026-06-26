@@ -296,7 +296,7 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     """Return host coordinates for the output dep of a ComputedBuffer."""
     output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep, op)
+    return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
 
 
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
@@ -345,10 +345,17 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
 
 
 def indirect_info_from_op(
-    op: ComputedBuffer,
-) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int]]":
-    """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass."""
+    op: "ComputedBuffer | None",
+) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass.
 
+    Pass op=None when there is no ComputedBuffer (e.g. structural callers that only
+    check stick compatibility or layout shape). Returns (set(), {}, None), where
+    sizes=None tells compute_coordinates to skip unknown symbols silently rather than
+    raising Unsupported.
+    """
+    if op is None:
+        return set(), {}, None
     subs, sizes = _build_indirect_load_subs(op)
     names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
@@ -358,19 +365,14 @@ def indirect_info_from_op(
     return names, access_subs, sizes
 
 
-def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in loads or stores."""
-    names, _, _ = indirect_info_from_op(op)
-    return names
-
-
 def indirect_sizes_from_op(
-    op: ComputedBuffer,
-) -> "dict[sympy.Symbol, int]":
+    op: "ComputedBuffer | None",
+) -> "dict[sympy.Symbol, int] | None":
     """Build {indirect_sym → size} for a ComputedBuffer (pre-scheduler).
 
     Returns the valid index range for each indirect symbol, captured from the
     size argument of indirect_indexing() during inner_fn re-execution.
+    Pass op=None when there is no ComputedBuffer; returns None.
     """
     _, _, sizes = indirect_info_from_op(op)
     return sizes
@@ -402,11 +404,9 @@ class _IndirectIndexFinder:
 
     def load(self, name: str, index):
         if self._pending_indirect_index_buf is not None:
+            assert self._pending_indirect_index_size is not None
             self.indirect_index_by_buf[name] = self._pending_indirect_index_buf
-            if self._pending_indirect_index_size is not None:
-                self.indirect_index_size_by_buf[name] = (
-                    self._pending_indirect_index_size
-                )
+            self.indirect_index_size_by_buf[name] = self._pending_indirect_index_size
             self._pending_indirect_index_buf = None
             self._pending_indirect_index_size = None
         return _LoadSentinel(name)
@@ -416,6 +416,11 @@ class _IndirectIndexFinder:
         # lowering always emits indirect_indexing() directly before the
         # consuming load(), so the single slot is never overwritten in between.
         if isinstance(index_var, _LoadSentinel):
+            assert self._pending_indirect_index_buf is None, (
+                f"indirect_indexing({index_var.name}) called before load() consumed "
+                f"the previous pending slot ({self._pending_indirect_index_buf}); "
+                "single-slot protocol violated"
+            )
             self._pending_indirect_index_buf = index_var.name
             self._pending_indirect_index_size = int(size)
         return sympy.S.Zero
@@ -486,6 +491,10 @@ def indirect_access_subs_from_op(
     Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
     load produced each indirect index. The resulting subs can be passed to
     device_coordinates() to replace indirect symbols with IndirectAccess(name).
+
+    Note: internally calls indirect_info_from_op(), re-executing inner_fn. If you
+    already have the result of indirect_info_from_op(), use the access_subs field
+    directly rather than calling this function.
     """
     _, access_subs, _ = indirect_info_from_op(op)
     return access_subs
@@ -510,16 +519,16 @@ def indirect_access_subs_from_kernel(
 def host_coordinates(
     layout: FixedLayout,
     dep: MemoryDep,
-    op_for_indirect_access: "ComputedBuffer | None",
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
 ) -> list[sympy.Expr]:
     """Compute host-space coordinate expressions for a tensor access.
 
     Args:
         layout: Host layout of the tensor being accessed.
         dep: Memory dependency describing the access index and loop ranges.
-        op_for_indirect_access: The ComputedBuffer being analyzed, used to
-            extract indirect symbol sizes via indirect_sizes_from_op(). Pass
-            None at callers where indirect coordinates are irrelevant.
+        indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
+            None for structural callers (stick-compatibility checks, layout
+            matching) where indirect coordinates are irrelevant.
 
     Returns:
         One coordinate expression per host dimension.
@@ -529,11 +538,6 @@ def host_coordinates(
     # coordinate expressions remain symbolic.
     # TODO(issue#1373): remove concretization once compute_coordinates handles
     #              symbolic comparisons natively.
-    indirect_sizes = (
-        indirect_sizes_from_op(op_for_indirect_access)
-        if op_for_indirect_access is not None
-        else None
-    )
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     index = concretize_index(dep.index, set(dep.ranges.keys()))
@@ -651,26 +655,21 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    op_for_indirect_access: "ComputedBuffer | None",
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
 ) -> list[sympy.Expr]:
     """Compute device-space coordinate expressions for a tensor access.
 
     Args:
         stl: Device layout (SpyreTensorLayout) of the tensor being accessed.
         dep: Memory dependency describing the access index and loop ranges.
-        op_for_indirect_access: The ComputedBuffer being analyzed, used to
-            extract indirect symbol sizes via indirect_sizes_from_op(). Pass
-            None at callers where indirect coordinates are irrelevant.
+        indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
+            None for structural callers (stick-compatibility checks, layout
+            matching) where indirect coordinates are irrelevant.
 
     Returns:
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
-    indirect_sizes = (
-        indirect_sizes_from_op(op_for_indirect_access)
-        if op_for_indirect_access is not None
-        else None
-    )
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
@@ -947,18 +946,18 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    ind_names, _, _ = indirect_info_from_op(op) if op is not None else (set(), {}, {})
-    if op is not None and in_dep.name in ind_names:
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    if in_dep.name in ind_names:
         return False, None
-    idc = device_coordinates(in_stl, in_dep, op)
-    out_idc = device_coordinates(out_stl, out_dep, op)
+    idc = device_coordinates(in_stl, in_dep, ind_sizes)
+    out_idc = device_coordinates(out_stl, out_dep, ind_sizes)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
-    ic = host_coordinates(in_host, in_dep, op)
+    ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:

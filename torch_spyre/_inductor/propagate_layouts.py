@@ -64,8 +64,8 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
-    is_stick_expr_offset_free,
     indirect_info_from_op,
+    is_stick_expr_offset_free,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -593,20 +593,20 @@ def _multi_arg_pointwise_layouts(
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
-    indirect_index_names, _, _ = indirect_info_from_op(op)
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
     # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
         stick_expr
         for arg in args
         for stl in arg.layouts
-        if arg.dep.name not in indirect_index_names
-        and (stick_expr := device_coordinates(stl, arg.dep, op)[-1]) != 0
+        if arg.dep.name not in ind_names
+        and (stick_expr := device_coordinates(stl, arg.dep, ind_sizes)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep, op) for arg in args]
-    out_coords = host_coordinates(output, output_dep, None)
+    in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
+    out_coords = host_coordinates(output, output_dep, ind_sizes)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -636,7 +636,7 @@ def _multi_arg_pointwise_layouts(
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )
-            coord = device_coordinates(in_stl, arg.dep, op)
+            coord = device_coordinates(in_stl, arg.dep, ind_sizes)
             if not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
         return True
@@ -757,13 +757,13 @@ def compute_layouts(
     # Log device coordinates for indirect value args. Useful for debugging
     # gather/scatter layout propagation.
     if logger.isEnabledFor(logging.DEBUG):
-        indirect_index_names, _, _ = indirect_info_from_op(op)
+        indirect_index_names, _, ind_sizes = indirect_info_from_op(op)
         if indirect_index_names:
             for arg in args:
                 if arg.dep.name in indirect_index_names:
                     continue
                 for j, stl in enumerate(arg.layouts):
-                    d_coords = device_coordinates(stl, arg.dep, op)
+                    d_coords = device_coordinates(stl, arg.dep, ind_sizes)
                     logger.debug(
                         f"  indirect value {arg.dep.name} STL[{j}]"
                         f"\n    d_coords={d_coords}"

@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Tests for propagate_named_dims — the pass that annotates each op's output
-# with semantic named dim labels (B, H, Lq, etc.) by propagating them from
-# annotated graph inputs through the op graph.
+# Tests for propagate_named_dims and the dim_info mechanism.
 #
-# Each test compiles a small function, intercepts the pass via patching, and
-# asserts that the graph output buffer carries the expected named dims.
-# No coarse tiling hints are used — these tests cover propagation only.
+# These tests verify that named dim labels (B, H, Lq, etc.) are correctly
+# propagated. They do not exercise the Spyre backend — functions are compiled
+# and the pass is intercepted via patching before any backend codegen runs.
 
 import collections
 import math

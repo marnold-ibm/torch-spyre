@@ -36,6 +36,7 @@ from .errors import Unsupported
 from .pass_utils import (
     host_coordinates,
     device_coordinates,
+    indirect_sizes_from_op,
     op_out_coords,
     find_reduction_var,
 )
@@ -150,7 +151,7 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     layout = _get_layout(dep)
     if layout is None:
         return {}
-    coords = host_coordinates(layout, dep, op)
+    coords = host_coordinates(layout, dep, indirect_sizes_from_op(op))
     remaining = list(buf_named_dims)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
@@ -292,16 +293,19 @@ def _log_dep_debug(label: str, dep: MemoryDep, op=None) -> None:
     )
     dpi = _get_dim_prop_info(dep)
     named_dims = dpi.named_dims if dpi is not None else []
+    ind_sizes = indirect_sizes_from_op(op)
     logger.debug(f"  {label} {dep.name}: named_dims={named_dims}")
     if layout is not None:
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
-        logger.debug(f"    host_coordinates={host_coordinates(layout, dep, op)}")
+        logger.debug(f"    host_coordinates={host_coordinates(layout, dep, ind_sizes)}")
     stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
-        logger.debug(f"    device_coordinates={device_coordinates(stl, dep, None)}")
+        logger.debug(
+            f"    device_coordinates={device_coordinates(stl, dep, ind_sizes)}"
+        )
     logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
 
 
