@@ -745,7 +745,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
-            op_spec = self.create_op_spec(op, False, args, op_info, self.indirect_var_names())
+            op_spec = self.create_op_spec(
+                op, False, args, op_info, self.indirect_var_names()
+            )
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")

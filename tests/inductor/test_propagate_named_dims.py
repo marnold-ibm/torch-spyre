@@ -755,6 +755,7 @@ def test_broadcast_expand_middle_dim():
 # -------- Indirect-access (gather) tests --------
 
 _GM, _GN, _GP = 128, 256, 32
+_GQ = 192
 _GA, _GB, _GC = 64, 8, 64
 
 
@@ -827,3 +828,24 @@ def test_index_select_2d():
         annotations={x: ["M", "N"], i: ["P"]},
     )
     assert result == ["P", "N"], f"got {result}"
+
+
+@pytest.mark.skip(
+    reason="Backend cannot run - will un-skip this test once #2864 merged which skips backend execution"
+)
+def test_gather_2d_index():
+    """x[i]: x[M,N] gathered by 2-D index i[P,Q]. Output is [P,Q,N]; the
+    gathered M dim has a 2-D indirect index (0 loop vars); inner N propagates."""
+    x = torch.randn(_GM, _GN, dtype=torch.float16, device=DEVICE)
+    i = torch.randint(0, _GM, (_GP, _GQ), dtype=torch.int32, device=DEVICE)
+
+    def fn(x, i):
+        return x[i]
+
+    result = _run_and_capture(
+        fn,
+        [x, i],
+        declarations={"M": _GM, "N": _GN, "P": _GP, "Q": _GQ},
+        annotations={x: ["M", "N"], i: ["P", "Q"]},
+    )
+    assert result == ["P", "Q", "N"], f"got {result}"

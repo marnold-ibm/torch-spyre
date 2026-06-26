@@ -38,6 +38,7 @@ from .pass_utils import (
     device_coordinates,
     op_out_coords,
     find_reduction_var,
+    indirect_sizes_from_op,
 )
 from .ir import SpyreConstantFallback
 from .propagate_hints import DimHint, get_op_hints
@@ -150,7 +151,8 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     layout = _get_layout(dep)
     if layout is None:
         return {}
-    coords = host_coordinates(layout, dep)
+    indirect_sizes = indirect_sizes_from_op(op) if op is not None else None
+    coords = host_coordinates(layout, dep, indirect_sizes=indirect_sizes)
     remaining = list(buf_named_dims)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
@@ -285,7 +287,7 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep) -> None:
+def _log_dep_debug(label: str, dep: MemoryDep, op=None) -> None:
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -297,7 +299,10 @@ def _log_dep_debug(label: str, dep: MemoryDep) -> None:
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
-        logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
+        indirect_sizes = indirect_sizes_from_op(op) if op is not None else None
+        logger.debug(
+            f"    host_coordinates={host_coordinates(layout, dep, indirect_sizes=indirect_sizes)}"
+        )
     stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
@@ -420,10 +425,10 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
             if logger.isEnabledFor(logging.DEBUG):
                 for dep in inputs:
-                    _log_dep_debug("input", dep)
+                    _log_dep_debug("input", dep, op)
                 for dep in rw.writes:
                     if isinstance(dep, MemoryDep):
-                        _log_dep_debug("output", dep)
+                        _log_dep_debug("output", dep, op)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:

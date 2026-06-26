@@ -469,9 +469,7 @@ def _build_indirect_load_subs(
         size = indirect_index_size_map.get(d.name)
         indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
         if len(indirect_syms) > 1:
-            raise Unsupported(
-                f"multiple indirect symbols in {d.name}: {indirect_syms}"
-            )
+            raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
         for sym in indirect_syms:
             subs[sym] = IndexedBase(indirect_index_dep.name)[indirect_index_dep.index]
             if size is not None:
