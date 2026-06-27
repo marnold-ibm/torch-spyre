@@ -544,12 +544,16 @@ def align_tensors(
 
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
-    # Collect all variables that appear in terms (loop vars + indirect symbols)
-    all_vars = set(var_ranges.keys())
+    # Collect all variables that appear in terms (loop vars + indirect symbols).
+    # dict.fromkeys preserves insertion order; set() does not. This matters for two
+    # reasons: (1) frontend determinism; (2) backend workaround — the backend is
+    # sensitive to iteration_space dim label order even though semantically it
+    # should not be.
+    all_vars = dict.fromkeys(var_ranges.keys())
     for terms in all_terms:
         for term in terms:
             if term.var is not None:
-                all_vars.add(term.var)
+                all_vars[term.var] = None
 
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
