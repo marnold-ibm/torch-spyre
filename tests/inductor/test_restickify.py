@@ -842,7 +842,7 @@ def test_amax_full_and_amax_live_maximum():
         u_max = torch.amax(t, dim=-1)
         return torch.maximum(t_max, u_max)
 
-    _compare(f, t)
+    _compare(f, t, optimal_cost=0)
 
 
 # ------- Unsupported stick configurations ---------
