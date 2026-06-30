@@ -595,7 +595,7 @@ def _multi_arg_pointwise_layouts(
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     # Collect all unique stick expressions from input layouts (including 0 for
-    # broadcast/constant inputs; filtered by _pick_stick_dim returning -1 below)
+    # sparse tensors)
     stick_exprs = {
         device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
@@ -667,8 +667,8 @@ def _multi_arg_pointwise_layouts(
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             stick_dim = _pick_stick_dim(stick_expr, out_coords)
-            # -1 means the stick expr (e.g. 0 for a broadcast input) has no
-            # matching output dimension; skip until matching_dim is replaced.
+            # -1 means the stick expr has no matching output dimension; skip
+            # until matching_dim is replaced.
             if stick_dim != -1:
                 _try_stick_dim(stick_dim)
 
