@@ -120,7 +120,13 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
 
 
 def _compute_dim_order(stick_dim, size, coords):
-    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
+    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling.
+
+    When stick_dim is -1 (zero-stick / sparse layout), no explicit stick dim is appended;
+    the sparse layout encodes the stick as 0 via the stride_map.
+    """
+    if stick_dim == -1:
+        return list(range(len(size)))
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
     dim_order += [d for d in range(len(size)) if d != stick_dim and coords[d] == 0]
     dim_order += [stick_dim]
@@ -231,23 +237,15 @@ def _single_arg_op_layout(
         out_stl = _output_stl_from_stick_expr(
             x_stick_expr, output, output_dep, c_size, c_stride
         )
-        # Only return early when the stick survived the reduction (non-zero stick).
-        # If the stick was reduced away (zero-stick output), fall through to also
-        # generate non-zero alternatives so the beam can pick the best layout.
-        if (
-            out_stl is not None
-            and device_coordinates(out_stl, output_dep, None)[-1] != 0
-        ):
+        if out_stl is not None:
             return [out_stl]
 
-        # Try alternative layouts when input layout is not supported or stick was reduced away
+        # Try alternative layouts when input layout is not supported
         in_coords = host_coordinates(in_layout, dep, None)
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
         )
         layouts = []
-        if out_stl is not None:
-            layouts.append(out_stl)  # include the zero-stick layout as a candidate
         for in_dim in range(len(in_layout.size)):
             if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
@@ -658,6 +656,17 @@ def _multi_arg_pointwise_layouts(
 
     results: list[SpyreTensorLayout] = []
 
+    # An arg is "zero-stick-only" if every one of its candidate STLs has stick
+    # expression 0.  Such an arg can only participate in a zero-stick output.
+    any_zero_stick_only = any(
+        all(
+            device_coordinates(stl, arg.dep, ind_sizes)[-1] == 0
+            for stl in arg.layouts
+        )
+        for arg in args
+        if arg.dep.name not in ind_names
+    )
+
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
         results.append(
@@ -676,8 +685,12 @@ def _multi_arg_pointwise_layouts(
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             stick_dim = _pick_stick_dim(stick_expr, out_coords)
-            if stick_dim != -1:
-                _try_stick_dim(stick_dim)
+            _try_stick_dim(stick_dim)
+
+    # If any arg has only zero-stick candidates, zero-stick must also be a
+    # valid output candidate (all inputs can use their zero-stick STL).
+    if any_zero_stick_only:
+        _try_stick_dim(-1)
 
     # Try alternative layouts if no valid layouts found
     if not results:
