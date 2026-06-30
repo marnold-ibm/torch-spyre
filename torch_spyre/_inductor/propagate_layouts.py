@@ -594,13 +594,13 @@ def _multi_arg_pointwise_layouts(
     """
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
-    # Collect all unique non-zero stick expressions from input layouts
+    # Collect all unique stick expressions from input layouts (including 0 for
+    # broadcast/constant inputs; filtered by _pick_stick_dim returning -1 below)
     stick_exprs = {
-        stick_expr
+        device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        and (stick_expr := device_coordinates(stl, arg.dep, ind_sizes)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
@@ -642,6 +642,7 @@ def _multi_arg_pointwise_layouts(
         return True
 
     def _try_stick_dim(stick_dim):
+        assert stick_dim != -1
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
             results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order))
@@ -665,7 +666,11 @@ def _multi_arg_pointwise_layouts(
         }
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
-            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+            stick_dim = _pick_stick_dim(stick_expr, out_coords)
+            # -1 means the stick expr (e.g. 0 for a broadcast input) has no
+            # matching output dimension; skip until matching_dim is replaced.
+            if stick_dim != -1:
+                _try_stick_dim(stick_dim)
 
     # Try alternative layouts if no valid layouts found
     if not results:
@@ -840,6 +845,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
+        if c_size[stick_dim] > 1  # no dim size 1 in stick
     ]
     if not layouts:
         layouts = [generic_layout(op)]
