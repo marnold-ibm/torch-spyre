@@ -120,13 +120,7 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
 
 
 def _compute_dim_order(stick_dim, size, coords):
-    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling.
-
-    When stick_dim is -1 (zero-stick / sparse layout), no explicit stick dim is appended;
-    the sparse layout encodes the stick as 0 via the stride_map.
-    """
-    if stick_dim == -1:
-        return list(range(len(size)))
+    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
     dim_order += [d for d in range(len(size)) if d != stick_dim and coords[d] == 0]
     dim_order += [stick_dim]
@@ -669,8 +663,7 @@ def _multi_arg_pointwise_layouts(
         }
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
-            stick_dim = _pick_stick_dim(stick_expr, out_coords)
-            _try_stick_dim(stick_dim)
+            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
     # Try alternative layouts if no valid layouts found
     if not results:
