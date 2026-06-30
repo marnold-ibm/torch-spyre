@@ -600,15 +600,11 @@ def _multi_arg_pointwise_layouts(
     """
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
-    # Collect all unique non-zero stick expressions from input layouts.
-    # Zero stick (constant layout) inputs are compatible with any output layout
-    # and do not constrain the output stick choice.
     stick_exprs = {
-        stick_expr
+        device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        and (stick_expr := device_coordinates(stl, arg.dep, ind_sizes)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
@@ -656,17 +652,6 @@ def _multi_arg_pointwise_layouts(
 
     results: list[SpyreTensorLayout] = []
 
-    # An arg is "zero-stick-only" if every one of its candidate STLs has stick
-    # expression 0.  Such an arg can only participate in a zero-stick output.
-    any_zero_stick_only = any(
-        all(
-            device_coordinates(stl, arg.dep, ind_sizes)[-1] == 0
-            for stl in arg.layouts
-        )
-        for arg in args
-        if arg.dep.name not in ind_names
-    )
-
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
         results.append(
@@ -686,11 +671,6 @@ def _multi_arg_pointwise_layouts(
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             stick_dim = _pick_stick_dim(stick_expr, out_coords)
             _try_stick_dim(stick_dim)
-
-    # If any arg has only zero-stick candidates, zero-stick must also be a
-    # valid output candidate (all inputs can use their zero-stick STL).
-    if any_zero_stick_only:
-        _try_stick_dim(-1)
 
     # Try alternative layouts if no valid layouts found
     if not results:
