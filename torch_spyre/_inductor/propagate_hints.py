@@ -53,8 +53,21 @@ class DimHint:
 #                 DimHint(dim_names=["B"], split_count=4, loop_var=c1, ...)]
 
 
+# Final hint-id key (e.g. ``_hint_1``), assigned post-trace by number_spyre_hints().
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
-_hint_counter = 0
+
+# In-trace key prefix. spyre_hint() runs during Dynamo tracing, so it must stay
+# constant-foldable: reading mutable state (a counter, current_meta) gets guarded
+# or traced-into and recompiles the frame every call. So it annotates a pure key
+# from its kwargs and defers the ordered _hint_N id to number_spyre_hints().
+_SPYRE_HINT_PREFIX = "_spyre_hint::"
+
+
+def _content_key(kwargs: dict) -> str:
+    """Annotation key from kwargs alone: same kwargs -> same key (stable across
+    recompiles), distinct nested scopes -> distinct keys (so they accumulate)."""
+    return _SPYRE_HINT_PREFIX + repr(sorted(kwargs.items(), key=repr))
+
 
 # Snapshot of FX node `custom` meta taken at CustomPrePasses time, indexed
 # by call_function node position. Used by recover_spyre_hints to restore
@@ -64,13 +77,45 @@ _dim_hints: list[tuple[Any, dict[str, Any] | None]] = []
 
 
 def spyre_hint(**kwargs: Any):
-    """
-    Attach a hint and a unique hint id to every FX node in scope.
-    """
-    global _hint_counter
+    """Attach a hint to every FX node in scope. The ordered ``_hint_N`` id the
+    compiler consumes is assigned post-trace by number_spyre_hints()."""
+    return torch.fx.traceback.annotate({_content_key(kwargs): kwargs})
 
-    _hint_counter += 1
-    return torch.fx.traceback.annotate({f"_hint_{_hint_counter}": kwargs})
+
+def number_spyre_hints(graph: torch.fx.Graph) -> None:
+    """Rewrite pure-content spyre_hint keys into ordered ``_hint_N`` (post-trace).
+
+    Each node's ``custom`` dict lists its scope keys outermost-first (annotate
+    inserts them in nesting order).  We assign ids by a stable topological order
+    of the "appears-before on some node" relation, so an outer scope always gets
+    a smaller id than the scopes it encloses.  Per-graph and deterministic.
+    """
+    before: dict[str, set[str]] = {}  # key -> keys that must precede it
+    for node in graph.nodes:
+        chain = [
+            k
+            for k in ((node.meta or {}).get("custom") or {})
+            if k.startswith(_SPYRE_HINT_PREFIX)
+        ]
+        for i, key in enumerate(chain):
+            before.setdefault(key, set()).update(chain[:i])
+    if not before:
+        return
+
+    ordered: list[str] = []
+    placed: set[str] = set()
+    while len(placed) < len(before):
+        ready = sorted(k for k in before if k not in placed and before[k] <= placed)
+        ordered.extend(ready)
+        placed.update(ready)
+    key_to_id = {key: i + 1 for i, key in enumerate(ordered)}
+
+    for node in graph.nodes:
+        custom = (node.meta or {}).get("custom")
+        if not custom:
+            continue
+        for key in [k for k in custom if k.startswith(_SPYRE_HINT_PREFIX)]:
+            custom[f"_hint_{key_to_id[key]}"] = custom.pop(key)
 
 
 def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
@@ -106,6 +151,9 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     the ``target`` OpOverload is preserved and is what we align on.
     """
     global _dim_hints
+
+    # Assign ordered _hint_N ids before snapshotting.
+    number_spyre_hints(graph)
 
     _dim_hints = [
         (node.target, node.meta.get("custom"))
