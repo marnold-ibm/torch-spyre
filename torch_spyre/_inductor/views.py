@@ -254,6 +254,15 @@ def compute_coordinates(
         # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.xreplace({var: 1})
         limit = term.xreplace({var: range_val})
+
+        mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
+        if len(mods_with_var) > 1:
+            raise Unsupported(
+                f"Factored contraction: variable {var} (range {range_val}) appears "
+                f"in {len(mods_with_var)} Mod expressions {mods_with_var}. "
+                f"This layout cannot be mapped to device dimensions."
+            )
+
         add_term(var=var, step=step, limit=limit)
 
     # NOTE: indirect_access_subs substitution is NOT applied here. It is deferred to

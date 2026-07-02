@@ -66,7 +66,9 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+from .pass_utils import apply_splits_from_index_coeff, device_coordinates, iteration_space_from_op
+from .ir import FixedTiledLayout
+from torch._inductor.virtualized import V
 from .scratchpad.allocator import (
     StrategyBCoOptimizingAllocator,
     scratchpad_planning,
@@ -106,8 +108,56 @@ def _format_operations(operations: list[Operation]) -> str:
             if loop_info := getattr(op, "loop_info", None):
                 buf.write(f"\n  loop_info={loop_info}")
             buf.write(f"\n  {op.data}")
+            if isinstance(op.layout, FixedTiledLayout):
+                rw = op.get_read_writes()
+                write_dep = next(iter(rw.writes))
+                it_space = iteration_space_from_op(op)
+                coords = device_coordinates(op.layout.device_layout, write_dep, it_space)
+                out_name = op.get_operation_name()
+                buf.write(f"\n  device_coordinates(output={out_name})={coords}")
+                for read_dep in rw.reads:
+                    read_buf = V.graph.get_buffer(read_dep.name)
+                    if read_buf is None:
+                        continue
+                    read_layout = read_buf.get_layout()
+                    if not isinstance(read_layout, FixedTiledLayout):
+                        continue
+                    try:
+                        read_coords = device_coordinates(read_layout.device_layout, read_dep, it_space)
+                        buf.write(f"\n  device_coordinates(input={read_dep.name})={read_coords}")
+                    except Exception:
+                        pass
         buf.write("\n\n")
     return buf.getvalue()
+
+
+def _print_device_coordinates(graph: GraphLowering) -> None:
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        layout = op.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        rw = op.get_read_writes()
+        write_dep = next(iter(rw.writes))
+        it_space = iteration_space_from_op(op)
+        try:
+            coords = device_coordinates(layout.device_layout, write_dep, it_space)
+            print(f"  device_coordinates(output={op.get_operation_name()})={coords}")
+        except Exception:
+            pass
+        for read_dep in rw.reads:
+            read_buf = V.graph.get_buffer(read_dep.name)
+            if read_buf is None:
+                continue
+            read_layout = read_buf.get_layout()
+            if not isinstance(read_layout, FixedTiledLayout):
+                continue
+            try:
+                read_coords = device_coordinates(read_layout.device_layout, read_dep, None)
+                print(f"  device_coordinates(input={read_dep.name})={read_coords}")
+            except Exception:
+                pass
 
 
 def _graph_has_spyre_device(graph: torch.fx.graph.Graph) -> bool:
@@ -338,6 +388,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            _print_device_coordinates,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
@@ -360,18 +411,12 @@ class CustomPreSchedulingPasses:
         if not _operations_have_spyre_device(graph.operations):
             return
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "BEFORE PRE-SCHEDULING\n%s", _format_operations(graph.operations)
-            )
+        print("BEFORE PRE-SCHEDULING\n" + _format_operations(graph.operations))
 
         for pass_fn in self.passes:
             pass_fn(graph)
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "AFTER PRE-SCHEDULING\n%s", _format_operations(graph.operations)
-            )
+        print("AFTER PRE-SCHEDULING\n" + _format_operations(graph.operations))
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

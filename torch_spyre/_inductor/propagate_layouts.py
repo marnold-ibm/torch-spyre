@@ -197,6 +197,9 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     """
     for i, arg in enumerate(args):
         for stl in arg.layouts:
+            print(
+                f"_check_supported_input_sticks {op_label} arg{i}: dep.index={arg.dep.index} ranges={dict(arg.dep.ranges)} stl.device_size={list(stl.device_size)} stl.stride_map={list(stl.stride_map)}"
+            )
             stick_expr = device_coordinates(stl, arg.dep, None)[-1]
             if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
                 raise Unsupported(
@@ -558,6 +561,33 @@ def _matmul_layouts(
     reduction_var = find_reduction_var(x.dep, output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
 
+    def _fmt_arg(label, arg, req_var):
+        lines = [f"  {label}: name={arg.dep.name}"]
+        lines.append(f"    host size={list(arg.layout.size)}")
+        lines.append(f"    host stride={list(arg.layout.stride)}")
+        for i, stl in enumerate(arg.layouts):
+            try:
+                dev_coords = device_coordinates(stl, arg.dep, None)
+                stick = dev_coords[-1]
+                compatible = req_var in stick.free_symbols
+                lines.append(f"    candidate[{i}]:")
+                lines.append(f"      device_size={list(stl.device_size)}")
+                lines.append(f"      stride_map={list(stl.stride_map)}")
+                lines.append(f"      coords={dev_coords}")
+                lines.append(f"      stick={stick}  {req_var}_on_stick={compatible}")
+            except Unsupported as e:
+                lines.append(f"    candidate[{i}]: (unsupported: {e})")
+        return "\n".join(lines)
+    print(
+        f"{op.get_name()} _matmul_layouts {data.reduction_type}\n"
+        f"  output: size={list(output.size)}\n"
+        f"          stride={list(output.stride)}\n"
+        f"          host_coords={out_coords}\n"
+        f"  reduction_var={reduction_var}  generated_var={generated_var}\n"
+        f"{_fmt_arg('x', x, reduction_var)}\n"
+        f"{_fmt_arg('y', y, generated_var)}"
+    )
+
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
     )
@@ -584,6 +614,14 @@ def _matmul_layouts(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+
+    print(
+        f"{op.get_name()} _matmul_layouts result:\n"
+        f"  x_req_stl: device_size={list(x_req_stl.device_size)}  stride_map={list(x_req_stl.stride_map)}\n"
+        f"  y_req_stl: device_size={list(y_req_stl.device_size)}  stride_map={list(y_req_stl.stride_map)}\n"
+        f"  out_stl:   device_size={list(out_stl.device_size)}  stride_map={list(out_stl.stride_map)}"
+    )
+
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y], out_stl, [x_req_stl, y_req_stl], op
     )
