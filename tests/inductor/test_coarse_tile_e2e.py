@@ -472,6 +472,56 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
+    # Loop-invariant (broadcast) op gets per_tile_fixed=True
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "unroll_loops": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_loop_invariant_op_per_tile_fixed_in_sdsc(self):
+        """A loop-invariant ComputedBuffer inside a coarse-tile group must have
+        per_tile_fixed=True in the generated SDSC source, so the unroller does
+        not advance its address.
+
+        torch.full lowers to a scalar-fill ComputedBuffer with no loop var matching
+        the hinted dim.  Its loop_tiled_dims are all-empty, making it loop-invariant
+        w.r.t. the tiling.  finalize_layouts must stamp per_tile_fixed=True on it.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"M": 4}):
+                # torch.full produces a scalar-fill ComputedBuffer with no M-dim
+                # loop var — its loop_tiled_dims are all empty (loop-invariant).
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+                return x + bias
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        src = source_codes[0]
+        self.assertIn(
+            "per_tile_fixed=True",
+            src,
+            "Loop-invariant (scalar-fill) buffer must have per_tile_fixed=True in SDSC",
+        )
+
+    # ------------------------------------------------------------------
     # Hint propagation through mm_to_bmm_pass
     # ------------------------------------------------------------------
 

@@ -270,6 +270,24 @@ def finalize_layouts(graph: GraphLowering) -> None:
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, stl)
+            # Mark loop-invariant tiled ops: per_tile_fixed so the unroller
+            # reuses the same base address every tile iteration.  A tiled op is
+            # loop-invariant when its CoarseTileInfo has no tiled dims at any
+            # level (all loop_tiled_dims and loop_tiled_reduction_dims entries
+            # are empty).  The loop-internal and tiled-reduction-scratch cases
+            # are handled later in _propagate_tiled_op /
+            # _propagate_tiled_reduction_op once consumer analysis is available.
+            loop_info = getattr(op, "loop_info", None)
+            if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
+                all_tiled_dims_empty = all(
+                    not dims for dims in loop_info.loop_tiled_dims
+                )
+                all_tiled_rdims_empty = all(
+                    not dims
+                    for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+                )
+                if all_tiled_dims_empty and all_tiled_rdims_empty:
+                    op.layout.per_tile_fixed = True
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
