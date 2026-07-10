@@ -1204,6 +1204,41 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, a, b, c, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
+    # ------------------------------------------------------------------
+    # Tiled pointwise with outside consumer (_allocate_full_buffer)
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "unroll_loops": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_tiled_pointwise_outside_consumer_correct(self):
+        """Tiled pointwise op with a consumer outside the loop (tests
+        _allocate_full_buffer pre-stickify: the full buffer must be correctly
+        stickified by layout propagation)."""
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 128, 64
+        x = torch.randn(A, B, dtype=torch.float16)
+        y = torch.randn(A, B, dtype=torch.float16)
+
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(x, ["A", "B"])
+        _name_tensor_dims(y, ["A", "B"])
+
+        def fn(x, y):
+            _name_tensor_dims(x, ["A", "B"])
+            _name_tensor_dims(y, ["A", "B"])
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                z = x + y  # tiled op
+            return z * 2.0  # outside consumer -- forces _allocate_full_buffer
+
+        compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.

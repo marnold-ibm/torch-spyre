@@ -60,7 +60,7 @@ from .constants import (
     STAGGERED_EAS,
     TOPK_OPS,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -1427,6 +1427,13 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreConstantFallback):
+            op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, SpyreEmptyFallback):
+            # Full-buffer placeholder allocated by _allocate_full_buffer when
+            # hint-driven coarse tiling runs pre-stickify.  Treat it like a
+            # constant: assign a single generic STL so downstream ops can read
+            # its layout through _get_prop_args without raising.
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, DeviceCopy):
