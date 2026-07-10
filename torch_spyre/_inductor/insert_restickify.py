@@ -288,6 +288,41 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 )
                 if all_tiled_dims_empty and all_tiled_rdims_empty:
                     op.layout.per_tile_fixed = True
+                # Tiled-reduction scratch: inner level tiles a reduction dim.
+                # The op's output is a per-tile accumulation buffer reused
+                # every inner-loop iteration.
+                elif not all_tiled_rdims_empty:
+                    op.layout.per_tile_fixed = True
+                    # Propagate the reduction op's device layout to accum_full.
+                    # Pre-stickify, _allocate_full_buffer assigned accum_full a
+                    # generic layout; we now overwrite it with the same STL as
+                    # the reduction op (they share the same output shape and
+                    # stick orientation must agree for the combine to work).
+                    accum_name = getattr(op, "_tiled_reduction_accum_name", None)
+                    if accum_name is not None:
+                        accum_buf = graph.get_buffer(accum_name)
+                        accum_layout = accum_buf.layout
+                        if isinstance(accum_layout, FixedTiledLayout):
+                            # finalize_layouts already committed a generic STL
+                            # (from propagate_spyre_tensor_layouts) to accum_full.
+                            # Replace with the reduction op's actual STL so that
+                            # fill, combine, and copy all agree on the device
+                            # coordinate system.  Skip if already has the right
+                            # STL (span-overflow path where _allocate_full_buffer
+                            # already derived it from _resize_device_layout).
+                            if accum_layout.device_layout != op.layout.device_layout:
+                                accum_buf.layout = FixedTiledLayout(
+                                    accum_layout.device,
+                                    accum_layout.dtype,
+                                    accum_layout.size,
+                                    accum_layout.stride,
+                                    op.layout.device_layout,
+                                )
+                        else:
+                            # FixedLayout: wrap with the reduction op's STL.
+                            accum_buf.layout = _fixed_tiled(
+                                accum_layout, op.layout.device_layout
+                            )
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
