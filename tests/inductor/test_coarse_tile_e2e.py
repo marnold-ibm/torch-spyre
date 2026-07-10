@@ -199,12 +199,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Nested hints: outer K=2, inner M=4 on a single op
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     # ------------------------------------------------------------------
     # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
     # ------------------------------------------------------------------
@@ -1910,6 +1904,49 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             "allocation={'lx'",
             src,
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
+        )
+
+    @config.patch({"unroll_loops": False})
+    def test_nested_matmul_accum_tile_per_tile_fixed_in_sdsc(self):
+        """Accumulator tile buffer in nested outer-M + inner-K reduction must have
+        per_tile_fixed=True in the generated SDSC source.
+
+        The accum_tile buffer is loop-internal to the inner K-loop, so the unroller
+        must not advance its base address across inner iterations.  This requires
+        _pending_per_tile_fixed to be set by _propagate_tiled_reduction_op (pre-
+        stickify path) and consumed by finalize_layouts.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "per_tile_fixed=True",
+            src,
+            "Nested-reduction accum_tile must have per_tile_fixed=True in SDSC",
         )
 
 

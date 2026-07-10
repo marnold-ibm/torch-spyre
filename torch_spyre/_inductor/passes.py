@@ -331,6 +331,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
         return
     # Compute offset to avoid loop_group_id collision with any hint-driven
     # groups already stamped by _maybe_coarse_tile_hints.
+    # E.g. if hints used groups 0 and 1, span-overflow groups start at 2.
     used_ids = [
         op.loop_info.loop_group_id[0]
         for op in graph.operations
