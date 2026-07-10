@@ -310,6 +310,52 @@ def _maybe_coarse_tile(graph: GraphLowering) -> None:
         coarse_tile(graph, groups=groups)
 
 
+@_runs(
+    reorder_unhinted_interlopers,
+    hints_to_coarse_tile_groups,
+    coarse_tile,
+)
+def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
+    """Hint-driven coarse tiling only.  Runs PRE-stickification.
+
+    span_overflow_groups is intentionally absent: it requires FixedTiledLayout
+    (device_layout) and must run post-stickification.
+    """
+    if config.ignore_wsr_hints:
+        return
+    reorder_unhinted_interlopers(graph)
+    groups = hints_to_coarse_tile_groups(graph)
+    if not groups:
+        return
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    coarse_tile(graph, groups=groups)
+
+
+@_runs(
+    span_overflow_groups,
+    coarse_tile,
+)
+def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
+    """Span-overflow coarse tiling only.  Runs POST-stickification.
+
+    Requires FixedTiledLayout (device_layout) on all ops.
+    hint-driven groups (hints_to_coarse_tile_groups) are intentionally
+    absent: they have already run pre-stickification.
+    """
+    if config.ignore_span_overflow_hints:
+        return
+    groups = span_overflow_groups(graph)
+    if not groups:
+        return
+    # span_overflow_groups assigns synthetic hint IDs starting from
+    # _SPAN_OVERFLOW_HINT_ID, so they never collide with hint-driven
+    # group IDs already stamped by _maybe_coarse_tile_hints.
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    coarse_tile(graph, groups=groups)
+
+
 @_runs(cost_model_matmul_division, work_distribution)
 def _distribute_work(graph: GraphLowering) -> None:
     # cost_model_matmul_division claims a subset of ops; work_distribution skips
