@@ -21,7 +21,6 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
-from .pass_utils import copy_fx_custom_meta
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -125,12 +124,6 @@ def _create_restickify_node(
         restick_fx_node = fx_graph.create_node(
             "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
         )
-    # Propagate hint metadata from the consumer op so assign_dim_hints can assign
-    # dim_hints to the restickify buffer after insertion.
-    for consumer_fx_node in op.origins:
-        if "custom" in consumer_fx_node.meta:
-            copy_fx_custom_meta(consumer_fx_node, restick_fx_node)
-            break
     # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
