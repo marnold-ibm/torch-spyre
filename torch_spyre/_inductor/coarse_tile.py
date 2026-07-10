@@ -1686,9 +1686,11 @@ def _propagate_tiled_reduction_op(
     # Insert fill op immediately after the fill target buffer allocation
     # (outside the loop for flat, inside the outer loop for nested).
     # Use a SpyreConstantFallback scalar as the fill source so that Spyre's
-    # kernel codegen can express this as an IDENTITY_OP broadcast.  We must
-    # assign a FixedTiledLayout manually here because finalize_layouts has
-    # already run when this pass executes.
+    # kernel codegen can express this as an IDENTITY_OP broadcast.  For the
+    # span-overflow path, finalize_layouts has already run so we must assign a
+    # FixedTiledLayout manually here.  For the hint path (pre-stickify),
+    # stickification will overwrite the layout; the manual assignment is
+    # redundant but harmless.
     dtype = op.get_dtype()
     device = op.get_device()
     from .ir import (
@@ -1741,14 +1743,19 @@ def _propagate_tiled_reduction_op(
             op, accum_tile, accum_full, fill_loop_info, operations
         )
 
-    # Mark tiled op's output as per-tile scratch (no address advance).
-    if not isinstance(op.layout, FixedTiledLayout):
-        raise RuntimeError(
-            f"coarse_tile: tiled reduction op {op.get_name()!r} has layout "
-            f"{type(op.layout).__name__}, expected FixedTiledLayout; "
-            "cannot mark per_tile_fixed"
-        )
-    op.layout.per_tile_fixed = True
+    # Mark the tiled reduction op's per-tile scratch as stationary.
+    # Pre-stickify: op.layout is FixedLayout; per_tile_fixed will be set by
+    # finalize_layouts (which inspects CoarseTileInfo) once stickification runs.
+    # Post-stickify (span-overflow path): op.layout is already FixedTiledLayout.
+    if isinstance(op.layout, FixedTiledLayout):
+        op.layout.per_tile_fixed = True
+
+    # Record the accumulation buffer name so finalize_layouts can propagate
+    # the reduction op's post-stickify device layout to accum_full.  Pre-stickify,
+    # accum_full gets a generic STL from propagate_spyre_tensor_layouts; we must
+    # overwrite it with the actual reduction output STL so fill, combine, and copy
+    # all agree on the device coordinate system.
+    op._tiled_reduction_accum_name = accum_full.get_name()  # type: ignore[attr-defined]
 
     # Patch consumers to read accum_full (the fully-assembled output).
     buf_name = op.get_name()
