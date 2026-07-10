@@ -328,10 +328,13 @@ def finalize_layouts(graph: GraphLowering) -> None:
             # when the layout is still FixedLayout (pre-stickify).  Transfer that
             # deferred flag now that we have the committed FixedTiledLayout.
             if getattr(op, "_pending_per_tile_fixed", False):
-                if isinstance(op.layout, FixedTiledLayout):
-                    op.layout.per_tile_fixed = True
-                if hasattr(op, "_pending_per_tile_fixed"):
-                    del op._pending_per_tile_fixed  # type: ignore[attr-defined]
+                assert isinstance(op.layout, FixedTiledLayout), (
+                    f"{op.get_name()} has _pending_per_tile_fixed but layout is "
+                    f"{type(op.layout).__name__} — expected FixedTiledLayout "
+                    "after finalize_layouts committed"
+                )
+                op.layout.per_tile_fixed = True
+                del op._pending_per_tile_fixed  # type: ignore[attr-defined]
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
