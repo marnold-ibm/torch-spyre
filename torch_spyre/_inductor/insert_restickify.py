@@ -167,6 +167,13 @@ def insert_restickify_on_node_inputs(
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
 
+        # When coarse-tiling runs pre-stickification, the consumer op already
+        # carries loop_info (loop_group_id + loop_count).  The restickify node
+        # is inserted inside the same loop group, so it must inherit loop_info
+        # to remain contiguous in build_loop_scheduler_nodes.
+        if hasattr(op, "loop_info"):
+            restick_buff.loop_info = op.loop_info
+
     # Patch inner_fn once with the full name_map covering all restickified args.
     orig_inner = op.data.inner_fn
 
@@ -316,6 +323,15 @@ def finalize_layouts(graph: GraphLowering) -> None:
                             accum_buf.layout = _fixed_tiled(
                                 accum_layout, op.layout.device_layout
                             )
+
+            # Loop-internal buffers: _propagate_tiled_op sets _pending_per_tile_fixed
+            # when the layout is still FixedLayout (pre-stickify).  Transfer that
+            # deferred flag now that we have the committed FixedTiledLayout.
+            if getattr(op, "_pending_per_tile_fixed", False):
+                if isinstance(op.layout, FixedTiledLayout):
+                    op.layout.per_tile_fixed = True
+                if hasattr(op, "_pending_per_tile_fixed"):
+                    del op._pending_per_tile_fixed  # type: ignore[attr-defined]
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
