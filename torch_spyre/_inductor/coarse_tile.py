@@ -1309,10 +1309,11 @@ def _allocate_full_buffer(
     """Allocate a full-sized HBM buffer for the tiled op's original shape.
 
     Creates a spyre.empty FX node, lowers it via V.graph.run_node(), assigns
-    a FixedTiledLayout matching tiled_op's layout, splices it into operations
-    at insert_at_idx, and returns the new ComputedBuffer.
+    a layout matching tiled_op's layout type (FixedLayout pre-stickify,
+    FixedTiledLayout post-stickify), splices it into operations at
+    insert_at_idx, and returns the new ComputedBuffer.
     """
-    from .propagate_layouts import generic_layout  # deferred: avoids circular import
+    from torch._inductor.ir import FixedLayout  # deferred: avoids circular import
     from .ir import (
         FixedTiledLayout,
         SpyreEmptyFallback,
@@ -1344,7 +1345,9 @@ def _allocate_full_buffer(
     )
     full_buf.origins = OrderedSet([empty_fx])
 
-    # Assign a FixedTiledLayout with the full size.
+    # Assign a layout for the full-sized buffer.  Pre-stickify we use a plain
+    # FixedLayout (stickification assigns the device layout later); post-stickify
+    # we must build a FixedTiledLayout because stickification has already run.
     orig_layout = tiled_op.layout
     # Recompute strides for the full size (contiguous row-major).
     strides: list[Expr] = []
@@ -1354,11 +1357,10 @@ def _allocate_full_buffer(
         stride = stride * s
 
     if isinstance(orig_layout, FixedTiledLayout):
-        # Derive the full buffer's device layout from the per-tile layout by
-        # scaling device_size entries up to the full host size.  The stick
-        # orientation (dim_order / element_arrangement) is propagated verbatim
-        # from orig_layout — both buffers must agree on physical layout so the
-        # scatter copy op computes correct device addresses.
+        # Post-stickify path (span-overflow groups): stickification has already
+        # run, so we must assign a FixedTiledLayout now.  Derive the full
+        # buffer's device layout by scaling the per-tile device layout up to
+        # the full host size using _resize_device_layout.
         full_size_ints = [int(s) for s in full_ranges]
         tile_size_ints = [int(s) for s in orig_layout.size]
         # Authoritative stick host dim from coordinate identity (issue #3116);
@@ -1391,16 +1393,24 @@ def _allocate_full_buffer(
                 list(range(ndim_full)),
                 orig_layout.device_layout.element_arrangement,
             )
+        layout: FixedTiledLayout | FixedLayout = FixedTiledLayout(
+            device,
+            dtype,
+            list(full_ranges),
+            strides,
+            device_layout,
+        )
     else:
-        device_layout = generic_layout(full_buf)
-
-    layout = FixedTiledLayout(
-        device,
-        dtype,
-        list(full_ranges),
-        strides,
-        device_layout,
-    )
+        # Pre-stickify path (hint-driven groups): stickification has not yet
+        # run, so assign a plain FixedLayout.  Stickification will propagate
+        # SpyreTensorLayout to this buffer via the ExternKernel->generic_layout
+        # path in propagate_spyre_tensor_layouts.
+        layout = FixedLayout(
+            device,
+            dtype,
+            list(full_ranges),
+            strides,
+        )
     full_buf.layout = layout
 
     # Splice into operations at the correct position.
