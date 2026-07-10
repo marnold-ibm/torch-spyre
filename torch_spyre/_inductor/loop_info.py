@@ -69,6 +69,9 @@ _SPYRE_METADATA_ATTRS = (
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
+    # Deferred per_tile_fixed flag: set by coarse_tile._propagate_tiled_op when
+    # the layout is FixedLayout (pre-stickify); consumed by finalize_layouts.
+    "_pending_per_tile_fixed",
 )
 
 

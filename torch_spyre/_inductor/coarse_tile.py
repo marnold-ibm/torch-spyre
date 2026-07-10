@@ -1163,6 +1163,10 @@ def _propagate_tiled_op(
 
         if isinstance(op.layout, FixedTiledLayout):
             op.layout.per_tile_fixed = True
+        else:
+            # Pre-stickify: layout is FixedLayout.  Defer to finalize_layouts
+            # which sees the committed FixedTiledLayout and can set the flag then.
+            op._pending_per_tile_fixed = True  # type: ignore[attr-defined]
         # Non-FixedTiledLayout buffers (e.g. MutationLayoutSHOULDREMOVE from a
         # prior pass) are intentionally left unmarked — their addressing is
         # handled by the layout type itself, not by the unroller.
