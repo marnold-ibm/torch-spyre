@@ -199,10 +199,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Nested hints: outer K=2, inner M=4 on a single op
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
-    # ------------------------------------------------------------------
-
     @config.patch(
         {
             "lx_planning": True,
