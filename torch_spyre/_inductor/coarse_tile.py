@@ -1165,17 +1165,16 @@ def _propagate_tiled_op(
     if not outside_consumers and not is_graph_output:
         # Loop-internal: the buffer is a per-tile scratch region reused every
         # iteration.  Mark it so the unroller does not advance its base address.
-        from .ir import FixedTiledLayout
-
         if isinstance(op.layout, FixedTiledLayout):
+            # Post-stickify (span-overflow path): layout is already FixedTiledLayout.
             op.layout.per_tile_fixed = True
         else:
-            # Pre-stickify: layout is FixedLayout.  Defer to finalize_layouts
-            # which sees the committed FixedTiledLayout and can set the flag then.
+            # Pre-stickify (hint path): layout is FixedLayout.  Defer to
+            # finalize_layouts which sees the committed FixedTiledLayout and can
+            # set the flag then.  MutationLayoutSHOULDREMOVE only appears in
+            # the post-stickify span-overflow path and is handled by the branch
+            # above (it would not reach this else).
             op._pending_per_tile_fixed = True  # type: ignore[attr-defined]
-        # Non-FixedTiledLayout buffers (e.g. MutationLayoutSHOULDREMOVE from a
-        # prior pass) are intentionally left unmarked — their addressing is
-        # handled by the layout type itself, not by the unroller.
         return
 
     # Reconstruct the original (pre-division) ranges.
@@ -1324,10 +1323,7 @@ def _allocate_full_buffer(
     insert_at_idx, and returns the new ComputedBuffer.
     """
     from torch._inductor.ir import FixedLayout  # deferred: avoids circular import
-    from .ir import (
-        FixedTiledLayout,
-        SpyreEmptyFallback,
-    )  # deferred: avoids circular import
+    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -1679,10 +1675,15 @@ def _propagate_tiled_reduction_op(
         accum_tile = _allocate_full_buffer(
             op, per_tile_ranges, operations, group_start_idx_after_full
         )
-        from .ir import FixedTiledLayout
-
         if isinstance(accum_tile.layout, FixedTiledLayout):
+            # Post-stickify (span-overflow path): set directly.
             accum_tile.layout.per_tile_fixed = True
+        else:
+            # Pre-stickify (hint path): layout is FixedLayout; defer to
+            # finalize_layouts.  In the span-overflow path this branch is
+            # unreachable because _allocate_full_buffer returns FixedTiledLayout
+            # when the original layout is already FixedTiledLayout.
+            accum_tile._pending_per_tile_fixed = True  # type: ignore[attr-defined]
         fill_target = accum_tile
         combine_target = accum_tile
     else:
@@ -1703,10 +1704,7 @@ def _propagate_tiled_reduction_op(
     # redundant but harmless.
     dtype = op.get_dtype()
     device = op.get_device()
-    from .ir import (
-        FixedTiledLayout,
-        SpyreConstantFallback,
-    )  # deferred: avoids circular import
+    from .ir import SpyreConstantFallback  # deferred: avoids circular import
 
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
@@ -2228,8 +2226,6 @@ def _divide_ranges(
 
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     from torch._inductor.ir import FixedLayout, FlexibleLayout
-
-    from .ir import FixedTiledLayout
 
     layout = getattr(op, "layout", None)
     if not (isinstance(layout, FixedLayout) and len(layout.size) == len(ranges)):
