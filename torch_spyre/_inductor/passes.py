@@ -329,12 +329,17 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     groups = span_overflow_groups(graph)
     if not groups:
         return
-    # span_overflow_groups assigns synthetic hint IDs starting from
-    # _SPAN_OVERFLOW_HINT_ID, so they never collide with hint-driven
-    # group IDs already stamped by _maybe_coarse_tile_hints.
+    # Compute offset to avoid loop_group_id collision with any hint-driven
+    # groups already stamped by _maybe_coarse_tile_hints.
+    used_ids = [
+        op.loop_info.loop_group_id[0]
+        for op in graph.operations
+        if hasattr(op, "loop_info") and op.loop_info is not None
+    ]
+    group_idx_offset = max(used_ids, default=-1) + 1
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-    coarse_tile(graph, groups=groups)
+    coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
