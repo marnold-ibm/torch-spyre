@@ -294,25 +294,6 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 @_runs(
     reorder_unhinted_interlopers,
     hints_to_coarse_tile_groups,
-    span_overflow_groups,
-    coarse_tile,
-)
-def _maybe_coarse_tile(graph: GraphLowering) -> None:
-    groups = []
-    if not config.ignore_wsr_hints:
-        reorder_unhinted_interlopers(graph)
-        groups += hints_to_coarse_tile_groups(graph)
-    if not config.ignore_span_overflow_hints:
-        groups += span_overflow_groups(graph)
-    if groups:
-        op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-        groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-        coarse_tile(graph, groups=groups)
-
-
-@_runs(
-    reorder_unhinted_interlopers,
-    hints_to_coarse_tile_groups,
     coarse_tile,
 )
 def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
@@ -393,6 +374,17 @@ class CustomPreSchedulingPasses:
         self.passes = [
             deadcode_elimination,
             #
+            # Working Set Reduction (hint-driven, pre-stickification)
+            # These passes only need host-side FixedLayout (size/stride) and
+            # loop variable ranges.  Running before stickification means
+            # _divide_ranges does not call _resize_device_layout: stickification
+            # computes the correct SpyreTensorLayout from the already-divided
+            # ranges.  This also dissolves the insert_restickify→hint cross-phase
+            # contract (issue #3135).
+            propagate_named_dims,
+            assign_dim_hints,
+            _maybe_coarse_tile_hints,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -405,10 +397,10 @@ class CustomPreSchedulingPasses:
             #
             dedup_and_promote_constants,
             #
-            # Working Set Reduction
-            propagate_named_dims,
-            assign_dim_hints,
-            _maybe_coarse_tile,
+            # Working Set Reduction (device-layout-aware, post-stickification)
+            # These passes require FixedTiledLayout.device_layout (device_size,
+            # stride_map, elems_per_stick) for physical span arithmetic.
+            _maybe_coarse_tile_span_overflow,
             #
             # Core Division
             span_reduction,

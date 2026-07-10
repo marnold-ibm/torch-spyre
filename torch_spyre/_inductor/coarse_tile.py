@@ -1152,13 +1152,8 @@ def _propagate_tiled_op(
         buf_name, loop_group_id, operations
     )
 
-    # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant —
-    # mark per_tile_fixed so the unroller reuses the same address each tile.
+    # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant.
     if all(not dims for dims in loop_info.loop_tiled_dims):
-        from .ir import FixedTiledLayout
-
-        if isinstance(op.layout, FixedTiledLayout):
-            op.layout.per_tile_fixed = True
         return
 
     if not outside_consumers and not is_graph_output:
