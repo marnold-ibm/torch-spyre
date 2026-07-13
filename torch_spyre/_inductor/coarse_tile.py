@@ -60,6 +60,8 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    FixedLayout,
+    FlexibleLayout,
     Layout,
     Loops,
     MutationLayoutSHOULDREMOVE,
@@ -86,7 +88,7 @@ from .span_overflow_hint_analysis import (
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
-from .ir import FixedTiledLayout, _resize_device_layout
+from .ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 
 logger = get_inductor_logger("coarse_tile")
 hints_logger = get_inductor_logger("assign_dim_hints")
@@ -1037,7 +1039,20 @@ def coarse_tile(
     ] = []
     for group_idx, (group_ops, levels) in enumerate(groups, start=group_idx_offset):
         group_id: tuple[int, ...] = (group_idx,)
+        # Phase 1: create tile-sized fills and insert them before the group.
+        # Returns name_map without patching group ops (patching is deferred to
+        # phase 2 so replace_computed_buffer_body runs after _stamp_group and
+        # therefore copies the already-stamped loop_info onto the new object).
+        name_map = _replace_constant_fill_predecessors(
+            group_ops, levels, operations, group_id
+        )
+        # Rebuild op_to_position after potential insertions from fill replacement.
+        op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
+        # Phase 2: patch group ops to read tile-sized fills.  Done after
+        # _stamp_group so loop_info is already present on each op when
+        # replace_computed_buffer_body copies metadata to the reconstructed object.
+        _apply_fill_name_swap(group_ops, name_map, operations)
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
@@ -1322,7 +1337,6 @@ def _allocate_full_buffer(
     FixedTiledLayout post-stickify), splices it into operations at
     insert_at_idx, and returns the new ComputedBuffer.
     """
-    from torch._inductor.ir import FixedLayout  # deferred: avoids circular import
     from .ir import SpyreEmptyFallback  # deferred: avoids circular import
 
     graph_lowering = V.graph
@@ -2011,6 +2025,270 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _replace_constant_fill_predecessors(
+    group_ops: list[Operation],
+    levels: list[tuple],
+    operations: list[Operation],
+    group_id: tuple[int, ...],
+) -> dict[str, str]:
+    """Create tile-sized constant-fill buffers for full-size fills feeding the group.
+
+    full.default / zeros_like / zeros ops are often created outside a
+    spyre_hint() scope (so they carry no dim_hints) but feed tiled ops inside
+    the scope.  Rather than absorbing the full-size fill into the tiling loop
+    (which causes DDL slice-size mismatches), we:
+
+      1. Create a new tile-sized SpyreConstantFallback + Pointwise fill op
+         with the same constant value but with the hinted dimension already
+         divided by split_count.
+      2. Insert the new tile-sized fill immediately before the tiling group in
+         operations (outside the loop — no loop_info stamped).
+
+    The tile-sized fill is a loop-invariant constant: its value is identical
+    across all iterations, so creating it once and reading it every iteration
+    is semantically equivalent to slicing a per-iteration fill.  Because it
+    sits outside the loop it is also a candidate for LX scratchpad allocation.
+
+    Returns a name_map {old_fill_name: new_tile_fill_name} for the caller to
+    apply via _apply_fill_name_swap after _stamp_group has run (so that
+    replace_computed_buffer_body preserves the loop_info already stamped on
+    each group op).
+    """
+    from torch._inductor.dependencies import MemoryDep
+
+    # Build a reference dim_hints list from the first op in the group that has them.
+    ref_dim_hints: list[DimHint] = []
+    for op in group_ops:
+        hints = getattr(op, "dim_hints", [])
+        if hints:
+            ref_dim_hints = hints
+            break
+
+    if not ref_dim_hints:
+        return {}
+
+    # Collect the set of buffer names already in the group so we don't confuse
+    # intra-group data-flow edges with inter-group constant-fill edges.
+    group_names: set[str] = {
+        op.get_name() for op in group_ops if isinstance(op, ComputedBuffer)
+    }
+
+    # Find the insert position: just before the first op of the group.
+    first_group_idx = next(
+        (i for i, op in enumerate(operations) if op is group_ops[0]), None
+    )
+    if first_group_idx is None:
+        return {}
+
+    # name_map collects old_fill_name → new_tile_fill_name for the NameSwapHandler.
+    name_map: dict[str, str] = {}
+
+    # Track already-replaced fills so we don't create duplicates when the same
+    # fill feeds multiple ops in the group.
+    replaced: set[str] = set()
+
+    for op in group_ops:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        try:
+            rw = op.get_read_writes()
+        except Exception:
+            continue
+        for dep in rw.reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            old_name = dep.name
+            if old_name in group_names or old_name in replaced:
+                continue
+            buf = V.graph.get_buffer(old_name)
+            if not isinstance(buf, ComputedBuffer):
+                continue
+            if not _is_constant_fill(buf):
+                continue
+
+            # Read the constant value from the SpyreConstantFallback scalar
+            # that is the fill's only input.
+            fill_rw = buf.get_read_writes()
+            scalar_dep = next(
+                (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
+            )
+            if scalar_dep is None:
+                continue
+            scalar_buf = V.graph.get_buffer(scalar_dep.name)
+            if not isinstance(scalar_buf, SpyreConstantFallback):
+                continue
+            const_value = scalar_buf.constant_args[0]
+
+            # Compute the tile-sized shape using the consumer op's authoritative
+            # loop_var→ranges_pos mapping.  Size-based matching (_constant_fill_
+            # ranges_pos) is unreliable when two named dims share the same value
+            # (e.g. Lq=256 and Lk=256 in flash attention).  Instead, for each
+            # hint we ask: which output-ranges position of the consumer op does
+            # this hint tile?  If the fill has a dimension at that same position
+            # with the expected size, divide it; otherwise skip (the fill doesn't
+            # have that dimension and should not be divided on it).
+            old_size = [int(r) for r in buf.data.ranges]
+            tile_size = list(old_size)
+            consumer_out = op_out_coords(op)
+            for h in getattr(op, "dim_hints", None) or []:
+                if h.loop_var is None or h.is_reduction or h.split_count <= 1:
+                    continue
+                consumer_pos = _loop_var_to_ranges_pos(consumer_out, h.loop_var)
+                if consumer_pos is None:
+                    continue
+                if consumer_pos >= len(old_size):
+                    continue
+                if old_size[consumer_pos] != int(op.data.ranges[consumer_pos]):
+                    # Fill dim size doesn't match consumer's full range; skip.
+                    continue
+                if tile_size[consumer_pos] % int(h.split_count) != 0:
+                    logger.warning(
+                        "coarse_tile: constant-fill %s dim %d size %d not "
+                        "divisible by split_count %d; skipping replacement",
+                        old_name,
+                        consumer_pos,
+                        tile_size[consumer_pos],
+                        int(h.split_count),
+                    )
+                    tile_size = None  # type: ignore[assignment]
+                    break
+                tile_size[consumer_pos] = tile_size[consumer_pos] // int(h.split_count)
+
+            if tile_size is None:
+                continue
+
+            dtype = buf.get_dtype()
+            device = buf.get_device()
+
+            # Create the tile-sized scalar + fill.
+            new_scalar = SpyreConstantFallback(
+                torch.ops.spyre.constant.default, float(const_value), dtype, device
+            )
+            scalar_stl = SpyreTensorLayout([], dtype)
+            new_scalar.layout = FixedTiledLayout(device, dtype, [], [], scalar_stl)
+            scalar_loader = TensorBox.create(new_scalar).make_loader()
+
+            tile_ranges = [sympy.Integer(s) for s in tile_size]
+            fill_data = Pointwise(
+                device=device,
+                dtype=dtype,
+                inner_fn=lambda index, _loader=scalar_loader: _loader([]),
+                ranges=tile_ranges,
+            )
+            tile_strides = [
+                sympy.Integer(int(s))
+                for s in FlexibleLayout.contiguous_strides(tile_size)
+            ]
+            fill_name = V.graph.qualify_name(f"ct_fill_{old_name}")
+            fill_buf = ComputedBuffer(
+                name=fill_name,
+                layout=FixedLayout(device, dtype, list(tile_ranges), tile_strides),
+                data=fill_data,
+            )
+            fill_buf.origins = buf.origins
+            fill_buf.operation_name = fill_name
+            # Stamp loop_info so the fill is placed inside the loop group by
+            # build_loop_scheduler_nodes, with empty loop_tiled_dims (loop-
+            # invariant: executed once per loop body but no range is divided).
+            # Use the same nested_group_id that _stamp_group assigns to broadcast
+            # ops: group_id + (0,) * (len(levels) - 1).  loop_count length must
+            # equal loop_group_id length (enforced by _loop_count assertion).
+            counts = [count for _, count in levels]
+            nested_group_id = group_id + (0,) * (len(levels) - 1)
+            fill_buf.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
+                loop_group_id=nested_group_id,
+                loop_count=counts,
+                loop_tiled_dims=[[] for _ in levels],
+                loop_tiled_reduction_dims=[[] for _ in levels],
+            )
+            V.graph.name_to_buffer[fill_name] = fill_buf
+
+            # Splice new_scalar and fill_buf into operations just before the group.
+            # new_scalar was appended to operations by register_operation() inside
+            # SpyreConstantFallback.__init__; move it to the insert position.
+            operations.remove(new_scalar)
+            operations.insert(first_group_idx, new_scalar)
+            first_group_idx += 1
+            operations.insert(first_group_idx, fill_buf)
+            first_group_idx += 1
+
+            name_map[old_name] = fill_name
+            replaced.add(old_name)
+            logger.debug(
+                "coarse_tile: created tile-sized fill %s (shape %s) replacing %s (shape %s)",
+                fill_name,
+                tile_size,
+                old_name,
+                old_size,
+            )
+
+    return name_map
+
+
+def _apply_fill_name_swap(
+    group_ops: list[Operation],
+    name_map: dict[str, str],
+    operations: list[Operation],
+) -> None:
+    """Patch group ops to read tile-sized fills instead of the original full-size ones.
+
+    Must be called AFTER _stamp_group so that replace_computed_buffer_body
+    copies the already-stamped loop_info onto the reconstructed ComputedBuffer.
+    """
+    if not name_map:
+        return
+
+    from torch._inductor.dependencies import MemoryDep
+    from .insert_restickify import NameSwapHandler
+    from .pass_utils import replace_computed_buffer_body
+
+    for op in group_ops:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        reads = set()
+        try:
+            reads = {
+                d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+            }
+        except Exception:
+            continue
+        if not reads & set(name_map):
+            continue
+
+        orig_inner = op.data.inner_fn
+
+        def new_inner_fn(*args, _map=name_map, _orig=orig_inner):
+            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+                return _orig(*args)
+
+        object.__setattr__(op.data, "inner_fn", new_inner_fn)
+        replace_computed_buffer_body(op, op.data, operations)
+
+
+def _is_constant_fill(op: ComputedBuffer) -> bool:
+    """True if op is a Pointwise whose only reads come from SpyreConstantFallback.
+
+    full.default / zeros_like / zeros lower to a SpyreConstantFallback scalar
+    broadcast through a thin Pointwise wrapper.  These ops are position-
+    independent, so shrinking their per-tile range to match the tiled group
+    is semantically equivalent to slicing a full-sized fill.
+    """
+    if not isinstance(op.data, Pointwise):
+        return False
+    try:
+        rw = op.get_read_writes()
+    except Exception:
+        return False
+    from torch._inductor.dependencies import MemoryDep
+
+    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    if not reads:
+        return False
+    return all(
+        isinstance(V.graph.get_buffer(d.name), SpyreConstantFallback) for d in reads
+    )
+
+
 def _stamp_group(
     ops: list[Operation],
     group_id: tuple[int, ...],
@@ -2078,6 +2356,7 @@ def _stamp_group(
         for hint_id, count in levels:
             opos = hint_id_to_ranges_pos.get(hint_id)
             rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+
             op_tiled_dims.append([opos] if opos is not None else [])
             op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
             # _divide_ranges with tiled_dims=[] is a no-op.
@@ -2225,8 +2504,6 @@ def _divide_ranges(
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
-    from torch._inductor.ir import FixedLayout, FlexibleLayout
-
     layout = getattr(op, "layout", None)
     if not (isinstance(layout, FixedLayout) and len(layout.size) == len(ranges)):
         return None

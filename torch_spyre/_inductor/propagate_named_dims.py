@@ -273,6 +273,7 @@ def _set_no_named_dims(op):
 def _compute_named_dims(op, inputs):
     loop_var_dims = get_input_named_dims(inputs, op)
     output_dep = next(iter(op.get_read_writes().writes))
+
     for sym in output_dep.ranges:
         if sym not in loop_var_dims:
             size = int(output_dep.ranges[sym])
@@ -282,8 +283,22 @@ def _compute_named_dims(op, inputs):
     named_dims = []
     for coord in out_coords:
         sym = _lone_sym(coord)
-        if sym is not None:
-            named_dims.extend(loop_var_dims.get(sym, []))
+        if sym is None:
+            continue
+        names = loop_var_dims.get(sym, [])
+        # Skip size-1 loop vars that carry only untracked placeholder names.
+        # These arise when B=1: i0 (range 1) is absent from every input's
+        # loop_var_dims (compute_input_named_dims skips size-1 layout dims),
+        # so the fallback above assigns _untracked_1. Including it in
+        # named_dims would prepend an extra entry that confuses _consume_names
+        # in downstream ops (it would consume "B" into the wrong pair).
+        # Omitting it keeps named_dims aligned with the non-unit layout dims,
+        # matching the contract of compute_input_named_dims (size-1 → skip).
+        if int(output_dep.ranges.get(sym, 0)) == 1 and all(
+            n.startswith("_untracked_") for n in names
+        ):
+            continue
+        named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
         reduction_sym = find_reduction_var(inputs[0], output_dep)
