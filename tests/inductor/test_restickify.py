@@ -845,6 +845,63 @@ def test_amax_full_and_amax_live_maximum():
     _compare(f, t, optimal_cost=0)
 
 
+# ------- Broadcast outer-product tests ---------
+
+
+def test_broadcast_outer_diff():
+    """acs.unsqueeze(-1) - acs.unsqueeze(-2): outer-product subtraction over [BH, C].
+
+    Both reads of acs conflict (stick on d1 vs d2); the optimizer picks stick on
+    dim 0 (BH) at cost 2 * acs.numel() — two restickifies of the 2D input.
+    """
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2)),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
+def test_broadcast_expand_first():
+    """expand on unsqueeze(-1) only — one input expanded, one bare unsqueeze."""
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2)),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
+def test_broadcast_expand_second():
+    """expand on unsqueeze(-2) only — one input expanded, one bare unsqueeze."""
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2).expand(-1, C, -1)),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
+def test_broadcast_expand_both():
+    """expand on both unsqueezes — both inputs fully expanded to [BH, C, C]."""
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(
+            acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2).expand(-1, C, -1)
+        ),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
 # ------- Unsupported stick configurations ---------
 
 

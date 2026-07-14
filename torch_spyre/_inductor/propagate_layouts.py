@@ -862,6 +862,14 @@ def _multi_arg_pointwise_layouts(
 
     results: list[SpyreTensorLayout] = []
 
+    tried_stick_dims: set[int] = set()
+
+    def _try_stick_dim_once(stick_dim):
+        if stick_dim in tried_stick_dims:
+            return
+        tried_stick_dims.add(stick_dim)
+        _try_stick_dim(stick_dim)
+
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
         results.append(
@@ -880,15 +888,16 @@ def _multi_arg_pointwise_layouts(
         }
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
-            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+            _try_stick_dim_once(_pick_stick_dim(stick_expr, out_coords))
 
-    # Try alternative layouts if no valid layouts found
-    if not results:
-        for alt_stick_dim in range(len(output.size) - 1):
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-                continue
-            _try_stick_dim(alt_stick_dim)
+    # Also try all non-last dims as stick candidates (not just as fallback).
+    # This covers broadcast cases where the input stick exprs conflict but a
+    # common dim (e.g. the batch dim) is a valid stick for all inputs.
+    for alt_stick_dim in range(len(output.size) - 1):
+        # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
+        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+            continue
+        _try_stick_dim_once(alt_stick_dim)
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
     # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation

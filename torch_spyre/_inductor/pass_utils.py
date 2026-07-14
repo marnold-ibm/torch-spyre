@@ -1050,6 +1050,10 @@ def compute_restickify_needed(
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
+    # A zero-stick input (e.g. reduction output) cannot be restickified — there
+    # is no source data to redistribute to a different stick position.
+    if idc[-1] == sympy.S.Zero and out_idc[-1] != sympy.S.Zero:
+        return True, None
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
