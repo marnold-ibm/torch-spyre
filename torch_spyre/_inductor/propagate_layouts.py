@@ -1369,11 +1369,42 @@ def propagate_spyre_tensor_layouts(
                     )
                     if not isinstance(target_buf, SpyreEmptyFallback):
                         continue
-                    # SpyreEmptyFallback accumulator has no device layout yet
-                    # (it is assigned during stickification).  Skip the
-                    # restickify optimizer for this op — the accumulator's STL
-                    # is determined by propagate_spyre_tensor_layouts on the
-                    # post-stickify path.
+                    # SpyreEmptyFallback accumulator has no device layout yet.
+                    # Treat the mutation op like a normal pointwise op: run
+                    # _multi_arg_pointwise_layouts with the "new value" inputs
+                    # (excluding the running accumulator read-back).  This
+                    # enforces the same input-compatibility and slice constraints
+                    # as a regular add, so the backend DDL slice check passes.
+                    rw = op.get_read_writes()
+                    output_dep = next(iter(rw.writes))
+                    all_args = _get_prop_args(rw.reads)
+                    # Exclude the running accumulator itself (dep.name == target_name)
+                    # from the layout constraint: it IS the output, not a new input.
+                    new_value_args = [a for a in all_args if a.dep.name != target_name]
+                    if not new_value_args:
+                        # No real inputs — fall back to unconstrained candidates.
+                        candidates = _all_constant_layouts(target_buf)
+                        target_buf.layouts = candidates
+                        op.layouts = candidates
+                        op.restick_cost_fn = AllSameNode.from_args(
+                            all_args, candidates, output_dep, op
+                        )
+                    else:
+                        accum_layout = target_buf.get_layout()
+                        candidates = _multi_arg_pointwise_layouts(
+                            op, accum_layout, output_dep, new_value_args
+                        )
+                        # op.restick_cost_fn was set by _multi_arg_pointwise_layouts
+                        # using only new_value_args.  The accumulator read-back
+                        # (target_name) is also a real input to this add and its
+                        # stick must match the output.  Rebuild the cost function
+                        # with all_args so the beam search enforces that constraint
+                        # and doesn't commit the accumulator to a mismatched layout.
+                        op.restick_cost_fn = AllSameNode.from_args(
+                            all_args, candidates, output_dep, op
+                        )
+                        target_buf.layouts = candidates
+                        op.layouts = candidates
                     continue
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))

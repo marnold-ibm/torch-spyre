@@ -18,7 +18,7 @@ from collections import defaultdict
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from torch._inductor.graph import GraphLowering
@@ -340,6 +340,36 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
+        # Mutation ops targeting a SpyreEmptyFallback: the optimizer commits the
+        # mutation op's output STL via AllSameNode (matching the new-value inputs).
+        # The SpyreEmptyFallback was separately committed by AnyInNode (candidates[0]),
+        # which may differ.  Overwrite the accumulator's FixedTiledLayout to match the
+        # mutation op's committed STL so the backend sees consistent layouts.
+        if isinstance(getattr(op, "layout", None), MutationLayoutSHOULDREMOVE):
+            mut_target = op.layout.target
+            while isinstance(mut_target, ReinterpretView):
+                mut_target = mut_target.data
+            mut_target_name = (
+                mut_target.get_name() if hasattr(mut_target, "get_name") else ""
+            )
+            mut_target_buf = (
+                graph.get_buffer(mut_target_name) if mut_target_name else None
+            )
+            if isinstance(mut_target_buf, SpyreEmptyFallback) and committed is not None:
+                accum_layout = mut_target_buf.get_layout()
+                if isinstance(accum_layout, (FixedTiledLayout, FixedLayout)):
+                    mut_target_buf.layout = FixedTiledLayout(
+                        accum_layout.device,
+                        accum_layout.dtype,
+                        accum_layout.size,
+                        accum_layout.stride,
+                        committed,
+                    )
+            elif isinstance(mut_target_buf, SpyreEmptyFallback) and committed is None:
+                # committed_stl was cleaned up; fall back to the accumulator's layout.
+                accum_layout = mut_target_buf.get_layout()
+                if isinstance(accum_layout, FixedTiledLayout):
+                    committed = accum_layout.device_layout
         for edge, target_stl in cost_fn.required_input_stls(committed):
             input_buf = graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
