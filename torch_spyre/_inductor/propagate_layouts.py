@@ -28,7 +28,6 @@ from torch._inductor.ir import (
     ExternKernel,
     FallbackKernel,
     FixedLayout,
-    FlexibleLayout,
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
@@ -716,31 +715,7 @@ def _matmul_layouts(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
 
-    # For loop-internal bmm ops (_pending_per_tile_fixed=True), the host layout
-    # has been divided to per-tile size by _divide_ranges.  The C++ constructor
-    # produces stride_map[j]=64 for the tile-count device dim because it only
-    # sees the per-tile host size (e.g. 2) and cannot infer that this dim is a
-    # coarse-tile loop dim (not a real host dim).
-    #
-    # Fix: reconstruct the full-size host layout, compute its STL, then shrink
-    # back to the per-tile STL via _resize_device_layout.  This gives the
-    # correct stride_map (e.g. -1 for the tile-count device dim) that matches
-    # what post-stickify coarse tiling would produce on the main branch.
-    loop_info = getattr(op, "loop_info", None)
-    if getattr(op, "_pending_per_tile_fixed", False) and loop_info is not None:
-        from .coarse_tile import _resize_device_layout
-
-        full_c_size = list(c_size)
-        for level_dims, count in zip(loop_info.loop_tiled_dims, loop_info.loop_count):
-            for d in level_dims:
-                full_c_size[d] = c_size[d] * int(count)
-        full_c_stride = [int(s) for s in FlexibleLayout.contiguous_strides(full_c_size)]
-        full_stl = SpyreTensorLayout(
-            full_c_size, full_c_stride, output.dtype, out_dim_order
-        )
-        out_stl = _resize_device_layout(full_stl, full_c_size, c_size)
-    else:
-        out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y], out_stl, [x_req_stl, y_req_stl], op
