@@ -916,3 +916,23 @@ def test_sparse_dense_pointwise_unsupported():
         InductorError, match="No mechanism to gather elements from multiple sticks"
     ):
         _compare(lambda a, b: a.sum(1) + b, a, b)
+
+
+def test_sparse_dense_pointwise_unsupported_d0_stick():
+    """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate.
+
+    When b has dim_order=[1,0], the natural output stick is Mod(d0,64). The sparse
+    a.sum(1) output has in_stick=0 and is stick-compatible with Mod(d0,64) per
+    stick_compatible, but it is NOT a broadcast — its elements span multiple sticks.
+    The fix in compute_restickify_needed detects this and falls through to the
+    restickify path, which correctly raises as infeasible.
+    """
+    from torch.spyre import SpyreTensorLayout
+
+    a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
+    with pytest.raises(
+        InductorError, match="No mechanism to gather elements from multiple sticks"
+    ):
+        _compare(lambda a, b: a.sum(1) + b, a, b)

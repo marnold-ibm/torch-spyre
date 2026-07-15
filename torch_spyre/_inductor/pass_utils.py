@@ -1050,15 +1050,27 @@ def compute_restickify_needed(
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    # A zero-stick input (e.g. reduction output) cannot be restickified — there
-    # is no source data to redistribute to a different stick position.
-    if idc[-1] == sympy.S.Zero and out_idc[-1] != sympy.S.Zero:
-        return True, None
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
-    if in_stick_offset_free and stick_compatible([idc, out_idc]):
-        return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
+    if in_stick_offset_free and stick_compatible([idc, out_idc]):
+        # A zero input stick is compatible only if a size-1 host dim maps to it
+        # (genuine broadcast). If no size-1 host dim produces a zero coordinate,
+        # the zero stick came from a reduction (sparse output) whose elements span
+        # multiple device sticks — restickify cannot gather them.
+        # Guard is skipped when the output stick is also zero (both-zero sticks are
+        # trivially compatible, e.g. scalar ops on 0-dim tensors).
+        if (
+            idc[-1] == sympy.S.Zero
+            and out_idc[-1] != sympy.S.Zero
+            and not any(
+                e == sympy.S.Zero and concretize_expr(sz) == 1
+                for e, sz in zip(ic, in_host.size)
+            )
+        ):
+            pass  # sparse reduction output — fall through to restickify path
+        else:
+            return False, None
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:

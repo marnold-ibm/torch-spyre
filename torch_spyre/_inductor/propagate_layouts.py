@@ -1266,7 +1266,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         if target_stl is None:
             continue
         producer_layouts = getattr(producer, "layouts", None)
-        if not producer_layouts or target_stl not in producer_layouts:
+        if not producer_layouts or producer_layouts[0] != target_stl:
             continue
 
         producer.layout = copy_op.layout
