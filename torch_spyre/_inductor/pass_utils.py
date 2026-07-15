@@ -1066,6 +1066,7 @@ def compute_restickify_needed(
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     ic = host_coordinates(in_host, in_dep, ind_sizes)
+    sparse_fallthrough = False
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         # A zero input stick is compatible only if a size-1 host dim maps to it
         # (genuine broadcast). If no size-1 host dim produces a zero coordinate,
@@ -1081,10 +1082,30 @@ def compute_restickify_needed(
                 for e, sz in zip(ic, in_host.size)
             )
         ):
-            pass  # sparse reduction output — fall through to restickify path
+            sparse_fallthrough = (
+                True  # sparse reduction output — fall through to restickify path
+            )
         else:
             return False, None
     target_stick = out_idc[-1]
+
+    # Implicit-broadcast fast-exit: if the input's stick is zero and the output
+    # stick variable does not appear in in_dep.index, the input is implicitly
+    # broadcasting along the output's stick dimension (e.g. amax(x,dim=1)[d0]
+    # used in a kernel whose output stick is Mod(d1,64) — d1 is absent from
+    # in_dep.index).  No restickify is needed; the hardware reads the single-
+    # stick input element and replicates it across the output sticks.
+    # sparse_fallthrough guards the case where stick_compatible=True but the
+    # zero-stick input is a sparse reduction (not a genuine broadcast) — in that
+    # case the implicit-broadcast shortcut must not fire.
+    if (
+        not sparse_fallthrough
+        and idc[-1] == sympy.S.Zero
+        and target_stick != sympy.S.Zero
+        and in_stick_offset_free
+        and target_stick.free_symbols.isdisjoint(in_dep.index.free_symbols)
+    ):
+        return False, None
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout
