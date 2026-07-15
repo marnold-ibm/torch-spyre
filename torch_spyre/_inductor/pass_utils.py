@@ -1035,8 +1035,21 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
+    # Fast path: same STL and same dep index means already stick-compatible — no restickify needed.
+    if in_stl == out_stl and in_dep.index == out_dep.index:
+        return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
     out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
+    if idc is not None and idc[-1] == sympy.S.Zero and not idc[-1].free_symbols:
+        # Pure broadcast inputs (all stride_map entries are -1, e.g. scalar constants)
+        # are stick-compatible with any output — return early without checking
+        # stick_compatible. Sparse reduction outputs (stride_map has non-(-1) entries)
+        # can produce a zero-stick idc but are NOT always compatible, so fall through
+        # to the committed stick_compatible check below.
+        if all(sm == -1 for sm in in_stl.stride_map):
+            return False, None
+        if out_idc is None:
+            return False, None
     if idc is None or out_idc is None:
         # One of the layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
