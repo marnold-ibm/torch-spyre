@@ -863,6 +863,7 @@ def test_amax_full_and_amax_live_maximum():
 
 # ------- Unsupported stick configurations ---------
 
+
 def test_sparse_dense_pointwise():
     """a.sum(2) + b - reduction followed by pointwise without broadcasting."""
     a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
@@ -875,8 +876,7 @@ def test_sparse_dense_pointwise():
 
 
 def test_sparse_dense_pointwise_d0_stick():
-    """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate.
-    """
+    """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
     a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
@@ -885,6 +885,7 @@ def test_sparse_dense_pointwise_d0_stick():
         InductorError, match="No mechanism to gather elements from multiple sticks"
     ):
         _compare(lambda a, b: a.sum(2) + b, a, b)
+
 
 def test_sparse_broadcast_dense_pointwise():
     """a.sum(1) + b - reduction followed by broadcast and pointwise
@@ -895,15 +896,18 @@ def test_sparse_broadcast_dense_pointwise():
     b = torch.randn((S, S), dtype=torch.float16)
     _compare(lambda a, b: a.sum(1) + b, a, b, optimal_cost=0)
 
+
 def test_sparse_broadcast_dense_pointwise_d0_stick():
-    """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate.
-    """
+    """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare_with_device_args(lambda a, b: a.sum(1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0)
+    _compare_with_device_args(
+        lambda a, b: a.sum(1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0
+    )
+
 
 def test_unsqueeze_broadcast_dense_pointwise():
     """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise
@@ -922,7 +926,9 @@ def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare_with_device_args(lambda a, b: a.unsqueeze(-1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0)
+    _compare_with_device_args(
+        lambda a, b: a.unsqueeze(-1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0
+    )
 
 
 def test_unsqueeze_expand_broadcast_dense_pointwise():
@@ -942,7 +948,12 @@ def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare_with_device_args(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0)
+    _compare_with_device_args(
+        lambda a, b: a.unsqueeze(-1).expand(S, S) + b,
+        [a, b],
+        [a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
 
 
 # ------- Broadcast outer-product tests ---------
@@ -987,6 +998,7 @@ def test_broadcast_expand_second():
         check_strides=False,
     )
 
+
 def test_broadcast_expand_both():
     """expand on both unsqueezes — both inputs fully expanded to [BH, C, C]."""
     BH, C = 64, 64
@@ -999,5 +1011,3 @@ def test_broadcast_expand_both():
         optimal_cost=2 * acs.numel(),
         check_strides=False,
     )
-
-
