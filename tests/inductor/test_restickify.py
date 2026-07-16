@@ -91,7 +91,9 @@ def _compare(
         )
     if not skip_correctness:
         compare_with_cpu(fn, *args, target=spyre_result, run_eager=False)
-    if check_strides and device_args is None:
+    if (
+        check_strides and device_args is None
+    ):  # skip when device_args differ from CPU args: strides intentionally won't match
         cpu_result = fn(*args)
         assert cpu_result.stride() == spyre_result.stride(), (
             f"Stride mismatch: CPU {cpu_result.stride()} vs Spyre {spyre_result.stride()}"
@@ -872,7 +874,7 @@ def test_sparse_dense_pointwise():
 
 
 def test_sparse_dense_pointwise_d0_stick():
-    """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+    """a.sum(2) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
     a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])

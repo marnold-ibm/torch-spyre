@@ -892,6 +892,8 @@ def _multi_arg_pointwise_layouts(
     # against layouts already produced by the input-stick loop above.
     # Skip for staggered-EA ops: their output layout is dictated by the staggered
     # input EA and adding STANDARD candidates would corrupt downstream ops.
+    # EA omitted from key: the loop below is skipped for staggered ops, so all
+    # candidates added (and looked up) here use STANDARD EA — geometry suffices.
     seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
     for alt_stick_dim in range(len(output.size)) if not staggered_inputs else []:
         # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
