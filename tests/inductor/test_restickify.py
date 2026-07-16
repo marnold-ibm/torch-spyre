@@ -897,7 +897,13 @@ def test_sparse_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare(lambda a, b: a.sum(1) + b, a, b, device_args=[a.to(DEVICE), b_dev], optimal_cost=0)
+    _compare(
+        lambda a, b: a.sum(1) + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
 
 
 def test_unsqueeze_broadcast_dense_pointwise():
@@ -914,7 +920,13 @@ def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, device_args=[a.to(DEVICE), b_dev], optimal_cost=0)
+    _compare(
+        lambda a, b: a.unsqueeze(-1) + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
 
 
 def test_unsqueeze_expand_broadcast_dense_pointwise():
@@ -931,7 +943,13 @@ def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, device_args=[a.to(DEVICE), b_dev], optimal_cost=0)
+    _compare(
+        lambda a, b: a.unsqueeze(-1).expand(S, S) + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
 
 
 # ------- Broadcast outer-product tests ---------
