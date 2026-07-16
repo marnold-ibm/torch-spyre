@@ -87,6 +87,21 @@ def _compare(fn, *args, check_strides=True, optimal_cost=None, skip_correctness=
         )
 
 
+def _compare_with_device_args(fn, cpu_args, device_args, optimal_cost=None):
+    """Like _compare, but allows pre-placed device tensors (e.g. custom layouts).
+
+    cpu_args: plain CPU tensors used for the reference result.
+    device_args: tensors already on DEVICE (possibly with custom layouts) used for the compiled run.
+    """
+    spyre_result, plan = _compile_and_run_plan_capture(fn, *device_args)
+    if optimal_cost is not None:
+        actual_cost = _compute_cost(plan)
+        assert actual_cost == optimal_cost, (
+            f"restickify cost: expected {optimal_cost}, got {actual_cost}"
+        )
+    compare_with_cpu(fn, *cpu_args, target=spyre_result, run_eager=False)
+
+
 def _make_tensors(n, *shape):
     """Make n scaled fp16 tensors of the given shape. Scale keeps values small enough for chained matmuls."""
     return [torch.randn(*shape, dtype=torch.float16) * 0.1 for _ in range(n)]
@@ -859,20 +874,6 @@ def test_sparse_dense_pointwise():
         _compare(lambda a, b: a.sum(2) + b, a, b)
 
 
-@pytest.mark.skip
-def test_sparse_broadcast_dense_pointwise():
-    """a.sum(1) + b - reduction followed by broadcast and pointwise
-
-    There is no restickify resolution for this configuration so we must catch this and report error
-    """
-    a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
-    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.sum(1) + b, a, b)
-
-
 def test_sparse_dense_pointwise_d0_stick():
     """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate.
     """
@@ -885,18 +886,64 @@ def test_sparse_dense_pointwise_d0_stick():
     ):
         _compare(lambda a, b: a.sum(2) + b, a, b)
 
-@pytest.mark.skip
+def test_sparse_broadcast_dense_pointwise():
+    """a.sum(1) + b - reduction followed by broadcast and pointwise
+
+    There is no restickify resolution for this configuration so we must catch this and report error
+    """
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.sum(1) + b, a, b, optimal_cost=0)
+
 def test_sparse_broadcast_dense_pointwise_d0_stick():
     """a.sum(1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate.
     """
 
-    a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
-    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.sum(1) + b, a, b)
+    b_dev = b.to(device_layout=b_layout)
+    _compare_with_device_args(lambda a, b: a.sum(1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0)
+
+def test_unsqueeze_broadcast_dense_pointwise():
+    """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise
+
+    There is no restickify resolution for this configuration so we must catch this and report error
+    """
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S * S)
+
+
+def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
+    """a.unsqueeze(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b_dev = b.to(device_layout=b_layout)
+    _compare_with_device_args(lambda a, b: a.unsqueeze(-1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0)
+
+
+def test_unsqueeze_expand_broadcast_dense_pointwise():
+    """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise
+
+    There is no restickify resolution for this configuration so we must catch this and report error
+    """
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S * S)
+
+
+def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
+    """a.unsqueeze(-1).expand(S, S) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b_dev = b.to(device_layout=b_layout)
+    _compare_with_device_args(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0)
+
 
 # ------- Broadcast outer-product tests ---------
 
