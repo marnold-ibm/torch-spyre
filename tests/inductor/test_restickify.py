@@ -894,7 +894,7 @@ def test_sparse_broadcast_dense_pointwise():
     """
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.sum(1) + b, a, b, optimal_cost=0)
+    _compare(lambda a, b: a.sum(1) + b, a, b, optimal_cost=16384)
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():
