@@ -66,40 +66,36 @@ def _compile_and_run_plan_capture(fn, *args):
     return spyre_result, captured.get("plan", {})
 
 
-def _compare(fn, *args, check_strides=True, optimal_cost=None, skip_correctness=False):
+def _compare(
+    fn,
+    *args,
+    device_args=None,
+    check_strides=True,
+    optimal_cost=None,
+    skip_correctness=False,
+):
     """Run fn on Spyre, assert correctness against CPU, and optionally assert the restickify
     plan has cost == optimal_cost.
+
+    device_args: if provided, used for the Spyre run instead of args (allows pre-placed
+    tensors with custom layouts). args are still used for the CPU reference.
     """
+    run_args = device_args if device_args is not None else args
     if optimal_cost is None:
-        spyre_result = _compile_and_run(fn, args, DEVICE)
+        spyre_result = _compile_and_run(fn, run_args, DEVICE)
     else:
-        spyre_result, plan = _compile_and_run_plan_capture(fn, *args)
+        spyre_result, plan = _compile_and_run_plan_capture(fn, *run_args)
         actual_cost = _compute_cost(plan)
         assert actual_cost == optimal_cost, (
             f"restickify cost: expected {optimal_cost}, got {actual_cost}"
         )
     if not skip_correctness:
         compare_with_cpu(fn, *args, target=spyre_result, run_eager=False)
-    if check_strides:
+    if check_strides and device_args is None:
         cpu_result = fn(*args)
         assert cpu_result.stride() == spyre_result.stride(), (
             f"Stride mismatch: CPU {cpu_result.stride()} vs Spyre {spyre_result.stride()}"
         )
-
-
-def _compare_with_device_args(fn, cpu_args, device_args, optimal_cost=None):
-    """Like _compare, but allows pre-placed device tensors (e.g. custom layouts).
-
-    cpu_args: plain CPU tensors used for the reference result.
-    device_args: tensors already on DEVICE (possibly with custom layouts) used for the compiled run.
-    """
-    spyre_result, plan = _compile_and_run_plan_capture(fn, *device_args)
-    if optimal_cost is not None:
-        actual_cost = _compute_cost(plan)
-        assert actual_cost == optimal_cost, (
-            f"restickify cost: expected {optimal_cost}, got {actual_cost}"
-        )
-    compare_with_cpu(fn, *cpu_args, target=spyre_result, run_eager=False)
 
 
 def _make_tensors(n, *shape):
@@ -888,13 +884,10 @@ def test_sparse_dense_pointwise_d0_stick():
 
 
 def test_sparse_broadcast_dense_pointwise():
-    """a.sum(1) + b - reduction followed by broadcast and pointwise
-
-    There is no restickify resolution for this configuration so we must catch this and report error
-    """
+    """a.sum(1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.sum(1) + b, a, b, optimal_cost=16384)
+    _compare(lambda a, b: a.sum(1) + b, a, b, optimal_cost=S * S)
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():
@@ -904,16 +897,11 @@ def test_sparse_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare_with_device_args(
-        lambda a, b: a.sum(1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0
-    )
+    _compare(lambda a, b: a.sum(1) + b, a, b, device_args=[a.to(DEVICE), b_dev], optimal_cost=0)
 
 
 def test_unsqueeze_broadcast_dense_pointwise():
-    """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise
-
-    There is no restickify resolution for this configuration so we must catch this and report error
-    """
+    """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
     _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S * S)
@@ -926,16 +914,11 @@ def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare_with_device_args(
-        lambda a, b: a.unsqueeze(-1) + b, [a, b], [a.to(DEVICE), b_dev], optimal_cost=0
-    )
+    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, device_args=[a.to(DEVICE), b_dev], optimal_cost=0)
 
 
 def test_unsqueeze_expand_broadcast_dense_pointwise():
-    """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise
-
-    There is no restickify resolution for this configuration so we must catch this and report error
-    """
+    """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
     _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S * S)
@@ -948,12 +931,7 @@ def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
     b_dev = b.to(device_layout=b_layout)
-    _compare_with_device_args(
-        lambda a, b: a.unsqueeze(-1).expand(S, S) + b,
-        [a, b],
-        [a.to(DEVICE), b_dev],
-        optimal_cost=0,
-    )
+    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, device_args=[a.to(DEVICE), b_dev], optimal_cost=0)
 
 
 # ------- Broadcast outer-product tests ---------
