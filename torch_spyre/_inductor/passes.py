@@ -384,11 +384,12 @@ class CustomPreSchedulingPasses:
         for pass_fn in self.passes:
             t0 = time.perf_counter()
             pass_fn(graph)
-            logger.info(
-                "elapsed %5dms  %s",
-                (time.perf_counter() - t0) * 1000,
-                _get_pass_name(pass_fn),
-            )
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "elapsed %5dms  %s",
+                    (time.perf_counter() - t0) * 1000,
+                    _get_pass_name(pass_fn),
+                )
 
             pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):

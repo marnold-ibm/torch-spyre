@@ -388,7 +388,7 @@ class BeamState:
     cost: float
 
 
-BEAM_WIDTH = 10000
+BEAM_WIDTH = 200
 MAX_BEAM_STATES_LOGGED = 10
 
 
