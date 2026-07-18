@@ -467,7 +467,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": True,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1212,7 +1211,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": True,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1914,7 +1912,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
         )
 
-    @config.patch({"unroll_loops": False})
     def test_nested_matmul_accum_tile_per_tile_fixed_in_sdsc(self):
         """Accumulator tile buffer in nested outer-M + inner-K reduction must have
         per_tile_fixed=True in the generated SDSC source.
