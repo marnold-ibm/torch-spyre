@@ -58,10 +58,12 @@ import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
+from torch._inductor.utils import sympy_subs
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     FlexibleLayout,
+    IRNode,
     Layout,
     Loops,
     MutationLayoutSHOULDREMOVE,
@@ -1155,6 +1157,20 @@ def _propagate_tiled_op(
 ) -> None:
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
     loop_info = getattr(op, "loop_info", None)
+
+    # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
+    # full-size SpyreEmptyFallback buffer directly (e.g. an accumulator
+    # produced by an earlier Case 1/2 rewrite).  That buffer has exactly one
+    # candidate layout, sized to the full buffer, while this op's own
+    # candidates are sized to its tile — the two can never be stick-compatible.
+    # Insert a tile-sized read view for each such input before doing anything
+    # else (mirrors the write-side _insert_copy_op fix, but on the read side).
+    # This must run before the Reduction/has_tiled_reduction branch below,
+    # since _propagate_tiled_reduction_op never touches op's own reads.
+    full_deps = _full_buffer_read_deps(op)
+    if full_deps:
+        op = _insert_read_view_ops(op, full_deps, operations)
+
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
         has_tiled_reduction = loop_info is not None and any(
@@ -1208,14 +1224,25 @@ def _propagate_tiled_op(
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
+    multi_input = _num_real_inputs(op) > 1
 
-    if has_inside:
+    if has_inside or multi_input:
         # Case 1: keep tiled op writing to small buffer; insert copy op.
+        # Multi-input ops must take this path even with no inside consumers:
+        # the tiled op's other real inputs are themselves tile-sized
+        # loop-internal ops whose own stick layout can never be made
+        # compatible with a full-size output under AllSameNode's
+        # stick-compatibility rule. Routing through _insert_copy_op keeps
+        # the tiled op self-consistent (own tile-sized layout, own
+        # tile-sized real inputs) and reuses the copy op's proven
+        # single-real-input path (the copy fuses the tiled op's own
+        # upstream computation via make_loader()).
         _insert_copy_op(op, full_buf, operations)
     else:
-        # Case 2: tiled op has no inside consumers — rewire it to write directly
-        # into the full-size buffer.  Note: MutationLayoutSHOULDREMOVE is
-        # incompatible with lx_planning (scratchpad); do not combine the two.
+        # Case 2: single real input, no inside consumers — rewire it to
+        # write directly into the full-size buffer.  Note:
+        # MutationLayoutSHOULDREMOVE is incompatible with lx_planning
+        # (scratchpad); do not combine the two.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.
@@ -1228,7 +1255,7 @@ def _propagate_tiled_op(
         "coarse_tile: propagated %s → %s (case %s)",
         buf_name,
         full_name,
-        "1 (copy)" if has_inside else "2 (mutation)",
+        "1 (copy)" if (has_inside or multi_input) else "2 (mutation)",
     )
 
 
@@ -1292,6 +1319,33 @@ def _has_inside_consumers(
         if _reads_buffer(op, buf_name):
             return True
     return False
+
+
+def _num_real_inputs(op: ComputedBuffer) -> int:
+    """Count op's MemoryDep reads that are not SpyreConstantFallback buffers."""
+    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    return sum(
+        1
+        for d in reads
+        if not isinstance(V.graph.get_buffer(d.name), SpyreConstantFallback)
+    )
+
+
+def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
+    """Return op's MemoryDep reads that target a full-size SpyreEmptyFallback buffer.
+
+    A loop-internal op (own tile-sized layout) that reads one of these
+    directly can never be made stick-compatible with it: the
+    SpyreEmptyFallback target has exactly one candidate layout, sized to the
+    full buffer, while the op's own candidates are sized to its tile.  See
+    _insert_read_view_ops.
+    """
+    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
+
+    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    return [
+        d for d in reads if isinstance(V.graph.get_buffer(d.name), SpyreEmptyFallback)
+    ]
 
 
 def _graph_output_names() -> set[str]:
@@ -1481,6 +1535,127 @@ def _insert_copy_op(
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, copy_buf)
+
+
+class _NameSwapHandler(WrapperHandler):
+    """Redirect ops.load(name, index) calls for names present in name_map.
+
+    See NameSwapHandler in insert_restickify.py — same pattern (CLAUDE.md
+    "Compiler Pass Conventions": wrap inner_fn via a WrapperHandler, never
+    reconstruct it from index expressions). Duplicated locally rather than
+    imported to avoid a coarse_tile <-> insert_restickify import-order
+    dependency; the two run at different, non-adjacent pipeline stages.
+    """
+
+    def __init__(self, inner, name_map: dict[str, str]):
+        super().__init__(inner)
+        self._name_map = name_map
+
+    def load(self, name, index):
+        return super().load(self._name_map.get(name, name), index)
+
+
+def _insert_read_view_ops(
+    tiled_op: ComputedBuffer,
+    full_deps: list[MemoryDep],
+    operations: list[Operation],
+) -> ComputedBuffer:
+    """Insert, before tiled_op, one tile-sized view op per full-size real input.
+
+    tiled_op is loop-internal (no outside consumers) but reads one or more
+    full-size SpyreEmptyFallback buffers directly. Those buffers get exactly
+    one candidate layout (sized to the full buffer), while tiled_op's own
+    candidates are sized to its tile — the two can never be stick-compatible
+    under AllSameNode.  Mirroring _insert_copy_op's write-side fix: for each
+    such input, insert a small Pointwise "view" op that reads the full
+    buffer's current tile slice (same index expression tiled_op already
+    uses, same loop_info so the per-iteration base address advances
+    identically) and writes it into a fresh tile-sized buffer.  tiled_op's
+    own inner_fn is then patched (WrapperHandler, not reconstructed — see
+    _NameSwapHandler) to read the view instead of the full buffer.
+
+    The view's own ranges/index must match dep (dep.var_names/dep.size), not
+    tiled_op.data.ranges: for a Reduction, the read spans output dims plus
+    the reduction dim, so dep's iteration space has more vars than the op's
+    own output-shaped ranges.  The view's layout reuses full_buf's own
+    per-var strides (extracted from dep.index, which is affine in
+    dep.var_names) rather than fresh contiguous strides, sized down to
+    dep.size — so tiled_op's unmodified read index (dep.index, computed
+    against those same strides) still resolves correctly once _NameSwapHandler
+    retargets the load at the view buffer instead of full_buf.
+
+    Returns the reconstructed ComputedBuffer that replaces tiled_op in
+    operations (see replace_computed_buffer_body below) — callers must
+    rebind their own reference since the original tiled_op object is stale
+    after this call.
+    """
+    name_map: dict[str, str] = {}
+    tiled_idx = operations.index(tiled_op)
+
+    for dep in full_deps:
+        full_buf = V.graph.get_buffer(dep.name)
+
+        tile_ranges = list(dep.size)
+        tile_strides = [dep.index.coeff(v) for v in dep.var_names]
+
+        def _view_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
+            subs = dict(zip(_dep.var_names, idx))
+            flat_index = sympy_subs(_dep.index, subs)
+            return V.ops.load(_full_name, flat_index)
+
+        # Construct under tiled_op's origins so data.origins is non-empty —
+        # _single_arg_op_layout (propagate_layouts.py) unconditionally
+        # dereferences next(iter(data.origins)) for ordinary (non-mutation)
+        # Pointwise ops.  IRNode.origins is populated at construction time
+        # from IRNode._current_origins, so it must be set via this context
+        # manager rather than assigned after the fact (assigning
+        # view_buf.origins below only sets the ComputedBuffer's own origins,
+        # not view_data's).
+        with IRNode.current_origins(tiled_op.origins):
+            view_data = Pointwise(
+                device=tiled_op.get_device(),
+                dtype=full_buf.get_dtype(),
+                inner_fn=_view_inner_fn,
+                ranges=tile_ranges,
+            )
+        view_name = V.graph.qualify_name(
+            f"coarse_tile_read_view_{tiled_op.get_name()}_{dep.name}"
+        )
+        view_layout = FixedLayout(
+            tiled_op.get_device(),
+            full_buf.get_dtype(),
+            tile_ranges,
+            tile_strides,
+        )
+        view_buf = ComputedBuffer(name=view_name, layout=view_layout, data=view_data)
+        view_buf.origins = tiled_op.origins
+        view_buf.operation_name = view_name
+        view_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+
+        V.graph.name_to_buffer[view_name] = view_buf
+        operations.insert(tiled_idx, view_buf)
+        tiled_idx += 1
+
+        name_map[dep.name] = view_name
+
+    # Patch tiled_op's inner_fn once with the full name_map (wrap, not
+    # reconstruct — see _NameSwapHandler docstring).  Rebuild via
+    # replace_computed_buffer_body, matching every other inner_fn-rewrite
+    # site in this file (_patch_consumers, _patch_retiled_load_indexes,
+    # _apply_fill_name_swap): a fresh ComputedBuffer has no stale per-object
+    # caches, sidestepping the need to enumerate every cache key by hand.
+    from .pass_utils import replace_computed_buffer_body
+
+    orig_inner = tiled_op.data.inner_fn
+
+    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
+        with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
+            return _orig_inner(*args)
+
+    object.__setattr__(tiled_op.data, "inner_fn", new_inner_fn)
+    new_op = replace_computed_buffer_body(tiled_op, tiled_op.data, operations)
+    V.graph.name_to_buffer[new_op.get_name()] = new_op
+    return new_op
 
 
 # ---------------------------------------------------------------------------
@@ -1985,8 +2160,14 @@ def _patch_retiled_load_indexes(
 
     from .pass_utils import replace_computed_buffer_body
 
+    # Only ops that were already in the group when _stamp_group ran can hold a
+    # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
+    # by insert_tiling_propagation (e.g. _insert_copy_op's copy_buf) read the
+    # retiled buffer's already-updated layout directly, so rewriting them here
+    # would double-apply the stride correction (see issue found while fixing
+    # test_hint_restickify_stays_in_group).
     retiled_names = set(rewrites_by_name)
-    for op in list(operations):
+    for op in list(group_ops):
         if not _should_patch_retiled_load_indexes(op, group_id, retiled_names):
             continue
 
