@@ -1389,6 +1389,32 @@ def propagate_spyre_tensor_layouts(
                         op.restick_cost_fn = AllSameNode.from_args(
                             all_args, candidates, output_dep, op
                         )
+                    elif (
+                        isinstance(op.data, Reduction)
+                        and op.data.reduction_type == BATCH_MATMUL_OP
+                    ):
+                        # Tiled matmul/bmm accumulator: op computes a per-tile
+                        # partial matmul and writes it into a slice of the
+                        # full-size accumulator. x and y are the two genuine
+                        # matmul operands (never the accumulator read-back —
+                        # mirrors the non-accumulator BATCH_MATMUL_OP dispatch
+                        # in compute_layouts, whose args also never include the
+                        # reduction's own output buffer). _matmul_layouts
+                        # derives a single out_stl deterministically from
+                        # accum_layout and installs its own FixedInOutNode, so
+                        # the accumulator is automatically pinned to that same
+                        # out_stl -- no separate AllSameNode join is needed.
+                        assert len(new_value_args) == 2, (
+                            "BATCH_MATMUL_OP accumulator op should have exactly "
+                            f"two non-accumulator inputs, got {len(new_value_args)} "
+                            f"for {op.get_name()}"
+                        )
+                        accum_layout = target_buf.get_layout()
+                        candidates = _matmul_layouts(
+                            op, accum_layout, output_dep, new_value_args
+                        )
+                        target_buf.layouts = candidates
+                        op.layouts = candidates
                     elif isinstance(op.data, Reduction):
                         # Tiled-reduction accumulator: op computes a per-tile
                         # partial reduction and writes it into a slice of the

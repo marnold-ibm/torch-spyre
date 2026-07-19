@@ -1224,25 +1224,28 @@ def _propagate_tiled_op(
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
-    multi_input = _num_real_inputs(op) > 1
+    has_loop_internal_input = _has_loop_internal_real_input(
+        op, loop_group_id, operations
+    )
 
-    if has_inside or multi_input:
+    if has_inside or has_loop_internal_input:
         # Case 1: keep tiled op writing to small buffer; insert copy op.
-        # Multi-input ops must take this path even with no inside consumers:
-        # the tiled op's other real inputs are themselves tile-sized
-        # loop-internal ops whose own stick layout can never be made
-        # compatible with a full-size output under AllSameNode's
-        # stick-compatibility rule. Routing through _insert_copy_op keeps
-        # the tiled op self-consistent (own tile-sized layout, own
+        # Ops with a loop-internal real input must take this path even with
+        # no inside consumers: that input is itself a tile-sized loop-internal
+        # op whose own stick layout can never be made compatible with a
+        # full-size output under AllSameNode's stick-compatibility rule (see
+        # _has_loop_internal_real_input). Routing through _insert_copy_op
+        # keeps the tiled op self-consistent (own tile-sized layout, own
         # tile-sized real inputs) and reuses the copy op's proven
         # single-real-input path (the copy fuses the tiled op's own
         # upstream computation via make_loader()).
         _insert_copy_op(op, full_buf, operations)
     else:
-        # Case 2: single real input, no inside consumers — rewire it to
-        # write directly into the full-size buffer.  Note:
-        # MutationLayoutSHOULDREMOVE is incompatible with lx_planning
-        # (scratchpad); do not combine the two.
+        # Case 2: no inside consumers and every real input is external to the
+        # loop (a graph input or other buffer with its own independent,
+        # unconstrained candidate layouts) — rewire the op to write directly
+        # into the full-size buffer.  Note: MutationLayoutSHOULDREMOVE is
+        # incompatible with lx_planning (scratchpad); do not combine the two.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.
@@ -1255,7 +1258,7 @@ def _propagate_tiled_op(
         "coarse_tile: propagated %s → %s (case %s)",
         buf_name,
         full_name,
-        "1 (copy)" if (has_inside or multi_input) else "2 (mutation)",
+        "1 (copy)" if (has_inside or has_loop_internal_input) else "2 (mutation)",
     )
 
 
@@ -1321,14 +1324,32 @@ def _has_inside_consumers(
     return False
 
 
-def _num_real_inputs(op: ComputedBuffer) -> int:
-    """Count op's MemoryDep reads that are not SpyreConstantFallback buffers."""
+def _has_loop_internal_real_input(
+    op: ComputedBuffer,
+    loop_group_id: tuple,
+    operations: list[Operation],
+) -> bool:
+    """Return True if any real input of op is itself produced inside the loop.
+
+    A real (non-constant) input that is a ComputedBuffer stamped with
+    loop_info in the same outer loop group is a tile-sized, loop-internal
+    producer with its own tile-sized candidate layouts — those can never be
+    made stick-compatible with a full-size output under AllSameNode's
+    stick-compatibility rule (see Case 1 vs Case 2 above). A real input with
+    no loop_info (a graph input, or any other buffer resolved outside the
+    loop) has its own independent, unconstrained candidate layouts and does
+    not hit this problem, so it does not force Case 1.
+    """
+    outer_key = loop_group_id[0]
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    return sum(
-        1
-        for d in reads
-        if not isinstance(V.graph.get_buffer(d.name), SpyreConstantFallback)
-    )
+    for dep in reads:
+        buf = V.graph.get_buffer(dep.name)
+        if isinstance(buf, SpyreConstantFallback):
+            continue
+        li = getattr(buf, "loop_info", None)
+        if li is not None and li.loop_group_id[0] == outer_key:
+            return True
+    return False
 
 
 def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
