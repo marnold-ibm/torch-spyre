@@ -1389,6 +1389,49 @@ def propagate_spyre_tensor_layouts(
                         op.restick_cost_fn = AllSameNode.from_args(
                             all_args, candidates, output_dep, op
                         )
+                    elif isinstance(op.data, Reduction):
+                        # Tiled-reduction accumulator: op computes a per-tile
+                        # partial reduction and writes it into a slice of the
+                        # full-size accumulator. The "new value" input is the
+                        # reduction's own un-reduced, higher-rank input, so
+                        # this must go through the same per-arg reduction
+                        # layout logic compute_layouts uses for ordinary
+                        # reductions (_single_arg_op_layout), not the
+                        # broadcast-oriented pointwise join path.
+                        assert len(new_value_args) == 1, (
+                            "Reduction op should have exactly one non-accumulator "
+                            f"input, got {len(new_value_args)} for {op.get_name()}"
+                        )
+                        accum_layout = target_buf.get_layout()
+                        in_arg = new_value_args[0]
+                        candidates = []
+                        for stl in in_arg.layouts:
+                            candidates.extend(
+                                _single_arg_op_layout(
+                                    op,
+                                    accum_layout,
+                                    output_dep,
+                                    in_arg.dep,
+                                    in_arg.layout,
+                                    stl,
+                                )
+                            )
+                        if not candidates:
+                            raise Unsupported(
+                                f"{op.get_name()}: no supported output layout "
+                                f"found for any of {len(in_arg.layouts)} "
+                                f"candidate input layouts; accum size="
+                                f"{accum_layout.size}"
+                            )
+                        # The accumulator read-back (target_name) is also a
+                        # real input to this op and its stick must match the
+                        # output, so build the cost function from all_args
+                        # (not just in_arg) — mirrors the pointwise branch.
+                        op.restick_cost_fn = AllSameNode.from_args(
+                            all_args, candidates, output_dep, op
+                        )
+                        target_buf.layouts = candidates
+                        op.layouts = candidates
                     else:
                         accum_layout = target_buf.get_layout()
                         candidates = _multi_arg_pointwise_layouts(
