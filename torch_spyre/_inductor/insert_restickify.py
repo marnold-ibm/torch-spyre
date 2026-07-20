@@ -358,13 +358,17 @@ def finalize_layouts(graph: GraphLowering) -> None:
             if isinstance(mut_target_buf, SpyreEmptyFallback) and committed is not None:
                 accum_layout = mut_target_buf.get_layout()
                 if isinstance(accum_layout, (FixedTiledLayout, FixedLayout)):
-                    mut_target_buf.layout = FixedTiledLayout(
+                    new_layout = FixedTiledLayout(
                         accum_layout.device,
                         accum_layout.dtype,
                         accum_layout.size,
                         accum_layout.stride,
                         committed,
                     )
+                    new_layout.per_tile_fixed = getattr(
+                        accum_layout, "per_tile_fixed", False
+                    )
+                    mut_target_buf.layout = new_layout
             elif isinstance(mut_target_buf, SpyreEmptyFallback) and committed is None:
                 # committed_stl was cleaned up; fall back to the accumulator's layout.
                 accum_layout = mut_target_buf.get_layout()
@@ -374,7 +378,22 @@ def finalize_layouts(graph: GraphLowering) -> None:
             input_buf = graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
             if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
-                assert getattr(input_buf, ELIDED_COPY_BACK_ATTR, False), (
+                # Reading real_layout() through a mutation layout is only valid
+                # once the target buffer's own layout is a committed
+                # FixedTiledLayout. Two producers of this shape:
+                #  - the copy-back elision optimization (propagate_layouts.py),
+                #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
+                #  - a sequential-carry op (_propagate_carry_op) that mutates
+                #    directly into a SpyreEmptyFallback accumulator (accum_tile) —
+                #    a legitimate in-group consumer (e.g. the next recurrence
+                #    step) reads the carry op's own output the same way an
+                #    ordinary producer's output would be read.
+                mutation_target = in_layout.get_buffer()
+                is_elided = getattr(input_buf, ELIDED_COPY_BACK_ATTR, False)
+                is_carry_into_accum = isinstance(
+                    mutation_target, SpyreEmptyFallback
+                ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
+                assert is_elided or is_carry_into_accum, (
                     f"unexpected mutation layout on {edge.dep.name}"
                 )
                 in_layout = in_layout.real_layout()
@@ -383,6 +402,13 @@ def finalize_layouts(graph: GraphLowering) -> None:
             if restick_stl is None:
                 continue
             restick_target = _fixed_tiled(in_layout, restick_stl)
+            # restick_target's buffer is created fresh by _create_restickify_node
+            # and consumed only by op's own inner_fn (see
+            # insert_restickify_on_node_inputs) — it can never have outside-loop
+            # consumers, so it is always safe to inherit in_layout's per_tile_fixed:
+            # if the source address doesn't advance across iterations, this private
+            # single-consumer copy of it doesn't need to either.
+            restick_target.per_tile_fixed = getattr(in_layout, "per_tile_fixed", False)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"

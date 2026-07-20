@@ -16,6 +16,7 @@ from contextlib import contextmanager
 
 import torch
 from torch._inductor.graph import GraphLowering
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from typing import Callable, Optional
@@ -121,6 +122,26 @@ def enable_spyre_context(
         old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
+
+    # coarse_tile.py's sequential-carry mechanism (_propagate_carry_op) inserts
+    # a copy-out op that mutates a pre-loop seed buffer (accum_full) so its
+    # updated value is visible to the NEXT outer-tile iteration's copy-in.
+    # That cross-iteration read has no representation in the single-pass,
+    # pre-unroll IR the scheduler's own dead_node_elimination walks, so a
+    # carry copy-out with no other downstream reader looks dead and is
+    # removed — even though it is required for correctness. Mark such ops
+    # with _coarse_tile_force_live (see _insert_reduction_copy_op) and force
+    # SchedulerNode.has_side_effects() to report True for them, mirroring how
+    # upstream itself protects effectful FallbackKernels from the same DCE
+    # pass (torch/_inductor/lowering.py, effectful op handling).
+    old_scheduler_node_has_side_effects = SchedulerNode.has_side_effects
+
+    def _spyre_scheduler_node_has_side_effects(self: SchedulerNode) -> bool:
+        if getattr(self.node, "_coarse_tile_force_live", False):
+            return True
+        return old_scheduler_node_has_side_effects(self)
+
+    SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
     with (
         spyre_data_types(),

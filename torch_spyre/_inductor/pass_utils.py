@@ -44,7 +44,7 @@ from .codegen.superdsc import (
     _should_use_k_fast_mapping,
 )
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
@@ -62,7 +62,22 @@ class SchedNodeArg(NamedTuple):
 def _fixed_read_layout(buf) -> "FixedTiledLayout":
     layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
-        if not getattr(buf, ELIDED_COPY_BACK_ATTR, False):
+        # Reading real_layout() through a mutation layout is only valid once
+        # the target buffer's own layout is a committed FixedTiledLayout. Two
+        # producers of this shape:
+        #  - the copy-back elision optimization (propagate_layouts.py), which
+        #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
+        #  - a sequential-carry op (_propagate_carry_op) that mutates directly
+        #    into a SpyreEmptyFallback accumulator (accum_tile) — a legitimate
+        #    in-group consumer (e.g. the next recurrence step) reads the carry
+        #    op's own output the same way an ordinary producer's output would
+        #    be read.
+        mutation_target = layout.get_buffer()
+        is_elided = getattr(buf, ELIDED_COPY_BACK_ATTR, False)
+        is_carry_into_accum = isinstance(
+            mutation_target, SpyreEmptyFallback
+        ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
+        if not (is_elided or is_carry_into_accum):
             raise RuntimeError(f"unexpected mutation layout on read buffer {buf}")
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
