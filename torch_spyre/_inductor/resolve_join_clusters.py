@@ -237,6 +237,11 @@ def _join_best_cost(join_op, assignment: dict) -> float:
 
 def _resolve_cluster(cluster: list, consumer_counts: dict[str, int]) -> None:
     siblings = _flexible_siblings(cluster, consumer_counts)
+    logger.debug(
+        "resolve_join_clusters: cluster %s -> siblings %s",
+        [op.get_name() for op in cluster],
+        {n: [b.get_name() for b in chain] for n, chain in siblings.items()},
+    )
     if not siblings:
         return
 
@@ -272,9 +277,22 @@ def _resolve_cluster(cluster: list, consumer_counts: dict[str, int]) -> None:
         join_layouts = {name: stl for name, (stl, _, _) in assignment.items()}
         for join_op in cluster:
             total += _join_best_cost(join_op, join_layouts)
+        join_layouts_log = {name: list(stl.stride_map) for name, (stl, _, _) in assignment.items()}
+        logger.debug(
+            "resolve_join_clusters: combo cost=%.1f assignment=%s",
+            total, join_layouts_log,
+        )
         if total < best_cost:
             best_cost = total
             best_assignment = assignment
+
+    if best_assignment is not None and best_cost < INF:
+        logger.debug(
+            "resolve_join_clusters: best assignment for cluster %s cost=%.1f: %s",
+            [op.get_name() for op in cluster],
+            best_cost,
+            {n: list(stl.stride_map) for n, (stl, _, _) in best_assignment.items()},
+        )
 
     if best_assignment is None or best_cost == INF:
         # No jointly feasible assignment found -- leave candidates untouched
@@ -316,5 +334,8 @@ def resolve_join_clusters(graph: GraphLowering) -> None:
     if not join_ops:
         return
     consumer_counts = _consumer_counts(graph.operations)
-    for cluster in _build_clusters(join_ops):
+    # Process clusters in reverse topological order: downstream joins first.
+    # This ensures upstream join ops (e.g. buf20) still have multiple candidates
+    # when a downstream join (e.g. buf22) evaluates them jointly.
+    for cluster in reversed(_build_clusters(join_ops)):
         _resolve_cluster(cluster, consumer_counts)

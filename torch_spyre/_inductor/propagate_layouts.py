@@ -889,26 +889,13 @@ def _multi_arg_pointwise_layouts(
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
-    # Always scan all dims so that dims absent from any input stick expression
-    # (e.g. the outer broadcast dim) are also offered as candidates. Deduplicate
-    # against layouts already produced by the input-stick loop above.
-    # Skip for staggered-EA ops: their output layout is dictated by the staggered
-    # input EA and adding STANDARD candidates would corrupt downstream ops.
-    # EA omitted from key: the loop below is skipped for staggered ops, so all
-    # candidates added (and looked up) here use STANDARD EA — geometry suffices.
-    seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
-    for alt_stick_dim in range(len(output.size)) if not staggered_inputs else []:
-        # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-            continue
-        pre_len = len(results)
-        _try_stick_dim(alt_stick_dim)
-        if len(results) > pre_len:
-            key = (tuple(results[-1].device_size), tuple(results[-1].stride_map))
-            if key in seen_keys:
-                results.pop()
-            else:
-                seen_keys.add(key)
+    # Try alternative layouts if no valid layouts found
+    if not results:
+        for alt_stick_dim in range(len(output.size) - 1):
+            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
+            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+                continue
+            _try_stick_dim(alt_stick_dim)
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
     # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation

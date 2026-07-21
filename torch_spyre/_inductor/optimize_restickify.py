@@ -371,9 +371,14 @@ def greedy_local_min_cost(operations: list) -> None:
 # by a "beam width". When beam width is exceeded, the highest cost states are trimmed. Optimal cost is
 # only achieved if the optimal state always remains in the beam.
 #
-# Future improvements include (a) using live node analysis to prune dead states and (b) back-propagating
-# a "min_cost" to avoid dropping states that become important later. These will be added only once
-# we see evidence it matters in the models we are targeting.
+# A*-style backward pass: before the forward beam runs, compute_future_min_cost does a backward DP
+# over the op graph to estimate the minimum remaining cost achievable from each (op, candidate_stl)
+# pair onward. The forward beam then trims by lower_bound = cost_so_far + future_min_cost instead of
+# cost_so_far alone. This is admissible: the backward DP independently minimizes each downstream
+# consumer's cost (treating other inputs optimistically), so it underestimates true remaining cost.
+# States with a high future cost (e.g. buf30=cand1 which leads to INF at the buf22 join) are
+# de-prioritized relative to states with low future cost (e.g. buf30=cand3 which reaches the join
+# cheaply), even if their cost_so_far is currently lower.
 
 
 @dataclass
@@ -382,14 +387,90 @@ class BeamState:
 
     assignments is a tuple parallel to a shared buf_names list — index i holds the
     chosen SpyreTensorLayout for buf_names[i], or None for passthrough ops.
+    lower_bound = cost + future_min_cost for the last assigned op's candidate.
     """
 
     assignments: tuple  # tuple[SpyreTensorLayout | None, ...]
     cost: float
+    lower_bound: float = 0.0
 
 
 BEAM_WIDTH = 200
 MAX_BEAM_STATES_LOGGED = 10
+
+
+def compute_future_min_cost(
+    operations: list,
+) -> dict:
+    """Backward DP: returns future_min_cost[op_name][stl] = admissible lower bound on
+    remaining restickify cost from this op onward, if this op commits to stl.
+
+    Processes ops in reverse topological order. For each op and each of its output
+    candidates, sums over all downstream consumers the minimum edge cost achievable
+    from that candidate to any of the consumer's output candidates (recursively).
+
+    The bound is admissible (never overestimates) because each downstream consumer's
+    cost is minimized independently — ignoring cross-consumer pairwise constraints.
+    """
+    # Build downstream map: op_name -> list of ops that read it
+    downstream: dict[str, list] = defaultdict(list)
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+        for dep in op.get_read_writes().reads:
+            if isinstance(dep, MemoryDep):
+                downstream[dep.name].append(op)
+
+    future: dict[str, dict] = {}  # op_name -> {stl -> float}
+
+    for op in reversed(operations):
+        if not hasattr(op, "layouts"):
+            continue
+        name = op.get_name()
+        future[name] = {}
+
+        for candidate in op.layouts:
+            # Sum the minimum future cost over all downstream consumers of this op.
+            total_future = 0.0
+            for d_op in downstream.get(name, []):
+                if not hasattr(d_op, "layouts"):
+                    continue
+                # Find the EdgeCostMap in d_op for this input (dep.name == name).
+                ec = next(
+                    (e for e in d_op.restick_cost_fn.edge_costs if e.dep.name == name),
+                    None,
+                )
+                if ec is None:
+                    continue
+                # Optimistically: minimize over d_op's output candidates.
+                # For multi-input consumers, a d_cand is only reachable if all
+                # OTHER inputs also have at least one candidate compatible with it.
+                other_ecs = [
+                    e for e in d_op.restick_cost_fn.edge_costs if e.dep.name != name
+                ]
+                best = INF
+                for d_cand in d_op.layouts:
+                    edge_c = ec.cost(candidate, d_cand)
+                    if edge_c == INF:
+                        continue
+                    # Check that every other input has some candidate compatible with d_cand.
+                    other_feasible = all(
+                        any(e.cost(other_c, d_cand) < INF for other_c in e._in_layouts)
+                        for e in other_ecs
+                    )
+                    if not other_feasible:
+                        continue
+                    tail = future.get(d_op.get_name(), {}).get(d_cand, 0.0)
+                    best = min(best, edge_c + tail)
+                # If no feasible d_cand exists, this input→consumer path costs INF.
+                # Cap at a large finite value so it de-prioritizes but doesn't hard-block.
+                if best == INF:
+                    best = 1e18
+                total_future += best
+
+            future[name][candidate] = total_future
+
+    return future
 
 
 class Frontier:
@@ -411,10 +492,10 @@ class Frontier:
         return state.assignments[idx]
 
     def best(self) -> BeamState:
-        return self.states[0]
+        return min(self.states, key=lambda s: s.cost)
 
     def trim(self) -> None:
-        self.states.sort(key=lambda s: s.cost)
+        self.states.sort(key=lambda s: s.lower_bound)
         before = len(self.states)
         self.states = self.states[: self.K]
         if len(self.states) < before:
@@ -426,14 +507,50 @@ class Frontier:
             )
 
 
+def _compute_last_use(operations: list, step_of: "dict[str, int]") -> "dict[str, int]":
+    """Return last_use[op_name] = max step index of any op that reads this op's output.
+
+    Ops with no downstream consumers are absent from the result (or map to -1).
+    """
+    last_use: dict[str, int] = {}
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+        for dep in op.get_read_writes().reads:
+            if isinstance(dep, MemoryDep) and dep.name in step_of:
+                consumer_step = step_of[op.get_name()]
+                if last_use.get(dep.name, -1) < consumer_step:
+                    last_use[dep.name] = consumer_step
+    return last_use
+
+
 def beam_global_min_cost(operations: list) -> None:
     """Global beam search layout selection.
 
     Processes ops in topological order. For each op with a restick_cost_fn,
     expands every current state by branching over candidate output STLs and
-    accumulating cost. After each op the beam is pruned to K best states.
+    accumulating cost. After each op the beam is pruned to K best states
+    sorted by lower_bound = cost_so_far + future_min_cost (A*-style).
+
+    After expansion, states whose live assignments are identical are merged
+    (keeping only the lowest lower_bound one). This is state canonicalization
+    via liveness: once all consumers of a buffer have been committed, that
+    buffer's assignment slot can no longer affect future cost, so two states
+    that agree on every live slot are equivalent.
+
     At the end, the best state's assignments are committed to the ops.
     """
+    future_min_cost = compute_future_min_cost(operations)
+
+    # Precompute step index and last-use step for liveness merging.
+    step_of: dict[str, int] = {}
+    step_counter = 0
+    for op in operations:
+        if hasattr(op, "layouts"):
+            step_of[op.get_name()] = step_counter
+            step_counter += 1
+    last_use = _compute_last_use(operations, step_of)
+
     frontier = Frontier(BEAM_WIDTH)
     # Commit graph inputs and seed into the frontier so input_stl() works uniformly for all deps.
     for name in V.graph.graph_input_names:
@@ -447,17 +564,24 @@ def beam_global_min_cost(operations: list) -> None:
             stl = next(iter(tb.layouts))
             tb.data.data.committed_stl = stl
             frontier.add_buf(name)
+            inp_future = future_min_cost.get(name, {}).get(stl, 0.0)
             frontier.states = [
-                BeamState(assignments=state.assignments + (stl,), cost=state.cost)
+                BeamState(
+                    assignments=state.assignments + (stl,),
+                    cost=state.cost,
+                    lower_bound=state.cost + inp_future,
+                )
                 for state in frontier.states
             ]
 
     max_states = 1
+    merged_total = 0
 
     for op in operations:
         if not hasattr(op, "layouts"):
             continue
 
+        current_step = step_of[op.get_name()]
         frontier.add_buf(op.get_name())
 
         assert hasattr(op, "restick_cost_fn"), (
@@ -466,6 +590,7 @@ def beam_global_min_cost(operations: list) -> None:
         cost_fn = op.restick_cost_fn
         deps = [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
 
+        op_future = future_min_cost.get(op.get_name(), {})
         next_states = []
         for state in frontier.states:
             in_layouts = [frontier.input_stl(state, dep.name) for dep in deps]
@@ -473,18 +598,77 @@ def beam_global_min_cost(operations: list) -> None:
             for candidate_stl in op.layouts:
                 extra_cost = cost_fn.cost(in_layouts, candidate_stl)
                 if extra_cost < INF:
+                    new_cost = state.cost + extra_cost
+                    lb = new_cost + op_future.get(candidate_stl, 0.0)
                     next_states.append(
                         BeamState(
                             assignments=state.assignments + (candidate_stl,),
-                            cost=state.cost + extra_cost,
+                            cost=new_cost,
+                            lower_bound=lb,
                         )
                     )
+
+        # TEMP DEBUG: cost breakdown by buf30 candidate for coarse_tile_fill_buf21
+        if op.get_name() == "coarse_tile_fill_buf21" and "buf30" in frontier._buf_idx:
+            from collections import defaultdict
+            buf30_idx = frontier._buf_idx["buf30"]
+            cost_by_cand = defaultdict(list)
+            for s in next_states:
+                cand_key = str(list(s.assignments[buf30_idx].stride_map))
+                cost_by_cand[cand_key].append(s.cost)
+            for cand_key, costs in sorted(cost_by_cand.items()):
+                logger.debug(
+                    "FILL_BUF21 cost by buf30=%s: n=%d min=%.1f max=%.1f mean=%.1f",
+                    cand_key, len(costs), min(costs), max(costs),
+                    sum(costs) / len(costs),
+                )
+
+        # State canonicalization via liveness: states that agree on every live slot
+        # (slots whose last downstream consumer has not yet been committed) are
+        # equivalent — their futures are identical. Keep only the lowest-lower_bound
+        # one per live key, then trim.
+        live_indices = frozenset(
+            i
+            for i, name in enumerate(frontier.buf_names)
+            if last_use.get(name, -1) > current_step
+        )
+        before_merge = len(next_states)
+        canon: dict[tuple, BeamState] = {}
+        for s in next_states:
+            key = tuple(
+                s.assignments[i] if i in live_indices else None
+                for i in range(len(s.assignments))
+            )
+            if key not in canon or s.lower_bound < canon[key].lower_bound:
+                canon[key] = s
+        next_states = list(canon.values())
+        merged = before_merge - len(next_states)
+        merged_total += merged
+        if merged > 0:
+            logger.debug(
+                "liveness merge after %s: %d -> %d states (%d merged, %d live slots / %d total)",
+                op.get_name(), before_merge, len(next_states), merged,
+                len(live_indices), len(frontier.buf_names),
+            )
 
         frontier.states = next_states
         frontier.trim()
         if not frontier.states:
             raise _no_feasible_layout_error(op)
         max_states = max(max_states, len(frontier.states))
+        # TEMP DEBUG: track buf30/read_view/buf21 distributions at each step
+        _watch_names = [
+            "buf30", "coarse_tile_read_view_buf21_buf30", "buf21",
+        ]
+        _watch_idxs = {n: frontier._buf_idx[n] for n in _watch_names if n in frontier._buf_idx}
+        if _watch_idxs:
+            from collections import Counter
+            report = {}
+            for n, idx in _watch_idxs.items():
+                report[n] = dict(Counter(
+                    str(list(s.assignments[idx].stride_map)) for s in frontier.states
+                ))
+            logger.debug("PROBE_AFTER %s [%d]: %s", op.get_name(), len(frontier.states), report)
         if logger.isEnabledFor(logging.DEBUG):
             lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]
             for i, s in enumerate(frontier.states[:MAX_BEAM_STATES_LOGGED]):
@@ -497,9 +681,10 @@ def beam_global_min_cost(operations: list) -> None:
             logger.debug("\n".join(lines))
 
     logger.info(
-        "beam search done: max states = %d, best cost = %s",
+        "beam search done: max states = %d, best cost = %s, total liveness-merged = %d",
         max_states,
         frontier.best().cost,
+        merged_total,
     )
 
     # Commit the best state's assignments to all ops.
@@ -516,5 +701,6 @@ def optimize_restickify_locations(graph: GraphLowering) -> None:
         logger.info("optimizer: beam (global)")
         beam_global_min_cost(operations)
     else:
-        logger.info("optimizer: greedy (local)")
-        greedy_local_min_cost(operations)
+        raise NotImplementedError(
+            "greedy_local_min_cost is disabled — set config.global_stick_optimizer=True"
+        )
