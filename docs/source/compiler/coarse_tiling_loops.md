@@ -39,6 +39,7 @@ what constraints forced each choice — see the companion RFC
 - [Key files](#key-files)
 - [Invariants](#invariants-and-failure-modes)
 - [Rejected alternatives](#rejected-design-alternatives)
+- [Appendix: How IR rewiring works, and why it's sound](#appendix-how-ir-rewiring-works-and-why-its-sound)
 
 ## Design Overview
 
@@ -1645,3 +1646,484 @@ codegen time.
 - Symbolic loop counts in `bundle.mlir` (currently raises
   `NotImplementedError`; requires runtime shape plumbing into the MLIR
   function signature).
+
+## Appendix: How IR rewiring works, and why it's sound
+
+The sections above describe *what* `coarse_tile.py` does semantically: which
+buffers get promoted to full size, which get an `identity` copy op, which get
+`per_tile_fixed` scratch treatment. This appendix describes *how* those
+outcomes are implemented as edits to live Inductor IR objects, and why those
+edits cannot violate Inductor's own scheduler and dependency-tracking
+invariants. It is written for developers who need to modify `coarse_tile.py`
+itself or diagnose a wrong-code bug that might originate there — not a
+restatement of the Case 1/2/3 classification, the reduction accum pattern, or
+the carry seed/closure/entry/terminal vocabulary, all covered above.
+
+### The wrap-never-reconstruct convention in practice
+
+CLAUDE.md states the rule plainly: *"Modifying `ComputedBuffer.inner_fn`:
+wrap, never reconstruct. Use a `WrapperHandler` subclass ... installed with
+`V.set_ops_handler(handler)` inside the original `inner_fn`."* The reason is
+that `inner_fn` closes over symbolic index expressions computed against a
+specific `ranges`/`reduction_ranges`; those expressions go stale the moment
+anything about the op's shape changes, so hand-rebuilding them from scratch
+is a silent wrong-code trap (issue #2797, cited directly in
+`replace_computed_buffer_body`'s implementation comment in
+`pass_utils.py:1116-1117`). Every rewrite site in `coarse_tile.py` and
+`insert_restickify.py` follows the same four-line idiom instead:
+
+```python
+orig_inner = op.data.inner_fn
+
+def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
+    with V.set_ops_handler(SomeWrapperHandlerSubclass(V.ops, _map)):
+        return _orig_inner(*args)
+
+object.__setattr__(op.data, "inner_fn", new_inner_fn)
+new_op = replace_computed_buffer_body(op, op.data, operations)
+```
+
+`object.__setattr__` is required here because `ir.Loops` (the base of
+`Pointwise` and `Reduction`, which holds `inner_fn` and `ranges`) is declared
+`@ir_dataclass(frozen=True)` — a plain `data.inner_fn = new_inner_fn` raises
+`FrozenInstanceError`. This is the same escape hatch the doc already uses for
+`_divide_ranges`'s `object.__setattr__(data, "ranges", ranges)` above. By
+contrast, `Buffer` (the base of `ComputedBuffer`, which holds `.layout`) is
+**not** frozen, so the `op.layout = MutationLayoutSHOULDREMOVE(...)`
+assignments used elsewhere in this appendix are ordinary attribute sets, not
+escape-hatch writes — the two mechanisms look similar but rest on different
+class-level decisions.
+
+`replace_computed_buffer_body` (`pass_utils.py:1098-1135`) is the second half
+of the idiom: because `ComputedBuffer` itself is also frozen, the mutated
+`data` cannot simply be re-attached to the existing `op` object either — a
+fresh `ComputedBuffer` is constructed with the new `data`, all metadata
+fields downstream passes depend on (`operation_name`, `origins`,
+`origin_node`, `_split_size`/`_original_*`) are copied across, the
+`get_default_sizes_body` cache is explicitly cleared on the new object, and
+the new buffer replaces the old one in `operations` by index. Every inner_fn
+rewrite site ends with this call, not a raw dataclass mutation, specifically
+so that stale per-object caches on the old buffer can never leak forward.
+
+Call sites, all following this exact shape:
+
+- `_insert_read_view_ops` (`coarse_tile.py:2314-2414`, local
+  `_NameSwapHandler`) — see
+  [Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
+  above; detailed further below.
+- `_patch_consumers` (`coarse_tile.py:2772-2806`, `NameSwapHandler` imported
+  from `insert_restickify.py`) — patches an outside consumer's `inner_fn` to
+  read the newly-promoted full buffer instead of the original tile-sized one.
+- `_patch_retiled_load_indexes` / `_RetileLoadIndexHandler`
+  (`coarse_tile.py:2809-2972`) — a distinct mechanism from name-swapping,
+  detailed in the next subsection.
+- `_propagate_carry_op` (`coarse_tile.py:1763-2088`) — see
+  [Sequential carry](#sequential-carry-online-softmax-style-recurrences)
+  above; also rewires `entry_op`/closure-sibling `inner_fn`s to read
+  `carry_prev` instead of the seed.
+- `insert_restickify_on_node_inputs` (`insert_restickify.py:143-186`, using
+  the canonical `NameSwapHandler` defined at `insert_restickify.py:67-82`) —
+  the example CLAUDE.md itself points to.
+
+One site looks like an exception but is not: `_insert_copy_op`
+(`coarse_tile.py:2258-2293`) builds a **new** `Pointwise` via
+`tiled_op.make_loader()` rather than editing `tiled_op`'s own `inner_fn`.
+This is IR-safe by construction, not a violation of the convention — it
+reuses Inductor's own `make_loader()` (which itself returns a closure over
+the *existing* `inner_fn`/index machinery) instead of hand-assembling an
+index expression, so the same "never reconstruct a stale index" property
+holds even though no `WrapperHandler` is involved.
+
+No site in either file reconstructs an index expression from scratch.
+`_divide_ranges` (`coarse_tile.py:3455-3559`) is the one place shape and
+layout are mutated (via `object.__setattr__`) with `inner_fn` left completely
+untouched — deliberately, and safely, for the reason given in the next
+subsection.
+
+### Index-expression remapping: `_divide_ranges` and `_patch_retiled_load_indexes`
+
+Two distinct mechanisms handle index-expression correctness after tiling,
+and they are staged deliberately rather than combined:
+
+1. **`_divide_ranges`** (`coarse_tile.py:3455-3559`) shrinks `data.ranges`
+   (and the op's own `layout.size`/`layout.stride`) via `object.__setattr__`,
+   leaving `inner_fn` completely untouched. This is correct because the op's
+   own index arithmetic is expressed in terms of the loop variables that the
+   surrounding (now smaller, per-tile) iteration space binds — the *op*
+   never needs to know it was tiled; only its bounds shrink.
+
+2. **`_patch_retiled_load_indexes`** fixes a different problem: *other* ops
+   whose captured load index still carries the pre-tiling stride
+   coefficient for a buffer that has since been re-tiled. This is driven
+   exactly once, at the very end of `coarse_tile()`, after every group in
+   the call has been processed — not per-group. `_stride_rewrite_map`
+   (`coarse_tile.py:2809`) builds the substitution from old to new stride
+   coefficients; `_retile_load_index_from_strides`
+   (`coarse_tile.py:2822-2892`) checks that the load index is affine and
+   separable in the rewritten variables before substituting, and — this is
+   a real, flagged soft spot rather than a proven bug — conservatively
+   *refuses and warns* rather than raising a hard compile error if a future
+   index shape is not affine-separable. A refusal here degrades to a
+   runtime warning plus likely-wrong output, not a caught error at compile
+   time. `_RetileLoadIndexHandler` (`coarse_tile.py:2893-2934`,
+   a `WrapperHandler` subclass) is the mechanism that actually applies the
+   substitution to the consumer's `inner_fn`, following the same
+   wrap-never-reconstruct idiom as every other site in this appendix.
+
+   The concrete case is exactly the Small Example above: before
+   `insert_tiling_propagation`'s copy-op path is inserted for `buf1`, `buf1`'s
+   captured load of `y` is `i1 + 4096*i0` — a coefficient computed against
+   the *pre-tiling* full row stride (4096). Once `y`'s producer is tiled down
+   to a `[512, 1024]` per-tile buffer, that captured `4096*i0` coefficient no
+   longer matches `y`'s actual (now much smaller) tile layout, and
+   `_patch_retiled_load_indexes` rewrites it to the coefficient consistent
+   with the per-tile shape — the same information the `bundle.mlir` section's
+   `affine_map<(d0, d1)[s0] -> (s0 + 4194304*d0 + 2048*d1)>` encodes at the
+   byte-stride level for the final, fully-tiled program.
+
+   Running the patch once, globally, after all groups are stamped (rather
+   than per-group, immediately after each group is processed) is not a
+   stylistic choice: the project's own test history found and fixed a
+   double-application bug that resulted from patching too early, where a
+   load index already rewritten by an earlier group's pass got rewritten a
+   second time by a later group's pass touching an overlapping buffer.
+
+### Read redirection: why a view buffer, not just an index edit
+
+A recurring temptation when redirecting a read is to think of it as "leave
+`inner_fn` alone, just edit the dependency the scheduler sees." That is not
+possible in Inductor: as the next subsection proves in detail, dependency
+information is *derived from* `inner_fn` by re-tracing it, not stored
+independently — so the only way to actually redirect what an op reads is to
+change what its `inner_fn` does when traced.
+
+`_insert_read_view_ops` (`coarse_tile.py:2314-2414`) is the concrete instance
+already introduced under
+[Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
+above: when a loop-internal op reads a full-size `SpyreEmptyFallback` buffer
+directly (typically an accumulator that an earlier Case-2/mutation or carry
+rewrite already promoted to full size), the two-step mechanism is (1) insert,
+before the tiled op, a small tile-sized "view" `ComputedBuffer` whose
+`inner_fn` loads the full buffer's current tile slice using the *same* index
+expression the tiled op already computes and the *same* `loop_info` (so the
+per-iteration base address advances identically to the tiled op's own reads);
+then (2) wrap the tiled op's own `inner_fn` with the local `_NameSwapHandler`
+so that its load of the full buffer's name is retargeted to the new view
+buffer's name instead. The view's own layout is built from the full buffer's
+per-variable strides (extracted from the read dependency's index, which is
+affine in its var_names) rather than fresh contiguous strides, specifically
+so the tiled op's *unmodified* read index still resolves correctly once
+`_NameSwapHandler` retargets only the buffer name, not the index expression
+itself.
+
+The reason a view buffer is needed at all, rather than simply changing which
+name the tiled op loads from, is the same `AllSameNode` stick-compatibility
+constraint that motivates the Case 1/2/3 split on the write side: a full-size
+buffer has exactly one candidate layout (sized to the full buffer), while the
+tiled op's own candidate layouts are all tile-sized — the two can never be
+made stick-compatible without an intermediate buffer sized to match.
+
+### `MutationLayoutSHOULDREMOVE`: the real contract
+
+The doc above uses `MutationLayoutSHOULDREMOVE` four times (Case 3, the
+reduction accum pattern, the carry mechanism) as an already-understood
+primitive, each time asserting it is "a metadata redirect, zero added data
+movement." This subsection explains why that claim is true, from the actual
+upstream implementation (`torch/_inductor/ir.py:4373-4459`):
+
+```python
+class MutationLayoutSHOULDREMOVE(Layout):
+    def __init__(self, target: IRNode) -> None:
+        super().__init__(
+            target.get_device_or_error(),
+            target.get_dtype(),
+            target.get_size(),
+            None,
+        )
+        self.target = target
+        name = self.get_buffer().get_name()
+        V.graph.mark_buffer_mutated(name)
+```
+
+Constructing one of these immediately calls `V.graph.mark_buffer_mutated`
+on the target buffer's name — mutation is registered at construction time,
+unconditionally, not lazily discovered later. `get_buffer()` recursively
+unwraps through `MutationLayoutSHOULDREMOVE` → `BaseView` → `MutableBox`
+chains to find the real underlying `Buffer`, and `real_layout()` always
+defers to *that* buffer's own actual layout:
+
+```python
+    def real_layout(self) -> Layout:
+        layout = self.get_buffer().layout
+        assert isinstance(layout, Layout)
+        return layout
+```
+
+This is what "metadata redirect, zero added data movement" concretely means:
+the mutating op's `.layout.stride`/`.storage_size()` are computed by
+deferring to the target's real layout, not by allocating or copying
+anything. (`realize_into()`, the classmethod defined alongside it, is
+Inductor's own factory for the common "materialize a copy into an existing
+buffer" pattern; torch-spyre does not call it — every call site below
+constructs `MutationLayoutSHOULDREMOVE` directly and assigns it to `.layout`.)
+
+Marking the mutation matters beyond bookkeeping:
+`ComputedBuffer.make_loader()` checks `self.name not in
+V.graph.mutated_buffers` before deciding it is safe to inline a buffer's
+computation into its consumer. Mutation marking is exactly what prevents
+Inductor from incorrectly inlining away a buffer that is actually written in
+place — without the constructor's `mark_buffer_mutated` call, nothing would
+stop Inductor from treating the mutating op as a pure, inlinable pointwise
+computation and silently dropping the in-place write.
+
+**The single-writer invariant.** `Buffer.get_mutation_names()`
+(`ir.py:4574-4577`) returns at most one name — `ComputedBuffer` inherits it
+with no override:
+
+```python
+    def get_mutation_names(self) -> Sequence[str]:
+        if isinstance(self.layout, MutationLayoutSHOULDREMOVE):
+            return [self.layout.target.get_name()]
+        return ()
+```
+
+This is hard-enforced, not just documented, by an `assert` inside
+`Scheduler.compute_dependencies` at `scheduler.py:3337` (comment on the line
+above): `assert len(buf.get_mutations()) <= 1`. `compute_dependencies` is
+called from `Scheduler._init` — i.e. it runs before the first topological
+sort, before dead-code elimination, before any torch-spyre
+`CustomPreFusionPasses` hook fires. Every torch-spyre call site that assigns
+a `MutationLayoutSHOULDREMOVE` satisfies this by construction — `.layout` is
+a single attribute, and no site chains a new `MutationLayoutSHOULDREMOVE`
+onto a target that already carries one:
+
+| Site | File:line | Target |
+|---|---|---|
+| Case 3 direct mutation | `coarse_tile.py:1346` | full HBM buffer |
+| `_insert_copy_op` | `coarse_tile.py:2258-2293` | full buffer (copy-out) |
+| `_insert_reduction_copy_op` | `coarse_tile.py:2483-2546` | `accum_full` |
+| `_propagate_carry_op` | `coarse_tile.py:1763-2088` | seed / `accum_full` / `accum_tile` |
+
+This was checked directly against the current codebase and no violation was
+found — but the invariant is currently upheld by convention (one assignment
+per op, never revisited), not by an assertion or type-level guard. If this
+pattern is ever extended to a new call site, it is worth adding an explicit
+check rather than relying on the same discipline holding indefinitely.
+
+**A documented-but-unenforced gap.** `coarse_tile.py:1344-1345` carries a
+comment stating that `MutationLayoutSHOULDREMOVE` is incompatible with
+`lx_planning` (LX scratchpad placement) — the two must never be combined on
+the same buffer. There is no code-level guard preventing this combination;
+it currently relies entirely on pass-ordering discipline (scratchpad
+placement decisions and mutation-target rewrites are kept in separate,
+non-overlapping cases by construction) rather than an assertion that would
+catch a future regression.
+
+**An open upstream-adjacent TODO.** `span_overflow_hint_analysis.py:1519-1521`
+carries its own open question, quoted directly rather than resolved here:
+
+```python
+        # TODO: decide whether MutationLayoutSHOULDREMOVE producers need
+        # span-overflow planning, or whether they are safe to keep outside this
+        # pass as copy-back/mutation intermediates.
+```
+
+This appendix does not resolve that TODO; it is flagged here so a reader
+investigating a span-overflow-related bug touching a mutation-target buffer
+knows this question is already on record as open, not newly discovered.
+
+**Two passes named "propagation" — do not conflate them.** The pass-ordering
+section above already establishes when each pass runs; the naming collision
+is worth calling out explicitly since both passes touch
+`MutationLayoutSHOULDREMOVE`-adjacent state:
+`insert_tiling_propagation` (pre-scheduling, inside
+`CustomPreSchedulingPasses`, is the pass that *stamps* the layout — before
+any `Scheduler` object exists) is a completely different pass from
+`propagate_mutation_layouts` (pre-fusion, the first entry in
+`CustomPreFusionPasses`'s pass list shown above — it *unwraps*
+`MutationLayoutSHOULDREMOVE` back to a real `FixedTiledLayout`, after
+`Scheduler.__init__` has already consumed the mutation-marked state).
+
+### Why dependency info never goes stale: no caching
+
+The soundness of "mutate `inner_fn` in place and trust that Inductor sees
+the update" rests on one fact: `ComputedBuffer.get_read_writes()`
+(`ir.py:4768-4787`) has **no caching decorator**. Contrast this directly with
+`get_free_symbol_uses`, defined on the very next lines, which *is*
+`@cache_on_self_and_args("ComputedBuffer")`-decorated:
+
+```python
+    def get_read_writes(self) -> dependencies.ReadWrites:
+        if not isinstance(self.data, (Reduction, Scan, Sort, Pointwise)):
+            return dependencies.ReadWrites(
+                reads=OrderedSet(),
+                writes=OrderedSet(),
+                index_exprs=OrderedSet(),
+            )
+
+        with patch.object(FlexibleLayout, "allow_indexing", True):
+            if self.data.get_reduction_type():
+                return extract_read_writes(
+                    self.get_store_function(),
+                    self.data.get_pointwise_size(),
+                    self.data.get_reduction_size(),
+                )
+            else:
+                return extract_read_writes(
+                    self.get_store_function(),
+                    self.data.get_size(),
+                )
+
+    @cache_on_self_and_args("ComputedBuffer")
+    def get_free_symbol_uses(
+        self, unbacked_only: bool = False
+    ) -> OrderedSet[sympy.Symbol]:
+        ...
+```
+
+`extract_read_writes()` (`dependencies.py:659-693`) — for this call path,
+where `fn` is `self.get_store_function()`, a `partial`, not a `LoopBody` —
+takes the "slow path tracing the function" branch:
+
+```python
+    else:
+        # Slow path tracing the function
+        rw = RecordLoadStore(var_ranges, normalize=normalize)
+        with V.set_ops_handler(rw):
+            fn(*args, *hidden_args)
+        inner = rw.parent_handler
+```
+
+Every single call builds a fresh `RecordLoadStore`, installs it via
+`V.set_ops_handler`, and literally re-invokes the store function — which
+re-invokes `inner_fn` — from scratch. There is no memoized `ReadWrites`
+object anywhere in this path that a `coarse_tile.py` rewrite could leave
+stale. Mutating `op.data.inner_fn` in place is therefore automatically and
+immediately reflected the next time anything calls `get_read_writes()` — and
+there is no window in which Inductor's `Scheduler` could observe stale
+dependency info, because `SchedulerNode.read_writes` is itself built once,
+at `Scheduler.__init__` time, which runs strictly after all of
+`coarse_tile.py`'s IR rewriting (`CustomPreSchedulingPasses`, by
+construction) has already completed.
+
+`pass_utils.py`'s own comment at the `replace_computed_buffer_body` call
+site is the project's own prior articulation of this exact argument: *"Always
+wrap the original inner_fn via WrapperHandler; never rebuild index
+expressions from scratch (they go stale — see issue #2797)."*
+
+### DCE liveness: why carry copy-outs survive
+
+`Scheduler.dead_node_elimination` (`scheduler.py:3528-3567`) is a single
+reverse-topological-order linear sweep — not a separate reachability
+analysis:
+
+```python
+    def dead_node_elimination(self) -> None:
+        """
+        Remove any nodes without users
+        """
+        if not config.use_dce:
+            return
+
+        # self.nodes is in topological order, so by iterating in reverse order
+        # we have visited (and potentially removed) all users before visiting a
+        # given node.
+        updated_nodes = []
+        for node in reversed(self.nodes):
+
+            def can_eliminate_user(user: NodeUser) -> bool:
+                return user.is_weak or user.get_name() in V.graph.removed_operations
+
+            active_buffers = False
+            for buf in node.get_outputs():
+                can_eliminate = all(can_eliminate_user(u) for u in buf.users)
+                if can_eliminate:
+                    log.debug("removed dead buffer: %s", buf.get_name())
+                    V.graph.removed_buffers.add(buf.get_name())
+                else:
+                    active_buffers = True
+
+            can_eliminate = not node.has_side_effects() and not active_buffers
+            ...
+```
+
+`active_buffers` becomes `True` for a node the instant any one of its output
+buffers has a live (non-weak, non-removed) user; `can_eliminate_user`
+propagates removal backward as later nodes are dropped in the same reverse
+sweep. A node survives exactly when it has side effects, or at least one of
+its outputs still has a live user at the point the sweep reaches it.
+
+This runs exactly **once**, inside `Scheduler._init`, at step 8
+(`scheduler.py:2953`) — strictly **before** `CustomPreFusionPasses` fires
+(step 14, `scheduler.py:2966-2967`) and never again afterward in `_init`.
+This is the fact that matters for correctness: any liveness protection a
+torch-spyre pass wants to apply must already be in place by the time this
+sweep runs, not applied afterward — `CustomPreFusionPasses` is too late to
+save a node DCE has already dropped.
+
+The real problem this creates: a carry copy-out that writes the updated
+value back into the pre-loop seed buffer (`_propagate_carry_op`, described
+above) has no downstream reader *in the flat, pre-unroll IR that DCE walks*.
+The buffer it writes is read again only by the *next outer-tile iteration's*
+copy-in — a cross-iteration read with no representation at this IR level.
+From DCE's perspective the copy-out's output looks like a dead buffer with
+zero live users, and it would be removed despite being required for
+correctness — a real bug the project found and fixed (task history: "Confirm
+DCE mechanism: buf3's copy-out has no protecting downstream reader" /
+"Design and apply fix for DCE-eliminated carry copy-out").
+
+The fix is a targeted monkeypatch in `torch_spyre/_inductor/patches.py:126-144`:
+
+```python
+    # coarse_tile.py's sequential-carry mechanism (_propagate_carry_op) inserts
+    # a copy-out op that mutates a pre-loop seed buffer (accum_full) so its
+    # updated value is visible to the NEXT outer-tile iteration's copy-in.
+    # That cross-iteration read has no representation in the single-pass,
+    # pre-unroll IR the scheduler's own dead_node_elimination walks, so a
+    # carry copy-out with no other downstream reader looks dead and is
+    # removed — even though it is required for correctness. Mark such ops
+    # with _coarse_tile_force_live (see _insert_reduction_copy_op) and force
+    # SchedulerNode.has_side_effects() to report True for them, mirroring how
+    # upstream itself protects effectful FallbackKernels from the same DCE
+    # pass (torch/_inductor/lowering.py, effectful op handling).
+    old_scheduler_node_has_side_effects = SchedulerNode.has_side_effects
+
+    def _spyre_scheduler_node_has_side_effects(self: SchedulerNode) -> bool:
+        if getattr(self.node, "_coarse_tile_force_live", False):
+            return True
+        return old_scheduler_node_has_side_effects(self)
+
+    SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects
+```
+
+The patch's own comment already draws the right analogy: this is the same
+technique upstream Inductor uses to keep effectful `FallbackKernel`s (ops
+with observable side effects but no reader) alive across the same DCE pass —
+`has_side_effects()` is precisely the escape hatch DCE consults
+(`can_eliminate = not node.has_side_effects() and not active_buffers`,
+quoted above) for exactly this situation.
+
+The patch's scope is narrow, which matters for developer confidence that it
+cannot mask an unrelated bug elsewhere: it patches `SchedulerNode.
+has_side_effects` specifically — not `BaseSchedulerNode`, not
+`ExternKernelSchedulerNode`, not `FusedSchedulerNode` — and even for
+`SchedulerNode` it falls through unchanged to the original (`@cache_on_self`-
+decorated) implementation (`scheduler.py:1818-1823`) for every node except
+the ones explicitly stamped. The `_coarse_tile_force_live` attribute is
+stamped at exactly two sites: inside `_insert_reduction_copy_op`
+(`coarse_tile.py:2532`) and on a fill buffer (`coarse_tile.py:2712`).
+
+### Summary: invariant-by-invariant soundness table
+
+This table is additive to the [Invariants and failure modes](#invariants-and-failure-modes)
+section above, not a replacement for it — that section covers loop-structure
+invariants (contiguity, consistent `loop_count`, pass ordering); this one
+covers the IR-rewrite mechanism this appendix describes.
+
+| Inductor invariant | Where enforced upstream | How torch-spyre's rewiring respects it |
+|---|---|---|
+| Dependencies must reflect `inner_fn` | `get_read_writes()` re-traces every call, no cache (`ir.py:4768`) | No caching exists to go stale; wrap-in-place is automatically observed |
+| ≤1 mutation target per op | `assert` at `scheduler.py:3337` | Every `MutationLayoutSHOULDREMOVE` call site assigns exactly one; `.layout` is a single attribute, never chained |
+| Mutated buffers must not be silently inlined | `mark_buffer_mutated` called unconditionally in the constructor (`ir.py:4383`) | Constructor call fires on every instantiation, before `make_loader()` can ever see a stale view |
+| Dead nodes are pruned before codegen | `dead_node_elimination`, `scheduler.py:3528`, runs once, before `CustomPreFusionPasses` | `_coarse_tile_force_live` + patched `has_side_effects()` (`patches.py:126-144`) protects the two carry/reduction copy-out sites that need it |
+| Loop-group contiguity after scheduling | (existing invariant, cross-referenced only) | See [Contiguity invariant](#invariants-and-failure-modes) above |
