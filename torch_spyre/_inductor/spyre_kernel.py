@@ -610,6 +610,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
+        dim_advance_overrides: dict[sympy.Symbol, tuple[int, int]] = {}
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -625,6 +626,22 @@ class SpyreKernel(Kernel[CSEVariable]):
             else:
                 # Fallback: identity mapping (no unit-size dims to skip).
                 host_to_it = {i: i for i in range(len(it_space_keys))}
+
+            # Translate _coarse_tile_dim_advance (host-range-index keyed, see
+            # coarse_tile._propagate_tiled_op's Case 2 branch) into the
+            # iteration-space symbol space via the same host_to_it map used
+            # for tiled_syms above, so superdsc can bypass its
+            # device_coordinates-based stride/backGap derivation for these
+            # dims, which cannot otherwise be recovered for Case 2 ops.
+            dim_advance = getattr(ir_node, "_coarse_tile_dim_advance", None)
+            if dim_advance is not None:
+                for host_idx, (tile_size, supertile_count) in dim_advance.items():
+                    mapped = host_to_it.get(host_idx)
+                    if mapped is not None and mapped < len(it_space_keys):
+                        dim_advance_overrides[it_space_keys[mapped]] = (
+                            tile_size,
+                            supertile_count,
+                        )
 
             # For reduction dims: offset is the number of non-unit output-dim ranges.
             n_output_it_syms = sum(
@@ -694,6 +711,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
+            dim_advance_overrides=dim_advance_overrides,
             debug_handle=debug_handle,
         )
 
@@ -1091,6 +1109,15 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
+                if op_spec.dim_advance_overrides:
+                    buf.writeline(
+                        "dim_advance_overrides={"
+                        + ", ".join(
+                            f"{sympy_str(sym)}: {v!r}"
+                            for sym, v in op_spec.dim_advance_overrides.items()
+                        )
+                        + "},"
+                    )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
                     # generated-source -> exec round-trip. DebugHandle/SourceLoc

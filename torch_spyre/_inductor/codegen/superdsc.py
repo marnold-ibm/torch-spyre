@@ -396,6 +396,20 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
+    # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
+    # (tile_size, supertile_count) fact per coarse-tiled dim, stamped by
+    # coarse_tile._propagate_tiled_op onto the ComputedBuffer and translated
+    # into Inductor-symbol space by spyre_kernel.create_op_spec. Re-key it by
+    # SDSC symbol here so the per-dim loop below can use it directly instead
+    # of reverse-engineering the same fact from device_coordinates, which
+    # cannot represent it for these ops (see coarse_tiling_loops.md's
+    # IR-rewiring appendix).
+    sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {
+        symbol_mapping[sym]: v
+        for sym, v in op_spec.dim_advance_overrides.items()
+        if sym in symbol_mapping
+    }
+
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
     # and value tensors are those that contain IndirectAccess in their coordinates.
@@ -468,12 +482,32 @@ def _create_sdsc_tensors(
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
-            dev_dim_size = arg.device_size[-stride_idx - 2]
-            it_dim_size = iteration_space[dim]
-            if dim == stick_dim:
-                stick_size = arg.device_dtype.elems_per_stick()
-                dev_dim_size *= stick_size
-                it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+            if dim is stick_dim and dim in sdsc_dim_advance:
+                # Authoritative fact from coarse_tile.py: the stick dim is
+                # one tile of tile_size elements out of supertile_count
+                # tiles. _get_device_dim_order's dim_order walk can place the
+                # stick dim at a different position for this (Case 2 /
+                # mutated) arg than for its sibling args, which makes the
+                # stride_idx-based arg.device_size[-stride_idx-2] lookup
+                # below read the wrong slot for this arg specifically (see
+                # coarse_tiling_loops.md's IR-rewiring appendix). Use the
+                # authoritative supertile count for dev_dim_size instead of
+                # trusting that slot. Scoped to the stick dim only: other
+                # coarse-tiled dims (e.g. mb) already read the correct slot
+                # via the existing device_size lookup for every arg in this
+                # op, and overriding them too double-applies the tile split
+                # baked into arg.device_size, corrupting an already-correct
+                # stride (see the input mb regression this scoping fixes).
+                tile_size, supertile_count = sdsc_dim_advance[dim]
+                dev_dim_size = tile_size * supertile_count
+                it_dim_size = tile_size
+            else:
+                dev_dim_size = arg.device_size[-stride_idx - 2]
+                it_dim_size = iteration_space[dim]
+                if dim == stick_dim:
+                    stick_size = arg.device_dtype.elems_per_stick()
+                    dev_dim_size *= stick_size
+                    it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
             if has_indirect_access:
                 max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
@@ -916,7 +950,7 @@ def compile_op_spec(
         [symbol_mapping[s] for s in level if s in symbol_mapping]
         for level in reversed(op_spec.tiled_symbols)
     ]
-    return generate_sdsc(
+    result = generate_sdsc(
         idx,
         sdsc_spec,
         symbols,
@@ -924,3 +958,4 @@ def compile_op_spec(
         tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
     )
+    return result

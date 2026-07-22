@@ -431,6 +431,16 @@ Key observations:
   `c0` by the outer loop.
 - `symbolic_dim_bounds={}` is a new field added alongside `tiled_symbols`; it
   is empty here because all loop counts are concrete integers.
+- Every `OpSpec` above also carries `dim_advance_overrides={}` (omitted from
+  the listing like `debug_handle`, since it is empty for all three ops here).
+  This field is populated only for an op that took the Case 3 direct-rewire
+  path (see the table in
+  [Treatment by consumer topology](#treatment-by-consumer-topology)); the
+  `identity` op above (`coarse_tile_copy_buf1`) took the sibling Case 2
+  copy-op path instead, which never populates it — see the note right after
+  the Case 3 row of that table for why this specific example's `bundle.mlir`
+  is unaffected even though `_create_sdsc_tensors` gained this new
+  consumption logic.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
   `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
   Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
@@ -994,6 +1004,66 @@ existing storage in-place.  The full buffer's address is encoded in the
 unified treatment that always inserted a copy would handle all three cases
 correctly but waste a copy op here.
 
+**Case 3 also stamps `_coarse_tile_dim_advance`, an explicit side-channel for
+"which supertile."**  The direct rewire in this row leaves the op's own
+`inner_fn` completely untouched (per the wrap-never-reconstruct convention —
+see the [IR-rewiring appendix](#appendix-how-ir-rewiring-works-and-why-its-sound)),
+so the op's write index is still computed against its own tile-local
+`ranges`.  Inductor's IR has no side channel for "which tile of the full
+buffer this iteration is writing" — that fact lives only in `coarse_tile.py`'s
+own `loop_info.loop_tiled_dims`/`full_ranges` bookkeeping, and would otherwise
+be discarded the moment this function returns.  At the exact point the
+rewire happens, `_propagate_tiled_op` stamps it onto the op instead:
+
+```python
+op._coarse_tile_dim_advance: dict[int, tuple[int, int]]
+# host_dim_index -> (tile_size, supertile_count)
+```
+
+only for host dim indices that are actually coarse-tiled
+(`loop_info.loop_tiled_dims`).  `create_op_spec` (`spyre_kernel.py`)
+translates this host-dim-indexed dict into `OpSpec.dim_advance_overrides`,
+keyed by the Inductor iteration-space `Symbol` instead (using the same
+`host_to_it` correlation the rest of `create_op_spec` already builds).
+`superdsc.py`'s `_create_sdsc_tensors` consumes it to compute the stick
+dimension's stride/backGap directly from this authoritative fact, rather
+than reverse-engineering it from `device_coordinates` — a reverse-engineering
+step that silently reads the wrong slot when `_get_device_dim_order`'s
+coordinate walk happens to place the stick dimension differently for a
+mutated (Case 3) arg than for its sibling input args.  See
+[`MutationLayoutSHOULDREMOVE`: the real contract](#mutationlayoutshouldremove-the-real-contract)
+below for the general soundness argument, and the appendix subsection
+introduced alongside this mechanism for the specific bug this fixes.
+
+**This metadata is stamped only for Case 3 (the direct rewire), not Case
+2 (the copy-op path)** — `_insert_copy_op` builds its own, separate
+`ComputedBuffer` (`coarse_tile_copy_*`) with its own
+`MutationLayoutSHOULDREMOVE` layout, and that construction site does not
+stamp `_coarse_tile_dim_advance`.  This is not an oversight: the [Small
+Example](#small-example) above takes exactly this Case 2 path for
+`coarse_tile_copy_buf1`, and its `OpSpec` carries no
+`dim_advance_overrides` entry, yet its `bundle.mlir` affine map is
+already correct.  The reverse-engineered `_get_device_dim_order` walk is
+only unsound in some layouts, not all of them — the Small Example's
+`coarse_tile_copy_buf1` happens to place the stick dimension in the same
+relative slot as its sibling HBM args, so the existing derivation already
+produces the right stride there.
+`test_hint_nested_tiling_copy_mutation_correct`
+(`tests/inductor/test_coarse_tile_e2e.py`) is the case that actually
+exercises the degenerate slot: a `c.copy_(a + b)` direct mutation on a 2-D
+`[Lq, D]` tensor, no copy op inserted, so `add` itself takes Case 3.  A
+future bug report against the copy-op path should not assume it is already
+covered by this mechanism — it isn't; the mechanism would need to be
+extended to `_insert_copy_op`'s `copy_buf` construction if that path is
+ever found to hit the same degenerate-slot problem.
+
+**The same pattern on a flattened 1-D `[Lq * D]` tensor is a known, separate
+gap**, tracked by `test_hint_nested_tiling_copy_mutation_flat_known_xfail`
+(same file): it still mismatches by roughly 23-25% with this fix in place.
+The 1-D case does not land in the same `device_coordinates` slot the fix
+targets, and the root cause has not yet been isolated — do not assume the
+2-D fix above covers this shape.
+
 (read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)=
 
 #### Read-side adaptation: full-buffer inputs to a loop-internal op
@@ -1346,6 +1416,8 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = field(default_factory=list)
+    symbolic_dim_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
+    dim_advance_overrides: dict[Symbol, tuple[int, int]] = field(default_factory=dict)
 ```
 
 `LoopSpec` is a peer of `OpSpec` and `UnimplementedOp` in the list that
@@ -1365,6 +1437,15 @@ ops not inside a `LoopSpec`**.  Every enclosing loop level has an entry
 depth.  Two ops in the same loop group can have different `tiled_symbols`
 if work division or stickification places the batch dimension at
 different positions in each op's iteration space.
+
+`OpSpec.symbolic_dim_bounds` maps a PyTorch symbol name (e.g. `"s97"`) to
+`(max, granularity)` bounds for dynamic-shape dims; it is populated by
+`compute_symbolic_bounds` during `create_op_spec` and empty for concrete
+dims.  `OpSpec.dim_advance_overrides` maps an iteration-space `Symbol` to
+`(tile_size, supertile_count)` for a Case 3 op's coarse-tiled dims — see
+[Case 3 also stamps `_coarse_tile_dim_advance`](#treatment-by-consumer-topology)
+above for how it is produced and consumed; it is empty for every op that
+does not take the Case 3 direct-rewire path.
 
 The `bundle.py` and `compile_op_spec` paths reverse `tiled_symbols` to
 outermost-first order and build per-level `affine.apply` stride maps,

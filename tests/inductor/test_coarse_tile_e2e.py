@@ -30,6 +30,7 @@ import sys
 import os
 import regex as re
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -1445,6 +1446,81 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return z * 2.0  # outside consumer -- forces _allocate_full_buffer
 
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
+
+    def test_hint_nested_tiling_copy_mutation_correct(self):
+        """Nested Lq/D tiling into a direct copy_() mutation (Case 3 rewire).
+
+        c.copy_(a + b) makes `add` itself the op that no_inside_consumers /
+        is_graph_output routes into the Case 3 direct-rewire branch of
+        _propagate_tiled_op: `add`'s own layout becomes
+        MutationLayoutSHOULDREMOVE(c), with no separate copy op inserted.
+        Nesting num_tiles_per_dim={"Lq": 2} outer / {"D": 2} inner tiles the
+        stick dimension (D) at the inner level.
+
+        This is the minimal reproducer for the dim_advance_overrides bug:
+        _get_device_dim_order's device_coordinates walk placed the stick
+        dimension in a different relative slot for this mutated output than
+        for its sibling input args, so the D-tile stride/backGap derived from
+        that slot was wrong (the D-supertile advance never fired), corrupting
+        every tile but the first.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        Lq, D = 256, 128
+        a = torch.randn(Lq, D, dtype=torch.float16)
+        b = torch.randn(Lq, D, dtype=torch.float16)
+
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["Lq", "D"])
+            _name_tensor_dims(b, ["Lq", "D"])
+            c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
+            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+                with spyre_hint(num_tiles_per_dim={"D": 2}):
+                    c.copy_(a + b)
+            return c
+
+        compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct, "
+            "but on a flattened [Lq * D] 1-D tensor: still ~23-25% mismatch with "
+            "dim_advance_overrides in place. The 1-D case does not hit the same "
+            "device_coordinates slot the fix targets -- root cause not yet "
+            "isolated. Tracked as a known gap; do not assume the 2-D fix covers "
+            "this shape."
+        ),
+        strict=True,
+    )
+    def test_hint_nested_tiling_copy_mutation_flat_known_xfail(self):
+        """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
+        but on a flattened [Lq * D] 1-D tensor rather than [Lq, D] 2-D.
+
+        Currently fails: the dim_advance_overrides fix (verified for the 2-D
+        case above) does not fix this 1-D shape. Root cause not yet isolated.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        Lq, D = 256, 128
+        a = torch.randn(Lq * D, dtype=torch.float16)
+        b = torch.randn(Lq * D, dtype=torch.float16)
+
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["Lq", "D"])
+            _name_tensor_dims(b, ["Lq", "D"])
+            c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
+            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+                with spyre_hint(num_tiles_per_dim={"D": 2}):
+                    c.copy_(a + b)
+            return c
+
+        compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
 
 class TestNamedDimsHint(InductorTestCase):

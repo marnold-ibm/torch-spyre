@@ -1371,6 +1371,21 @@ def _propagate_tiled_op(
         # unconstrained candidate layouts) — rewire the op to write directly
         # into the full-size buffer.  Note: MutationLayoutSHOULDREMOVE is
         # incompatible with lx_planning (scratchpad); do not combine the two.
+        #
+        # Inductor's own write index for this op stays tile-local (it maps
+        # op.data.ranges-sized loop vars through full_buf's layout — there is
+        # no side channel for "which tile"), so the fact that this op's
+        # coarse-tiled dims must actually advance the write's base address
+        # once per outer-loop iteration cannot be recovered later from the
+        # op's device_coordinates (see coarse_tiling_loops.md's IR-rewiring
+        # appendix and issue tracking the ct_test_1.py wrong-result bug).
+        # Stamp it now, while loop_info/full_ranges are in scope, so
+        # create_op_spec can carry it into OpSpec.dim_advance_overrides.
+        op._coarse_tile_dim_advance = {  # type: ignore[attr-defined]
+            d: (int(op.data.ranges[d]), int(full_ranges[d]) // int(op.data.ranges[d]))
+            for dims in loop_info.loop_tiled_dims
+            for d in dims
+        }
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.

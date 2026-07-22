@@ -167,6 +167,16 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    # Maps an iteration-space Symbol to (tile_size, supertile_count) for a
+    # Case 2 (MutationLayoutSHOULDREMOVE) op's coarse-tiled dims. Populated by
+    # create_op_spec from ComputedBuffer._coarse_tile_dim_advance (stamped by
+    # coarse_tile._propagate_tiled_op). Consumed by superdsc._create_sdsc_tensors
+    # to compute the dim's stride/backGap directly rather than reverse-engineer
+    # it from device_coordinates, which is structurally unable to carry this
+    # information for such ops. Empty for ops without this metadata.
+    dim_advance_overrides: dict[Symbol, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
     debug_handle: DebugHandle | None = None
 
 

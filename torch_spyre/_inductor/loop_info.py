@@ -76,6 +76,11 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
+    # host-dim-index -> (tile_size, supertile_count) for a Case 2
+    # (MutationLayoutSHOULDREMOVE) op's coarse-tiled dims; set by
+    # coarse_tile._propagate_tiled_op, read by spyre_kernel.create_op_spec to
+    # drive OpSpec.dim_advance_overrides.
+    "_coarse_tile_dim_advance",
 )
 
 
