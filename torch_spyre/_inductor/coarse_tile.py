@@ -1153,8 +1153,19 @@ def insert_tiling_propagation(
             # snapshotted before this loop runs, so it must be kept in sync
             # here — otherwise a later pass reading group_ops (e.g.
             # _patch_retiled_load_indexes) sees the stale pre-rewrite object
-            # and clobbers the rewrite when it reconstructs from it.
-            current = V.graph.name_to_buffer.get(op.get_name())
+            # and clobbers the rewrite when it reconstructs from it.  Look
+            # up the current object in `operations` itself (already the
+            # authoritative post-replacement list) rather than V.graph --
+            # this pass runs from CustomPreSchedulingPasses, and unit tests
+            # that call coarse_tile() directly never install a real V.graph.
+            current = next(
+                (
+                    o
+                    for o in operations
+                    if isinstance(o, ComputedBuffer) and o.get_name() == op.get_name()
+                ),
+                None,
+            )
             if current is not None and current is not op:
                 group_ops[idx] = current
 
