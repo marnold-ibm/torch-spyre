@@ -2244,6 +2244,23 @@ def _allocate_full_buffer(
         # run, so assign a plain FixedLayout.  Stickification will propagate
         # SpyreTensorLayout to this buffer via the ExternKernel->generic_layout
         # path in propagate_spyre_tensor_layouts.
+        #
+        # This is logically a FlexibleLayout (the stride values below are
+        # never read by stickification -- generic_layout builds
+        # SpyreTensorLayout from .size alone), but it cannot be written that
+        # way: full_buf gets read (via name-swapped consumer inner_fns,
+        # e.g. _insert_read_view_ops) before stickification runs, and
+        # split_multi_ops traces those inner_fns by calling make_loader()/
+        # make_indexer() on full_buf. Inductor's Layout.make_indexer()
+        # (torch/_inductor/ir.py) asserts FlexibleLayout.allow_indexing --
+        # a FlexibleLayout buffer cannot be indexed until frozen to a
+        # concrete layout. Using FlexibleLayout here makes that assertion
+        # fire, split_multi_ops silently drops the trace, and any scalar
+        # constant in the consumer's inner_fn never gets materialized into a
+        # SpyreConstantFallback buffer -- it survives as a raw Constant all
+        # the way to codegen, which SpyreKernel.store() rejects. So
+        # FixedLayout is required here despite the stride values being
+        # otherwise meaningless.
         layout = FixedLayout(
             device,
             dtype,
@@ -3199,6 +3216,18 @@ def _replace_constant_fill_predecessors(
                 for s in FlexibleLayout.contiguous_strides(tile_size)
             ]
             fill_name = V.graph.qualify_name(f"ct_fill_{old_name}")
+            # Logically a FlexibleLayout (tile_strides above is just the
+            # contiguous row-major default; nothing downstream depends on
+            # this specific stride value), but it must be FixedLayout: this
+            # buffer is read by its consumer(s) before stickification runs,
+            # and split_multi_ops traces consumer inner_fns via
+            # make_loader()/make_indexer(), which asserts
+            # FlexibleLayout.allow_indexing (torch/_inductor/ir.py). A
+            # FlexibleLayout here makes that assertion fire, silently
+            # dropping the trace and letting any scalar constant survive
+            # ungrouped into codegen, where SpyreKernel.store() rejects it.
+            # (See the identical hazard and failure mode documented on
+            # _allocate_full_buffer's FixedLayout above.)
             fill_buf = ComputedBuffer(
                 name=fill_name,
                 layout=FixedLayout(device, dtype, list(tile_ranges), tile_strides),
