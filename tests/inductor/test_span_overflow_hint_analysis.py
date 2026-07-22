@@ -219,6 +219,7 @@ def _scheduler_node_for_op(op, name):
     snode.ancestors = set()
     snode.min_order = 0
     snode.max_order = 0
+    snode.unmet_dependencies = set()
     return snode
 
 
