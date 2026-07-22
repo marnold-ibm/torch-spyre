@@ -1240,6 +1240,25 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
             )
 
 
+def _level_advance_size(
+    loop_info: CoarseTileInfo, op: ComputedBuffer, lvl: int, d: int
+) -> int:
+    """Per-iteration advance size for host dim ``d`` tiled at level ``lvl``.
+
+    One iteration of level ``lvl`` advances dim ``d`` by ``op.data.ranges[d]``
+    scaled up by the trip counts of every more-inner level that also tiles
+    ``d`` — those inner iterations sweep the full tile before the outer level
+    advances again. When no other level tiles the same host dim (the common
+    case: each level owns a distinct host dim), this reduces to
+    ``op.data.ranges[d]``, matching the original single-level formula.
+    """
+    inner_multiplier = 1
+    for inner_lvl in range(lvl + 1, len(loop_info.loop_tiled_dims)):
+        if d in loop_info.loop_tiled_dims[inner_lvl]:
+            inner_multiplier *= int(loop_info.loop_count[inner_lvl])
+    return int(op.data.ranges[d]) * inner_multiplier
+
+
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -1405,11 +1424,28 @@ def _propagate_tiled_op(
         # appendix and issue tracking the ct_test_1.py wrong-result bug).
         # Stamp it now, while loop_info/full_ranges are in scope, so
         # create_op_spec can carry it into OpSpec.dim_advance_overrides.
-        op._coarse_tile_dim_advance = {  # type: ignore[attr-defined]
-            d: (int(op.data.ranges[d]), int(full_ranges[d]) // int(op.data.ranges[d]))
-            for dims in loop_info.loop_tiled_dims
-            for d in dims
-        }
+        #
+        # This is a *list*, one dict per nesting level (outermost-first,
+        # matching loop_info.loop_tiled_dims/loop_count), not a single flat
+        # dict keyed by host dim. A host dim can be tiled at more than one
+        # level when the tensor doesn't have enough real dims to give each
+        # level a distinct one (e.g. two coarse-tiling hints stacked on a
+        # flattened 1-D tensor both tile host dim 0) — collapsing those two
+        # levels' independent advances into one dict entry silently drops
+        # one of them. Per level, supertile_count is that level's own trip
+        # count; tile_size is the byte/element extent one iteration of that
+        # level advances by, i.e. op.data.ranges[d] scaled up by the trip
+        # counts of every more-inner level that also tiles d.
+        op._coarse_tile_dim_advance = [  # type: ignore[attr-defined]
+            {
+                d: (
+                    _level_advance_size(loop_info, op, lvl, d),
+                    int(loop_info.loop_count[lvl]),
+                )
+                for d in dims
+            }
+            for lvl, dims in enumerate(loop_info.loop_tiled_dims)
+        ]
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.

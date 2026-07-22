@@ -396,19 +396,33 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
-    # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
-    # (tile_size, supertile_count) fact per coarse-tiled dim, stamped by
+    # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative per-level
+    # (tile_size, supertile_count) fact for each coarse-tiled dim, stamped by
     # coarse_tile._propagate_tiled_op onto the ComputedBuffer and translated
-    # into Inductor-symbol space by spyre_kernel.create_op_spec. Re-key it by
-    # SDSC symbol here so the per-dim loop below can use it directly instead
-    # of reverse-engineering the same fact from device_coordinates, which
-    # cannot represent it for these ops (see coarse_tiling_loops.md's
-    # IR-rewiring appendix).
-    sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {
-        symbol_mapping[sym]: v
-        for sym, v in op_spec.dim_advance_overrides.items()
-        if sym in symbol_mapping
-    }
+    # into Inductor-symbol space by spyre_kernel.create_op_spec.
+    # op_spec.dim_advance_overrides is outermost-first, one dict per nesting
+    # level; a dim tiled at multiple levels (the flattened-1D case) appears in
+    # more than one level's dict. The per-iteration *advance* across levels is
+    # handled later, in compute_ops.generate_sdsc's affine_strides
+    # construction (which is structured per level). Here we only need the
+    # **iteration-0 base** fact -- the actual (innermost) tile extent this arg
+    # is written/read at per iteration, and the full extent it sits within --
+    # to compute a correct base offset/backGap, since device_coordinates
+    # cannot represent "which supertile" for these ops (see
+    # coarse_tiling_loops.md's IR-rewiring appendix). The innermost level that
+    # tiles a given dim owns its true per-iteration tile_size; the full extent
+    # is that tile_size times every level's supertile_count for that dim.
+    sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {}
+    for level_overrides in op_spec.dim_advance_overrides:
+        for sym, (tile_size, supertile_count) in level_overrides.items():
+            if sym not in symbol_mapping:
+                continue
+            sdsc_sym = symbol_mapping[sym]
+            _, prev_full_count = sdsc_dim_advance.get(sdsc_sym, (tile_size, 1))
+            # Innermost level tiling this dim wins tile_size (dict iteration
+            # order == level order, outermost-first, so later writes are more
+            # inner); full extent accumulates every level's supertile_count.
+            sdsc_dim_advance[sdsc_sym] = (tile_size, prev_full_count * supertile_count)
 
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -483,13 +497,16 @@ def _create_sdsc_tensors(
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
             if dim is stick_dim and dim in sdsc_dim_advance:
-                # Authoritative fact from coarse_tile.py: the stick dim is
-                # one tile of tile_size elements out of supertile_count
-                # tiles. _get_device_dim_order's dim_order walk can place the
-                # stick dim at a different position for this (Case 2 /
-                # mutated) arg than for its sibling args, which makes the
-                # stride_idx-based arg.device_size[-stride_idx-2] lookup
-                # below read the wrong slot for this arg specifically (see
+                # Authoritative fact from coarse_tile.py: the stick dim's
+                # iteration-0 tile is tile_size elements out of
+                # supertile_count tiles total (supertile_count already folds
+                # in every nesting level that tiles this dim, when there is
+                # more than one -- see the accumulation above).
+                # _get_device_dim_order's dim_order walk can place the stick
+                # dim at a different position for this (Case 2 / mutated) arg
+                # than for its sibling args, which makes the stride_idx-based
+                # arg.device_size[-stride_idx-2] lookup below read the wrong
+                # slot for this arg specifically (see
                 # coarse_tiling_loops.md's IR-rewiring appendix). Use the
                 # authoritative supertile count for dev_dim_size instead of
                 # trusting that slot. Scoped to the stick dim only: other
@@ -498,6 +515,9 @@ def _create_sdsc_tensors(
                 # op, and overriding them too double-applies the tile split
                 # baked into arg.device_size, corrupting an already-correct
                 # stride (see the input mb regression this scoping fixes).
+                # This establishes only the iteration-0 base offset/backGap;
+                # the per-iteration advance across nesting levels is applied
+                # separately in compute_ops.generate_sdsc's affine_strides.
                 tile_size, supertile_count = sdsc_dim_advance[dim]
                 dev_dim_size = tile_size * supertile_count
                 it_dim_size = tile_size
@@ -950,6 +970,17 @@ def compile_op_spec(
         [symbol_mapping[s] for s in level if s in symbol_mapping]
         for level in reversed(op_spec.tiled_symbols)
     ]
+    # op_spec.dim_advance_overrides is already outermost-first (see its
+    # docstring in op_spec.py), matching tiled_symbols_per_level's order
+    # above -- no reversal needed, only the symbol-space translation.
+    dim_advance_overrides_per_level = [
+        {
+            symbol_mapping[sym]: v
+            for sym, v in level_overrides.items()
+            if sym in symbol_mapping
+        }
+        for level_overrides in op_spec.dim_advance_overrides
+    ]
     result = generate_sdsc(
         idx,
         sdsc_spec,
@@ -957,5 +988,6 @@ def compile_op_spec(
         symbol_id_offset,
         tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
+        dim_advance_overrides=dim_advance_overrides_per_level,
     )
     return result

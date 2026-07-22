@@ -30,7 +30,6 @@ import sys
 import os
 import regex as re
 
-import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -1484,23 +1483,16 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct, "
-            "but on a flattened [Lq * D] 1-D tensor: still ~23-25% mismatch with "
-            "dim_advance_overrides in place. The 1-D case does not hit the same "
-            "device_coordinates slot the fix targets -- root cause not yet "
-            "isolated. Tracked as a known gap; do not assume the 2-D fix covers "
-            "this shape."
-        ),
-        strict=True,
-    )
-    def test_hint_nested_tiling_copy_mutation_flat_known_xfail(self):
+    def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
         but on a flattened [Lq * D] 1-D tensor rather than [Lq, D] 2-D.
 
-        Currently fails: the dim_advance_overrides fix (verified for the 2-D
-        case above) does not fix this 1-D shape. Root cause not yet isolated.
+        Both the outer Lq:2 and inner D:2 coarse-tiling hints land on the same
+        (only) host dim here, unlike the 2-D case where each hint owns a
+        distinct host dim. dim_advance_overrides carries one
+        (tile_size, supertile_count) fact per nesting level rather than one
+        per host dim, so this no longer collapses the two levels' facts into
+        one.
         """
         from torch_spyre._inductor import spyre_hint
 

@@ -167,15 +167,25 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
-    # Maps an iteration-space Symbol to (tile_size, supertile_count) for a
-    # Case 2 (MutationLayoutSHOULDREMOVE) op's coarse-tiled dims. Populated by
-    # create_op_spec from ComputedBuffer._coarse_tile_dim_advance (stamped by
-    # coarse_tile._propagate_tiled_op). Consumed by superdsc._create_sdsc_tensors
-    # to compute the dim's stride/backGap directly rather than reverse-engineer
-    # it from device_coordinates, which is structurally unable to carry this
-    # information for such ops. Empty for ops without this metadata.
-    dim_advance_overrides: dict[Symbol, tuple[int, int]] = dataclasses.field(
-        default_factory=dict
+    # Per-level map from an iteration-space Symbol to (tile_size,
+    # supertile_count) for a Case 2 (MutationLayoutSHOULDREMOVE) op's
+    # coarse-tiled dims. One dict per nesting level, **outermost-first** —
+    # parallel to loop_info.loop_tiled_dims/loop_count, NOT to tiled_symbols
+    # above (which is innermost-first). This is the one field on OpSpec where
+    # the two per-level lists run in opposite order. A host dim tiled at more
+    # than one level (e.g. two coarse-tiling hints stacked on a flattened 1-D
+    # tensor, where every level tiles the same host dim) appears in more than
+    # one level's dict with a different (tile_size, supertile_count) each —
+    # a single flat dict cannot represent that.
+    # Populated by create_op_spec from ComputedBuffer._coarse_tile_dim_advance
+    # (stamped by coarse_tile._propagate_tiled_op). Consumed directly by
+    # compute_ops.generate_sdsc's per-level affine_strides construction,
+    # which is the one place already structured per nesting level, rather
+    # than reverse-engineered from device_coordinates (structurally unable to
+    # carry this information for such ops). Empty for ops without this
+    # metadata.
+    dim_advance_overrides: list[dict[Symbol, tuple[int, int]]] = dataclasses.field(
+        default_factory=list
     )
     debug_handle: DebugHandle | None = None
 

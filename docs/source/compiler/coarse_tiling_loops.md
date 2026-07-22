@@ -431,7 +431,7 @@ Key observations:
   `c0` by the outer loop.
 - `symbolic_dim_bounds={}` is a new field added alongside `tiled_symbols`; it
   is empty here because all loop counts are concrete integers.
-- Every `OpSpec` above also carries `dim_advance_overrides={}` (omitted from
+- Every `OpSpec` above also carries `dim_advance_overrides=[]` (omitted from
   the listing like `debug_handle`, since it is empty for all three ops here).
   This field is populated only for an op that took the Case 3 direct-rewire
   path (see the table in
@@ -1018,21 +1018,79 @@ be discarded the moment this function returns.  At the exact point the
 rewire happens, `_propagate_tiled_op` stamps it onto the op instead:
 
 ```python
-op._coarse_tile_dim_advance: dict[int, tuple[int, int]]
+op._coarse_tile_dim_advance: list[dict[int, tuple[int, int]]]
+# one dict per nesting level, outermost-first, each:
 # host_dim_index -> (tile_size, supertile_count)
 ```
 
-only for host dim indices that are actually coarse-tiled
-(`loop_info.loop_tiled_dims`).  `create_op_spec` (`spyre_kernel.py`)
-translates this host-dim-indexed dict into `OpSpec.dim_advance_overrides`,
-keyed by the Inductor iteration-space `Symbol` instead (using the same
-`host_to_it` correlation the rest of `create_op_spec` already builds).
-`superdsc.py`'s `_create_sdsc_tensors` consumes it to compute the stick
-dimension's stride/backGap directly from this authoritative fact, rather
-than reverse-engineering it from `device_coordinates` — a reverse-engineering
-step that silently reads the wrong slot when `_get_device_dim_order`'s
-coordinate walk happens to place the stick dimension differently for a
-mutated (Case 3) arg than for its sibling input args.  See
+**This is a list, one dict per nesting level, not a single flat dict keyed
+by host dim.** A host dim can be tiled at more than one level when the
+tensor doesn't have enough real dims to give each level a distinct one — the
+canonical example is a flattened 1-D `[Lq * D]` tensor coarse-tiled by two
+independent hints (an outer `Lq` loop and an inner `D` loop), both of which
+necessarily tile host dim 0, since there is no second host dim to tile.
+Collapsing those two levels' independent advances into one dict entry (the
+original implementation of this mechanism) silently drops one level's fact:
+whichever level's dict comprehension ran last would win, leaving the other
+level's iterations advancing by the wrong stride. Keying by level instead of
+by host dim preserves both: `_coarse_tile_dim_advance[0]` holds the outer
+level's `(tile_size, supertile_count)` for host dim 0, and
+`_coarse_tile_dim_advance[1]` holds the inner level's own, independent fact
+for the same host dim.
+
+Per level, `supertile_count` is that level's own loop trip count
+(`loop_info.loop_count[lvl]`); `tile_size` is the byte/element extent one
+iteration of *that level* advances by — `op.data.ranges[d]` scaled up by the
+trip counts of every more-inner level that also tiles the same host dim `d`
+(those inner iterations sweep the full tile before the outer level advances
+again). When no other level tiles the same host dim — the common case, one
+host dim per level — this reduces to `op.data.ranges[d]` itself, the
+original single-level formula.
+
+`create_op_spec` (`spyre_kernel.py`) translates this per-level,
+host-dim-indexed list into `OpSpec.dim_advance_overrides`, translating each
+level's dict independently into the Inductor iteration-space `Symbol` space
+(using the same `host_to_it` correlation the rest of `create_op_spec`
+already builds), and preserving level order (outermost-first, no reversal —
+see [`LoopSpec` and `OpSpec.tiled_symbols`](#loopspec-and-opspecTiled_symbols-in-op_specpy)
+below for why this is the one field on `OpSpec` that stays outermost-first
+rather than being reversed to match `tiled_symbols`).
+
+The per-level fact is consumed in two places, for two different purposes:
+
+- **`superdsc.py`'s `_create_sdsc_tensors`** uses it to establish only the
+  **iteration-0 base** stick-dimension stride/backGap/offset — narrowly
+  scoped to the stick dim, and only for computing where the very first tile
+  starts, not for the per-iteration advance across supertiles. This
+  replaces a reverse-engineering step (deriving the same fact from
+  `device_coordinates`) that silently reads the wrong slot when
+  `_get_device_dim_order`'s coordinate walk happens to place the stick
+  dimension differently for a mutated (Case 3) arg than for its sibling
+  input args. `device_coordinates` cannot represent "which supertile" for
+  a Case 3 arg at all, so no downstream mechanism can correct a wrong
+  compile-time base offset — this is why the override survives here even
+  though the harder problem (below) moved elsewhere. When a host dim is
+  tiled at multiple levels, the innermost level tiling it wins for this
+  purpose: iteration order in the per-level list means later (more inner)
+  entries overwrite earlier ones for the same dim, which is the effective
+  per-symbol accumulation the base-offset computation needs.
+- **`compute_ops.py`'s `generate_sdsc`** uses the full per-level list to
+  build `affine_strides` — the actual per-iteration advance for each
+  nesting level. This is the one place in the whole pipeline that already
+  iterates per level and per tensor arg, so it is the natural fix site for
+  a symbol tiled at multiple levels: for such a symbol,
+  `tensor.strides[sym]` (`SDSCArgs`'s ordinary per-dim stride, a single
+  flat scalar) already coincides with the *innermost* overridden level's
+  advance — `coarse_tile.py` divides op ranges down to the innermost tile
+  before `create_op_spec` runs — but cannot also represent an outer level's
+  larger advance. `generate_sdsc` detects symbols that appear in more than
+  one level's override dict and, for those only, scales the
+  already-correct single-level stride by the ratio between that level's
+  `tile_size` and the innermost overridden level's `tile_size`. A symbol
+  tiled at just one level is left alone; the override never applies to it,
+  since `tensor.strides[sym]` is already exactly right there.
+
+See
 [`MutationLayoutSHOULDREMOVE`: the real contract](#mutationlayoutshouldremove-the-real-contract)
 below for the general soundness argument, and the appendix subsection
 introduced alongside this mechanism for the specific bug this fixes.
@@ -1059,12 +1117,15 @@ covered by this mechanism — it isn't; the mechanism would need to be
 extended to `_insert_copy_op`'s `copy_buf` construction if that path is
 ever found to hit the same degenerate-slot problem.
 
-**The same pattern on a flattened 1-D `[Lq * D]` tensor is a known, separate
-gap**, tracked by `test_hint_nested_tiling_copy_mutation_flat_known_xfail`
-(same file): it still mismatches by roughly 23-25% with this fix in place.
-The 1-D case does not land in the same `device_coordinates` slot the fix
-targets, and the root cause has not yet been isolated — do not assume the
-2-D fix above covers this shape.
+**The same pattern also covers a flattened 1-D `[Lq * D]` tensor**, tracked
+by `test_hint_nested_tiling_copy_mutation_flat` (same file): both the outer
+`Lq` and inner `D` coarse-tiling hints land on the same (only) host dim
+here, unlike the 2-D case where each hint owns a distinct host dim. This is
+exactly the multi-level-shared-host-dim scenario described above — it needs
+the per-level `_coarse_tile_dim_advance`/`dim_advance_overrides` shape (one
+entry per nesting level) rather than the single-entry-per-host-dim shape,
+since the latter cannot distinguish the outer level's advance from the
+inner level's for the same dim.
 
 (read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)=
 
@@ -1419,7 +1480,9 @@ class OpSpec:
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = field(default_factory=list)
     symbolic_dim_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
-    dim_advance_overrides: dict[Symbol, tuple[int, int]] = field(default_factory=dict)
+    dim_advance_overrides: list[dict[Symbol, tuple[int, int]]] = field(
+        default_factory=list
+    )
 ```
 
 `LoopSpec` is a peer of `OpSpec` and `UnimplementedOp` in the list that
@@ -1443,11 +1506,19 @@ different positions in each op's iteration space.
 `OpSpec.symbolic_dim_bounds` maps a PyTorch symbol name (e.g. `"s97"`) to
 `(max, granularity)` bounds for dynamic-shape dims; it is populated by
 `compute_symbolic_bounds` during `create_op_spec` and empty for concrete
-dims.  `OpSpec.dim_advance_overrides` maps an iteration-space `Symbol` to
-`(tile_size, supertile_count)` for a Case 3 op's coarse-tiled dims — see
+dims.  `OpSpec.dim_advance_overrides` is a `list[dict[Symbol, tuple[int,
+int]]]`, **outermost-first**, one dict per nesting level mapping an
+iteration-space `Symbol` to `(tile_size, supertile_count)` for that level's
+own advance on a Case 3 op's coarse-tiled dims — see
 [Case 3 also stamps `_coarse_tile_dim_advance`](#treatment-by-consumer-topology)
-above for how it is produced and consumed; it is empty for every op that
-does not take the Case 3 direct-rewire path.
+above for how it is produced and consumed; it is `[]` for every op that
+does not take the Case 3 direct-rewire path. Note the ordering: this is the
+one field on `OpSpec` that stays outermost-first, the same order as
+`loop_info.loop_tiled_dims`/`loop_count` in `coarse_tile.py` — it is *not*
+reversed to match `tiled_symbols`'s innermost-first order. A given `Symbol`
+can appear in more than one level's dict, when a host dim is tiled at
+multiple nesting levels (the flattened 1-D case above); each level's entry
+for that symbol is independent and carries that level's own tile size.
 
 The `bundle.py` and `compile_op_spec` paths reverse `tiled_symbols` to
 outermost-first order and build per-level `affine.apply` stride maps,
