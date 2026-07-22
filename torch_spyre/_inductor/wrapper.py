@@ -159,12 +159,19 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
     def allocate_pool(self):
         """Allocate the intermediate pool."""
+        # _pool is an opaque, flat byte-addressed region: individual buffers
+        # are placed into it at byte offsets (see memory_planning.py's
+        # layout.allocation["pool"] = offset) and it is passed to kernels
+        # as-is, never sliced/reshaped in Python.  A 1D uint8 tensor of
+        # pool_size_bytes elements is the natural, unambiguous
+        # representation -- no need to route it through a multi-dim device
+        # layout.
         pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
         return (
             f"_pool = spyre_empty_with_layout("
             f"({pool_size_bytes},), (1,), "
-            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_bytes}, 1, 1], "
-            f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
+            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_bytes}], "
+            f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
         )
 
 
