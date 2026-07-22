@@ -1337,6 +1337,15 @@ def _propagate_tiled_op(
         # single-real-input path (the copy fuses the tiled op's own
         # upstream computation via make_loader()).
         _insert_copy_op(op, full_buf, operations)
+        # The tiled op's own buffer is always loop-internal scratch here: it is
+        # fully drained by the copy op inserted above before the next iteration
+        # overwrites it, regardless of whether outside_consumers/is_graph_output
+        # routed it into this branch. Mark it so the unroller does not advance
+        # its base address.
+        if isinstance(op.layout, FixedTiledLayout):
+            op.layout.per_tile_fixed = True
+        else:
+            op._pending_per_tile_fixed = True  # type: ignore[attr-defined]
     else:
         # Case 2: no inside consumers and every real input is external to the
         # loop (a graph input or other buffer with its own independent,
