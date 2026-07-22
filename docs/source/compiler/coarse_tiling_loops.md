@@ -444,8 +444,9 @@ Key observations:
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
   `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
   Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
-  `per_tile_fixed=True` tells the unroller that this tensor's base address is
-  fixed across iterations (no `affine.apply` advance).  Because `y` is
+  `per_tile_fixed=True` tells `generate_bundle` that this tensor's base
+  address is fixed across iterations (no `affine.apply` advance).  Because
+  `y` is
   produced and fully consumed within the same tile iteration, no HBM
   allocation is needed.
 - The final output `z` (output of `mul`) has no inside consumers, but
@@ -590,8 +591,9 @@ Key points:
   `sencores=4`.
 - **Neither LX scratchpad tensor appears as a symbol at all.** `y` and
   `mul`'s own output both have `per_tile_fixed=True` (see the OpSpec above),
-  which tells the unroller their base address is fixed across iterations, so
-  neither needs an `affine.apply`-computed address, per-core or otherwise —
+  which tells `generate_bundle` their base address is fixed across
+  iterations, so neither needs an `affine.apply`-computed address, per-core
+  or otherwise —
   the generated wrapper does not even pass a `_pool` argument into the SDSC
   bundle for this example, since no per-tile HBM `pool` buffer was needed.
 - Each inner-loop iteration dispatches `add`, then `mul`, then the
@@ -911,8 +913,8 @@ for buffer lifetime analysis.
 immediately after stamping all loop attributes.  Its job is to ensure that
 any op whose result is consumed **outside** the loop (or is a graph output)
 exposes a complete, fully-sized buffer to its consumers.  Ops whose outputs
-are consumed only inside the loop are marked so the unroller does not advance
-their base addresses.
+are consumed only inside the loop are marked so `generate_bundle` does not
+advance their base addresses.
 
 #### Use-def analysis
 
@@ -987,10 +989,10 @@ if isinstance(op.layout, FixedTiledLayout):
 ```
 
 This flag propagates to `TensorArg.per_tile_fixed` during codegen (in
-`spyre_kernel.py`).  The unroller (`codegen/unroll.py`) then skips two
-things for these args: **address advance** (the base address is fixed across
-iterations) and **`device_size` update** (the allocation already matches the
-tile).
+`spyre_kernel.py`).  `generate_bundle` (`codegen/bundle.py`) then skips
+emitting an `affine.apply` address for these args (the base address is fixed
+across iterations); `device_size` already matches the tile, so no update is
+needed either.
 
 **Case 2**: the copy op carries the same `loop_info` (same `loop_group_id`,
 `loop_count`, and `loop_tiled_dims`) as the original op, so the scheduler
@@ -1118,9 +1120,9 @@ are allocated to enable LX scratchpad placement of the inner accumulator
 1. **Allocate `accum_full`** (full HBM output, shape matching the full
    output across all outer tiles).
 2. **Allocate `accum_tile`** (per-tile scratch, same per-tile output shape).
-   `accum_tile.layout.per_tile_fixed = True` so the unroller never advances
-   its base address; `scratchpad_planning` can therefore place it in LX
-   scratchpad memory.
+   `accum_tile.layout.per_tile_fixed = True` so `generate_bundle` never
+   advances its base address; `scratchpad_planning` can therefore place it
+   in LX scratchpad memory.
 3. **Insert a fill op** (inside the outer loop, carrying the outer
    `loop_info`) that writes the identity value into `accum_tile` once per
    outer-loop tile.
@@ -1129,8 +1131,8 @@ are allocated to enable LX scratchpad placement of the inner accumulator
    `accum_tile`.
 5. **Insert a `coarse_tile_reduce_copy` op** (inside the outer loop, after
    the inner loop) that copies `accum_tile → accum_full`.  It carries the
-   outer `loop_info` so the unroller advances `accum_full`'s HBM address
-   once per outer-loop tile.  The copy uses `MutationLayoutSHOULDREMOVE`
+   outer `loop_info` so `generate_bundle` advances `accum_full`'s HBM
+   address once per outer-loop tile.  The copy uses `MutationLayoutSHOULDREMOVE`
    so no extra allocation is created.
 6. **Mark the tiled reduction op's output `per_tile_fixed`** (the inner
    scratch for the reduction kernel itself).
@@ -1677,28 +1679,24 @@ scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
 maintaining an indentation level and a counter for SDSC JSON filenames.
 The filenames are assigned in depth-first traversal order.
 
-### Unrolling vs. `scf.for`: the `unroll_loops` flag
+### Loop codegen: `scf.for` with late-bound addresses
 
-Once the loop has reached `LoopSpec` form, `config.unroll_loops` (default
-`True`) controls whether the loop is resolved in the frontend or passed
-intact to the backend.
+Once the loop has reached `LoopSpec` form, `generate_bundle` in
+`codegen/bundle.py` emits the loop intact — an `scf.for` wrapping, for each
+tiled tensor, an `affine.apply` that computes the per-iteration HBM address
+from the loop induction variable(s), followed by `sdsc_execute`, as shown in
+the bundle.mlir section above.  `device_size` stays at the per-tile shape and
+`tiled_symbols` records which iteration-space symbols the enclosing loop
+levels advance; tensors with `per_tile_fixed=True` (e.g. LX scratchpad
+operands, see below) are skipped entirely — no `affine.apply` is emitted for
+them since their base address never changes across iterations.
 
-**`unroll_loops=True` (default):** `unroll_loop_specs` in
-`codegen/unroll.py` expands each `LoopSpec(K, body)` into K copies of
-`body` before `generate_bundle` runs.  Per-iteration HBM addresses are
-advanced by `iter * stride`, `device_size` is set to the per-tile shape,
-and `tiled_symbols` is cleared.  The resulting `bundle.mlir` contains K
-plain `sdsc_execute` calls with addresses baked into each `sdsc_*.json`.
-
-**`unroll_loops=False`:** `generate_bundle` emits the loop intact — an
-`scf.for` wrapping `affine.apply` per tiled tensor followed by
-`sdsc_execute`, as shown in the bundle.mlir section above.  This path is
-strictly more capable (smaller bundle, late-bound addresses) but requires
-backend symbol-table support that is still under development.
-
-Nothing upstream of `generate_bundle` knows or cares which path is active.
-When backend support lands, `unroll_loops` will be flipped to default
-`False` and `unroll_loop_specs` will become dead code.
+This is the only loop-codegen path: nothing upstream of `generate_bundle`
+branches on it, and there is no separate frontend loop-flattening step. An
+earlier prototype ("unrolling") that expanded each `LoopSpec(K, body)` into K
+flat copies of `body` with addresses baked into each `sdsc_*.json` has been
+removed now that the backend symbol-table support this path relies on has
+landed.
 
 ## Key files
 
@@ -1710,15 +1708,13 @@ When backend support lands, `unroll_loops` will be flipped to default
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
-| `torch_spyre/_inductor/codegen/bundle.py` | Layer 3: emits `scf.for` in `bundle.mlir` for the `unroll_loops=False` path |
-| `torch_spyre/_inductor/codegen/unroll.py` | Layer 3: unrolls `LoopSpec` into flat `OpSpec`s for the `unroll_loops=True` (default) path |
+| `torch_spyre/_inductor/codegen/bundle.py` | Layer 3: emits `scf.for` wrapping `affine.apply`/`sdsc_execute` in `bundle.mlir` |
 | `torch_spyre/_inductor/passes.py` | Wires all passes into `CustomPreSchedulingPasses` and `CustomPreFusionPasses` |
 | `torch_spyre/_inductor/propagate_hints.py` | `spyre_hint()` context manager; `DimHint`; hint collection/recovery across AOT re-tracing |
 | `torch_spyre/_inductor/propagate_named_dims.py` | `propagate_named_dims()` and `assign_dim_hints()`: attach `dim_hints` to `ir.Operation` objects |
 | `torch_spyre/_inductor/coarse_tile.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile()` group tuples; also `coarse_tile()` entry point |
 | `tests/inductor/test_coarse_tiling.py` | Unit tests: IR pass, propagation, scheduler node, bundle MLIR output |
 | `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests |
-| `tests/inductor/test_unroll_loop_specs.py` | Unit tests for `unroll_loop_specs` |
 
 ## Invariants and failure modes
 
@@ -2274,9 +2270,10 @@ save a node DCE has already dropped.
 
 The real problem this creates: a carry copy-out that writes the updated
 value back into the pre-loop seed buffer (`_propagate_carry_op`, described
-above) has no downstream reader *in the flat, pre-unroll IR that DCE walks*.
-The buffer it writes is read again only by the *next outer-tile iteration's*
-copy-in — a cross-iteration read with no representation at this IR level.
+above) has no downstream reader *in the flat scheduler IR that DCE walks,
+before loop codegen ever groups it under an `scf.for`*.  The buffer it writes
+is read again only by the *next outer-tile iteration's* copy-in — a
+cross-iteration read with no representation at this IR level.
 From DCE's perspective the copy-out's output looks like a dead buffer with
 zero live users, and it would be removed despite being required for
 correctness — a real bug the project found and fixed (task history: "Confirm
