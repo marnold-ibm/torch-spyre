@@ -203,6 +203,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         {
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
+            "sencores": 4,
         }
     )
     def test_hint_nested_loop_with_scratchpad(self):
@@ -215,7 +216,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         inner hint tiles B-dim by 4 (1024 cols/iter).  With lx_planning
         enabled, the intermediate result y=a+b is allocated to LX scratchpad
         (it is only consumed within the loop body); the final output z stays
-        in HBM.
+        in HBM.  sencores=4 keeps the generated bundle.mlir's per-core
+        address expansion small enough to quote in full in the design doc
+        (the default SENCORES=32 would unroll to 32 addresses per operand).
 
         Assertions:
         - LoopSpec entries are emitted (tiling is active).

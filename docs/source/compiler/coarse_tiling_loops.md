@@ -147,76 +147,120 @@ The per-inner-iteration `data.ranges` for both ops is `[512, 1024]`.
 
 ### LoopLevel IR after CustomPreSchedulingPasses
 
-After `coarse_tile`, `span_reduction`, `work_distribution`, and
-`scratchpad_planning` have all run, the two `ComputedBuffer` objects look like
-this (the `_format_operations` representation with loop attributes added):
+After `coarse_tile` (which internally runs `insert_tiling_propagation` and
+therefore already inserts `coarse_tile_copy_buf1`), `span_reduction`,
+`work_distribution` (`_distribute_work`), and `scratchpad_planning` have all
+run, `graph.operations` contains four ops (real captured output at
+`sencores=4`, in topological order; `d0`/`d1` are the `MemoryDep` index
+symbols for the outer and inner tiled dims respectively):
 
 ```
 buf0: ComputedBuffer                          # y = a + b
   layout = FixedTiledLayout(size=[512, 1024], stride=[1024, 1],
                             device_size=[16, 512, 64])  # per-tile shape
-  op_it_space_splits = {1024: 32}            # work division: 32 cores along dim 1
+  op_it_space_splits = ({1024: 4}, {})       # work division: 4 cores along dim 1
   loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
                            loop_tiled_dims=[[0], [1]])
   Pointwise(
     ranges=[512, 1024],                      # per-tile iteration space
-    inner_fn: load(a, i1 + 4096*i0)
-              load(b, i1 + 4096*i0)
-              return a + b
+    read: MemoryDep('arg0_1', 4096*d0 + d1, {d0: 512, d1: 1024})   # a
+    read: MemoryDep('arg1_1', 4096*d0 + d1, {d0: 512, d1: 1024})   # b
+    write: MemoryDep('buf0', 1024*d0 + d1, {d0: 512, d1: 1024})
   )
 
 buf1: ComputedBuffer                          # z = y * c
   layout = FixedTiledLayout(size=[512, 1024], stride=[1024, 1],
                             device_size=[16, 512, 64])  # per-tile shape
-  op_it_space_splits = {1024: 32}
+  op_it_space_splits = ({1024: 4}, {})
   loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
                            loop_tiled_dims=[[0], [1]])
   Pointwise(
     ranges=[512, 1024],
-    inner_fn: load(buf0, i1 + 4096*i0)      # reads y
-              load(c,    i1 + 4096*i0)
-              return y * c
+    read: MemoryDep('buf0', 1024*d0 + d1, {d0: 512, d1: 1024})    # y
+    read: MemoryDep('arg2_1', 4096*d0 + d1, {d0: 512, d1: 1024})  # c
+    write: MemoryDep('buf1', 1024*d0 + d1, {d0: 512, d1: 1024})
+  )
+
+coarse_tile_copy_buf1: ComputedBuffer         # identity copy: z_tile → z
+  layout = MutationLayoutSHOULDREMOVE(size=[1024, 4096], stride=[4096, 1])
+  op_it_space_splits = ({4096: 4}, {})
+  loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
+                           loop_tiled_dims=[[0], [1]])
+  Pointwise(
+    ranges=[512, 1024],
+    read: MemoryDep('buf1', 1024*d0 + d1, {d0: 512, d1: 1024})
+    write: MemoryDep('coarse_tile_copy_buf1', 4096*d0 + d1, {d0: 512, d1: 1024})
   )
 ```
 
+This example uses `sencores=4` (rather than the default 32) purely for
+readability: it keeps the per-core address expansion in the generated
+`bundle.mlir` below small enough to quote in full while still being real,
+unmodified compiler output. The mechanism is identical at any core count —
+only the second element of each `op_it_space_splits` entry and the number of
+per-core addresses in `bundle.mlir` scale with `sencores`.
+
+(A fourth op, `buf2` — a `SpyreEmptyFallback` full-size `[1024, 4096]` HBM
+buffer with `loop_info=None` — is also present as the eventual target that
+`coarse_tile_copy_buf1`'s `MutationLayoutSHOULDREMOVE` layout redirects into;
+it carries no loop attributes because it is never itself tiled, only mutated
+into. It is omitted above for brevity.)
+
 Key points:
 
-- Both ops share the same `loop_info` with `loop_group_id = (0, 0)`,
-  `loop_count = [2, 4]`, and `loop_tiled_dims = [[0], [1]]` — this is what
-  `build_loop_scheduler_nodes` uses to wrap them together in a
-  `CountedLoopSchedulerNode`.
+- **`buf1`'s read of `buf0` has coefficient `1024`, not `4096`.** This is the
+  detail most likely to be misremembered: `buf0` (`y`) has already been
+  divided down to its own per-tile `FixedTiledLayout` with `stride=[1024, 1]`
+  by the time `buf1`'s dependency is computed, so the read index reflects
+  `buf0`'s own (per-tile) stride, not the original full-tensor stride. Reads
+  of the *true* full-tensor inputs (`a`, `b`, `c` — `arg0_1`/`arg1_1`/`arg2_1`
+  above) keep the `4096` coefficient because those buffers are never
+  re-tiled; only the loop's own intermediate outputs are.
+- All three tiled ops share the same `loop_info` with `loop_group_id = (0,
+  0)`, `loop_count = [2, 4]`, and `loop_tiled_dims = [[0], [1]]` — this is
+  what `build_loop_scheduler_nodes` uses to wrap them together in a
+  `CountedLoopSchedulerNode`. `coarse_tile_copy_buf1` is tiled the same way
+  even though its own layout is `MutationLayoutSHOULDREMOVE` over the full
+  `[1024, 4096]` shape — see
+  [MutationLayoutSHOULDREMOVE: the real contract](#mutationlayoutshouldremove-the-real-contract)
+  for how that layout redirects without changing the loop's per-tile
+  `Pointwise.ranges`.
 - `ranges = [512, 1024]` is the *per-tile* iteration space (1/8th of the full
-  tensor).  Work division and codegen see only this reduced space; the loop
-  trip counts carry the information needed to reconstruct the full addressing.
-- `layout.size = [512, 1024]` matches the per-tile `ranges`.  The layout
-  describes the smaller per-tile output buffer allocated for each loop
-  iteration.  Per-iteration addressing into the full HBM region is handled
-  by `tiled_symbols` / `affine.apply` in `bundle.mlir` at runtime.
-- `op_it_space_splits = {1024: 32}` is stamped by `work_distribution`: the
-  coefficient `1024` identifies the per-tile stride-1 dimension (columns after
-  tiling), and `32` is the number of cores dividing that dimension's work.
-- `buf0` (`y`) is the intermediate result.  At this point its layout is a
+  tensor) for every tiled op, including the copy. Work division and codegen
+  see only this reduced space; the loop trip counts carry the information
+  needed to reconstruct the full addressing.
+- `layout.size = [512, 1024]` for `buf0`/`buf1` matches the per-tile `ranges`.
+  The layout describes the smaller per-tile output buffer allocated for each
+  loop iteration. Per-iteration addressing into the full HBM region is
+  handled by `tiled_symbols` / `affine.apply` in `bundle.mlir` at runtime.
+  `coarse_tile_copy_buf1`'s layout, by contrast, has `size=[1024, 4096]` —
+  the full tensor shape — because `MutationLayoutSHOULDREMOVE` always
+  describes the mutation *target*'s shape, not the per-tile source.
+- `op_it_space_splits` is a `(dict, dict)` pair stamped by
+  `work_distribution` (`_distribute_work`): for `buf0`/`buf1` it is
+  `({1024: 4}, {})` — the coefficient `1024` identifies the per-tile
+  stride-1 dimension (columns after tiling), and `4` is the number of cores
+  (`sencores`) dividing that dimension's work. `coarse_tile_copy_buf1` gets
+  `({4096: 4}, {})` instead, keyed on `4096` because its write target
+  (`buf2`, the full tensor) has the full-tensor stride, even though its own
+  `ranges` are still the per-tile `[512, 1024]`.
+- `buf0` (`y`) is the intermediate result. At this point its layout is a
   `FixedTiledLayout` with `size=[512, 1024]`; `scratchpad_planning` later
   assigns it `allocation={'lx': 0}`, placing it in LX scratchpad memory at
-  address 0.  Because `y` is produced and fully consumed within the same tile
+  address 0. Because `y` is produced and fully consumed within the same tile
   iteration and its per-tile size fits in scratchpad, no HBM allocation is
   needed for it at all.
-- This snapshot is taken right after `coarse_tile`, before
-  `insert_tiling_propagation` classifies `buf1` and inserts its copy op (see
-  [Treatment by consumer topology](#treatment-by-consumer-topology) below).
-  `buf1`'s `Pointwise.inner_fn` shown here is what feeds that later
-  classification; the additional `coarse_tile_copy_buf1` op and the
-  `buf1`→pool / copy→HBM buffer split shown in the
-  [Generated OpSpec](#generated-opspec-python-wrapper-source) section below
-  are not yet present at this stage.
 
 ### Generated OpSpec (Python wrapper source)
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
-single nested `LoopSpec`.  Below is the actual output produced by running the e2e test
-`test_hint_nested_loop_with_scratchpad` (which uses `spyre_hint(num_tiles_per_dim=...)` /
-`declare_tensor_dim` / `name_tensor_dims` with `allow_all_ops_in_lx_planning=True`;
-concrete HBM addresses replaced with symbolic names for readability):
+single nested `LoopSpec`.  Below is the actual output produced by running the
+e2e test `test_hint_nested_loop_with_scratchpad` at `sencores=4` (which uses
+`spyre_hint(num_tiles_per_dim=...)` / `declare_tensor_dim` / `name_tensor_dims`
+with `allow_all_ops_in_lx_planning=True`; the `debug_handle=DebugHandle(...)`
+field each real `OpSpec` carries is omitted below for brevity — it records the
+originating source location and ATen op for each dispatch and carries no
+tiling-relevant information):
 
 ```python
 sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
@@ -231,7 +275,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                             op='add',
                             is_reduction=False,
                             iteration_space={
-                                sympify('c0'): (sympify('512'), 32),
+                                sympify('c0'): (sympify('512'), 4),
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
@@ -247,7 +291,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                         sympify('c0'),
                                         sympify('Mod(c1, 64)'),
                                     ],
-                                    allocation={'hbm': <base_addr_a>},
+                                    allocation={'hbm': 0},
                                 ),
                                 TensorArg(              # input b
                                     is_input=True, arg_index=1,
@@ -258,7 +302,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                         sympify('c0'),
                                         sympify('Mod(c1, 64)'),
                                     ],
-                                    allocation={'hbm': <base_addr_b>},
+                                    allocation={'hbm': 1},
                                 ),
                                 TensorArg(              # output y (LX scratchpad)
                                     is_input=False, arg_index=-1,
@@ -278,7 +322,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                             op='mul',
                             is_reduction=False,
                             iteration_space={
-                                sympify('c0'): (sympify('512'), 32),
+                                sympify('c0'): (sympify('512'), 4),
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
@@ -306,7 +350,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                         sympify('c0'),
                                         sympify('Mod(c1, 64)'),
                                     ],
-                                    allocation={'hbm': <base_addr_c>},
+                                    allocation={'hbm': 2},
                                 ),
                                 TensorArg(              # output z tile (pool: per-tile HBM)
                                     is_input=False, arg_index=-1,
@@ -325,7 +369,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                             op='identity',                 # coarse_tile_copy_buf1
                             is_reduction=False,
                             iteration_space={
-                                sympify('c0'): (sympify('512'), 32),
+                                sympify('c0'): (sympify('512'), 4),
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
@@ -352,7 +396,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                         sympify('c0'),
                                         sympify('Mod(c1, 64)'),
                                     ],
-                                    allocation={'hbm': <base_addr_z>},
+                                    allocation={'hbm': 3},
                                 ),
                             ]
                         ),
@@ -413,36 +457,79 @@ Key observations:
 ### Generated `bundle.mlir`
 
 The SDSC compiler (`compile_op_spec`) translates `tiled_symbols` into per-loop
-byte strides, producing a 2-dimensional `affine_map`.  For this `[1024, 4096]`
-fp16 tensor with Spyre stick layout (128 bytes/stick, 64 elements/stick):
-
-- Outer stride: 512 rows × 64 sticks/row × 128 bytes/stick = 4,194,304 bytes
-- Inner stride: 1024 columns / 64 elements/stick × 128 bytes/stick = 2,048 bytes
+byte strides, producing 2-dimensional `affine_map`s — one per distinct memory
+region a tensor is allocated in, since HBM tensors and the `pool`
+intermediate are addressed relative to different base symbols and can end up
+with different strides:
 
 ```none
-#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 4194304*d0 + 2048*d1)>
+#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 65536*d0 + 2097152*d1)>
+#map_1 = affine_map<(d0, d1)[s0] -> (s0 + 65536*d0 + 1048576*d1)>
 module {
-    func.func @sdsc_bundle() {
+    func.func @sdsc_bundle(%pool_base_addr: !sdscbundle.input_arg<index>,
+                            %arg_0_base_addr: !sdscbundle.input_arg<index>,
+                            %arg_1_base_addr: !sdscbundle.input_arg<index>,
+                            %arg_2_base_addr: !sdscbundle.input_arg<index>,
+                            %arg_3_base_addr: !sdscbundle.input_arg<index>) {
+        %pool = sdscbundle.input_arg_extract value from %pool_base_addr : ... -> index
+        %arg_0 = sdscbundle.input_arg_extract value from %arg_0_base_addr : ... -> index
+        %arg_1 = sdscbundle.input_arg_extract value from %arg_1_base_addr : ... -> index
+        %arg_2 = sdscbundle.input_arg_extract value from %arg_2_base_addr : ... -> index
+        %arg_3 = sdscbundle.input_arg_extract value from %arg_3_base_addr : ... -> index
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
         %loop_bound_0 = arith.constant 2 : index
         %loop_bound_1 = arith.constant 4 : index
-        %sym_1 = arith.constant <base_addr_a> : index
-        %sym_2 = arith.constant <base_addr_b> : index
-        %sym_3 = arith.constant <base_addr_c> : index
-        %sym_4 = arith.constant <base_addr_z> : index
-        %sym_5 = arith.constant <base_addr_pool> : index
+
+        // per-core address = base + core_index * 16384 bytes, for each of the
+        // 4 cores (sencores=4); shown here for arg_0 (tensor a), identical
+        // pattern repeats for arg_1 (b), arg_2 (c), arg_3 (z), and pool:
+        %arg_0_core_offset_16384 = arith.constant 16384 : index
+        %arg_0_core_16384 = arith.addi %arg_0, %arg_0_core_offset_16384 : index
+        %arg_0_core_offset_32768 = arith.constant 32768 : index
+        %arg_0_core_32768 = arith.addi %arg_0, %arg_0_core_offset_32768 : index
+        %arg_0_core_offset_49152 = arith.constant 49152 : index
+        %arg_0_core_49152 = arith.addi %arg_0, %arg_0_core_offset_49152 : index
+        // ... (arg_1_core_*, arg_2_core_*, pool_addr_*, arg_3_core_* follow
+        // the same pattern — omitted here; see full real output below)
+
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
-                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
-                %addr_1 = affine.apply #map_0(%i_0, %i_1)[%sym_2]
-                sdscbundle.sdsc_execute (%addr_0, %addr_1) {sdsc_filename="sdsc_0.json", ...}  // add: a+b→y(lx)
-                %addr_2 = affine.apply #map_0(%i_0, %i_1)[%sym_3]
-                %addr_3 = affine.apply #map_0(%i_0, %i_1)[%sym_5]
-                sdscbundle.sdsc_execute (%addr_2, %addr_3) {sdsc_filename="sdsc_1.json", ...}  // mul: y(lx)*c→z_tile(pool)
-                %addr_4 = affine.apply #map_0(%i_0, %i_1)[%sym_5]
-                %addr_5 = affine.apply #map_0(%i_0, %i_1)[%sym_4]
-                sdscbundle.sdsc_execute (%addr_4, %addr_5) {sdsc_filename="sdsc_2.json", ...}  // identity: z_tile(pool)→z(hbm)
+                // add: a+b→y(lx) — one address per core, 4 cores each for a and b
+                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%arg_0]
+                %addr_1 = affine.apply #map_0(%i_0, %i_1)[%arg_0_core_16384]
+                %addr_2 = affine.apply #map_0(%i_0, %i_1)[%arg_0_core_32768]
+                %addr_3 = affine.apply #map_0(%i_0, %i_1)[%arg_0_core_49152]
+                %addr_4 = affine.apply #map_0(%i_0, %i_1)[%arg_1]
+                %addr_5 = affine.apply #map_0(%i_0, %i_1)[%arg_1_core_16384]
+                %addr_6 = affine.apply #map_0(%i_0, %i_1)[%arg_1_core_32768]
+                %addr_7 = affine.apply #map_0(%i_0, %i_1)[%arg_1_core_49152]
+                sdscbundle.sdsc_execute (%addr_0, %addr_1, %addr_2, %addr_3, %addr_4, %addr_5, %addr_6, %addr_7)
+                    {sdsc_filename="sdsc_0.json", "symbol_ids"=[-1, -2, -3, -4, -5, -6, -7, -8]}
+
+                // mul: y(lx)*c→z_tile(pool) — c uses #map_0, pool uses #map_1
+                %addr_8 = affine.apply #map_0(%i_0, %i_1)[%arg_2]
+                %addr_9 = affine.apply #map_0(%i_0, %i_1)[%arg_2_core_16384]
+                %addr_10 = affine.apply #map_0(%i_0, %i_1)[%arg_2_core_32768]
+                %addr_11 = affine.apply #map_0(%i_0, %i_1)[%arg_2_core_49152]
+                %addr_12 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_0]
+                %addr_13 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_16384]
+                %addr_14 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_32768]
+                %addr_15 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_49152]
+                sdscbundle.sdsc_execute (%addr_8, %addr_9, %addr_10, %addr_11, %addr_12, %addr_13, %addr_14, %addr_15)
+                    {sdsc_filename="sdsc_1.json", "symbol_ids"=[-9, -10, -11, -12, -13, -14, -15, -16]}
+
+                // identity: z_tile(pool)→z(hbm)
+                %addr_16 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_0]
+                %addr_17 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_16384]
+                %addr_18 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_32768]
+                %addr_19 = affine.apply #map_1(%i_0, %i_1)[%pool_addr_49152]
+                %addr_20 = affine.apply #map_0(%i_0, %i_1)[%arg_3]
+                %addr_21 = affine.apply #map_0(%i_0, %i_1)[%arg_3_core_16384]
+                %addr_22 = affine.apply #map_0(%i_0, %i_1)[%arg_3_core_32768]
+                %addr_23 = affine.apply #map_0(%i_0, %i_1)[%arg_3_core_49152]
+                sdscbundle.sdsc_execute (%addr_16, %addr_17, %addr_18, %addr_19, %addr_20, %addr_21, %addr_22, %addr_23)
+                    {sdsc_filename="sdsc_2.json", "symbol_ids"=[-17, -18, -19, -20, -21, -22, -23, -24]}
             }
         }
         return
@@ -450,21 +537,49 @@ module {
 }
 ```
 
-All three dispatches share the same affine map because they operate on
-tensors of the same shape and stride structure.  The LX scratchpad tensor
-`y` does not appear as a symbol — its `per_tile_fixed=True` flag tells the
-unroller its base address is fixed across iterations, so it needs no
-`affine.apply` at all.  `mul`'s `pool` output (`%sym_5`), by contrast, is
-real HBM (`memory_planning.py`'s `INTERMEDIATES_SEGMENT`, not scratchpad)
-and is *not* `per_tile_fixed`, so — like the other HBM operands `a`, `b`,
-`c`, `z` — it does need its own `affine.apply`-computed address each
-iteration, shared between the `mul` dispatch that writes it and the
-`identity` dispatch that reads it back.  Each inner-loop iteration
-dispatches `add`, then `mul`, then the `identity` copy at tile
-`(i_0, i_1)`: `add` keeps `y` in scratchpad for `mul` to consume
-immediately, and `mul` writes its result into that iteration's `pool` slot
-in HBM for the `identity` copy to drain into the correct slice of `z`'s
-full HBM buffer.
+(This is a lightly elided version of the real captured output — the
+per-core address setup for `arg_1`, `arg_2`, `pool`, and `arg_3` is omitted
+from the constant-declaration block above since it repeats the `arg_0`
+pattern exactly; nothing in the loop body itself is elided.)
+
+Key points, working from the two affine maps down:
+
+- **Two affine maps, not one.** `#map_0` addresses the four full-tensor HBM
+  operands (`a`, `b`, `c`, `z` — bound to `%arg_0`..`%arg_3`); `#map_1`
+  addresses the `pool` intermediate. They differ because `pool` is a
+  per-tile-sized HBM buffer (`[512, 1024]`) while `a`/`b`/`c`/`z` are the
+  full `[1024, 4096]` tensor — the outer-dimension stride (`2097152` vs.
+  `1048576` bytes) scales with the buffer's own row pitch, not a shared
+  constant.  Both maps share the same inner-dimension stride (`65536` bytes):
+  that's the per-core byte offset (see below) multiplied out along the
+  tiled column dimension, and it happens to come out the same for both
+  because the tiling granularity (`1024` columns/tile ÷ `sencores`) is
+  identical for every tensor in this example.
+- **Every full-tensor HBM operand is expanded into `sencores` per-core
+  addresses.** At `sencores=4`, `arg_0` (tensor `a`) contributes its own
+  base address plus three `arith.addi`-computed offsets
+  (`arg_0_core_16384`, `arg_0_core_32768`, `arg_0_core_49152`, stepping by
+  `16384` bytes — `65536 / 4`), and each `sdscbundle.sdsc_execute` dispatch
+  takes **8 address operands** for a 2-tensor op (4 cores × 2 tensors) rather
+  than a single pair.  At the default `sencores=32` this would instead be 32
+  per-core addresses per operand and 64 address operands per dispatch — real,
+  but too large to usefully quote in a doc, which is why this example fixes
+  `sencores=4`.
+- **The LX scratchpad tensor `y` does not appear as a symbol at all** — its
+  `per_tile_fixed=True` flag (see the OpSpec above) tells the unroller its
+  base address is fixed across iterations, so it needs no
+  `affine.apply`-computed address, per-core or otherwise.
+- **`pool` (the `mul` dispatch's output and the `identity` dispatch's input)
+  is real HBM** (`memory_planning.py`'s `INTERMEDIATES_SEGMENT`, not
+  scratchpad), and is *not* `per_tile_fixed`, so it does need its own
+  per-core, per-iteration `affine.apply` address using `#map_1`, computed
+  once and shared between the `mul` dispatch that writes it and the
+  `identity` dispatch that reads it back at the same tile coordinate.
+- Each inner-loop iteration dispatches `add`, then `mul`, then the
+  `identity` copy at tile `(i_0, i_1)`: `add` keeps `y` in scratchpad for
+  `mul` to consume immediately, and `mul` writes its result into that
+  iteration's `pool` slot in HBM for the `identity` copy to drain into the
+  correct slice of `z`'s full HBM buffer.
 
 ## Layer 1 — Pre-scheduling IR pass
 
