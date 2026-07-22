@@ -160,11 +160,10 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
     def allocate_pool(self):
         """Allocate the intermediate pool."""
         pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
-        pool_size_sticks = (pool_size_bytes + 127) // 128
         return (
             f"_pool = spyre_empty_with_layout("
-            f"({pool_size_sticks},), (1,), "
-            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_sticks}, 1, 1], "
+            f"({pool_size_bytes},), (1,), "
+            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_bytes}, 1, 1], "
             f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
         )
 
