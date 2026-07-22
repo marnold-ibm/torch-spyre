@@ -42,6 +42,14 @@ Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 After stamping, ``coarse_tile`` calls ``insert_tiling_propagation`` to allocate
 full-sized output buffers and insert copy/mutation ops for Pointwise operations
 whose results are consumed outside the loop.
+
+Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
+rewiring in this file, read "Appendix: How IR rewiring works, and why it's
+sound" in ``docs/source/compiler/coarse_tiling_loops.md``. It documents the
+wrap-never-reconstruct convention, why ``MutationLayoutSHOULDREMOVE`` sites
+must satisfy the single-mutation-target invariant, and the DCE-liveness
+mechanism protecting carry copy-outs -- the same ground this file's rewrite
+sites depend on.
 """
 
 from __future__ import annotations
