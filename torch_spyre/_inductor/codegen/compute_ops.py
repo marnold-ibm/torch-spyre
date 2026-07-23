@@ -15,6 +15,7 @@
 
 import dataclasses
 
+import sympy
 from torch_spyre._C import encode_constant, DataFormats
 from torch_spyre._inductor.errors import Unsupported
 from sympy import Symbol
@@ -423,6 +424,23 @@ def _tiled_byte_stride(tensor, tiled_sym) -> int:
     return int(tensor.strides[tiled_sym] * num_bytes(tensor.data_format))
 
 
+def _level_stride_from_expr(expr, level_idx: int) -> int | None:
+    """Extract nesting-level ``level_idx``'s coefficient from ``expr``.
+
+    ``expr`` is a sympy.Expr with one term per nesting level,
+    ``Symbol(f"_ct_lvl{lvl}") * device_stride`` summed (see
+    ``OpSpec.tile_advance_expr``). Returns ``None`` when ``expr`` is
+    ``None`` or has no term for ``level_idx`` (that level is not part of
+    this op's coarse-tiled advance).
+    """
+    if expr is None:
+        return None
+    sym = Symbol(f"_ct_lvl{level_idx}")
+    if sym not in expr.free_symbols:
+        return None
+    return int(sympy.Poly(expr, sym).coeff_monomial(sym))
+
+
 def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
     """Find the index of the index tensor that references the given value tensor.
 
@@ -502,7 +520,7 @@ def generate_sdsc(
     symbol_id_offset: int = 0,
     tiled_symbols=None,
     use_symbols: bool = False,
-    dim_advance_overrides=None,
+    tile_advance_expr=None,
 ):
     """Generate SDSC JSON for one OpSpec.
 
@@ -529,33 +547,23 @@ def generate_sdsc(
     IDs in the JSON and their values appended to ``symbols``, enabling
     ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
 
-    ``dim_advance_overrides``: optional ``list[dict[Symbol, tuple[int, int]]]``,
-    outermost-first per nesting level, parallel to ``tiled_symbols``. Only
-    relevant for a symbol tiled at *more than one* nesting level (e.g. a
-    flattened 1-D tensor tiled by two independent coarse-tiling hints that
+    ``tile_advance_expr``: optional ``sympy.Expr | None``, one term per
+    nesting level (``Symbol(f"_ct_lvl{lvl}") * device_stride``, summed).
+    Only relevant for a symbol tiled at *more than one* nesting level (e.g.
+    a flattened 1-D tensor tiled by two independent coarse-tiling hints that
     both land on the same host dim) -- for such a symbol,
     ``tensor.strides[sym]`` is a single flat value that already matches the
     *innermost* overridden level's tile_size, but cannot also represent an
     outer level's larger advance. For a symbol tiled at only one level,
     ``tensor.strides[sym]`` (via ``_tiled_byte_stride``) is already exactly
-    right and the override is not applied. For a multi-level symbol, each
-    level's stride is ``_tiled_byte_stride`` scaled by the ratio between that
-    level's ``tile_size`` and the innermost overridden level's ``tile_size``.
+    right and the expression's coefficient for that level is not consulted.
+    For a multi-level symbol, each level's coefficient is read directly out
+    of the expression via ``_level_stride_from_expr`` -- no ratio-scaling
+    arithmetic needed.
     """
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
         tiled_symbols = []
-    # dim_advance_overrides is list[dict[Symbol, tuple[int,int]]], outermost-
-    # first, parallel to tiled_symbols. Authoritative (tile_size,
-    # supertile_count) fact for a Case 2 op's coarse-tiled dims, stamped by
-    # coarse_tile.py and translated to SDSC-symbol space by compile_op_spec.
-    # A dim tiled at more than one level (the flattened-1D case) has a
-    # distinct entry per level here, each with its own tile_size -- unlike
-    # _tiled_byte_stride, which reads a single flat tensor.strides[sym] value
-    # and so cannot distinguish one level's advance from another's for the
-    # same symbol.
-    if dim_advance_overrides is None:
-        dim_advance_overrides = []
 
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
@@ -821,26 +829,17 @@ def generate_sdsc(
                 # exactly right there. Only a symbol tiled at *multiple*
                 # levels needs help, since tensor.strides[s] is one flat
                 # value and can't distinguish one level's advance from
-                # another's. For such a symbol, scale the (already-correct,
-                # single-level) base stride by the ratio between this
-                # level's tile_size and the innermost overridden level's
-                # tile_size -- that innermost tile_size is what
-                # tensor.strides[s] already corresponds to, since
-                # coarse_tile.py divides op ranges down to the innermost
-                # tile before create_op_spec runs.
+                # another's. For such a symbol, read that level's advance
+                # coefficient directly out of tile_advance_expr via
+                # _level_stride_from_expr.
                 levels_per_symbol: dict = {}
-                for level_idx, level_overrides in enumerate(dim_advance_overrides):
-                    for s in level_overrides:
+                for level_idx, level_syms in enumerate(tiled_symbols):
+                    for s in level_syms:
                         levels_per_symbol.setdefault(s, []).append(level_idx)
                 multi_level_syms = {
                     s for s, levels in levels_per_symbol.items() if len(levels) > 1
                 }
                 for level_idx, level_syms in enumerate(tiled_symbols):
-                    level_overrides = (
-                        dim_advance_overrides[level_idx]
-                        if level_idx < len(dim_advance_overrides)
-                        else {}
-                    )
                     tensor_tiled_at_level = [
                         s
                         for s in level_syms
@@ -848,18 +847,16 @@ def generate_sdsc(
                     ]
                     strides_for_level: dict = {}
                     for s in tensor_tiled_at_level:
-                        if s in level_overrides and s in multi_level_syms:
-                            tile_size, _ = level_overrides[s]
-                            innermost_level = levels_per_symbol[s][-1]
-                            innermost_tile_size, _ = dim_advance_overrides[
-                                innermost_level
-                            ][s]
-                            base_stride = _tiled_byte_stride(tensor, s)
-                            strides_for_level[s] = (
-                                base_stride * tile_size // innermost_tile_size
+                        level_stride = None
+                        if s in multi_level_syms:
+                            level_stride = _level_stride_from_expr(
+                                tile_advance_expr, level_idx
                             )
-                        else:
-                            strides_for_level[s] = _tiled_byte_stride(tensor, s)
+                        strides_for_level[s] = (
+                            level_stride
+                            if level_stride is not None
+                            else _tiled_byte_stride(tensor, s)
+                        )
                         any_tiled = True
                     per_level_strides.append(strides_for_level)
             else:
