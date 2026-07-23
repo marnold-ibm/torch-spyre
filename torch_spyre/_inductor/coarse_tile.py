@@ -1240,23 +1240,34 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
             )
 
 
-def _level_advance_size(
-    loop_info: CoarseTileInfo, op: ComputedBuffer, lvl: int, d: int
-) -> int:
-    """Per-iteration advance size for host dim ``d`` tiled at level ``lvl``.
+def _build_advance_expr(loop_info: CoarseTileInfo, op: ComputedBuffer) -> Expr | None:
+    """Build the host-stride tile-advance expression for a Case 2 op.
 
-    One iteration of level ``lvl`` advances dim ``d`` by ``op.data.ranges[d]``
+    One term per nesting level that tiles at least one host dim, summed:
+    ``sum(_ct_lvl{lvl} * host_stride[lvl] for lvl in tiled_levels)``.
+    ``host_stride[lvl]`` is the element extent one iteration of level
+    ``lvl`` advances the op's coarse-tiled dim(s) by -- ``op.data.ranges[d]``
     scaled up by the trip counts of every more-inner level that also tiles
-    ``d`` — those inner iterations sweep the full tile before the outer level
-    advances again. When no other level tiles the same host dim (the common
-    case: each level owns a distinct host dim), this reduces to
-    ``op.data.ranges[d]``, matching the original single-level formula.
+    the same host dim ``d`` (those inner iterations sweep the full tile
+    before the outer level advances again). When a host dim is tiled at
+    only one level (the common case), this reduces to ``op.data.ranges[d]``
+    itself.
+
+    Returns ``None`` when no level tiles any host dim (loop-invariant op).
     """
-    inner_multiplier = 1
-    for inner_lvl in range(lvl + 1, len(loop_info.loop_tiled_dims)):
-        if d in loop_info.loop_tiled_dims[inner_lvl]:
-            inner_multiplier *= int(loop_info.loop_count[inner_lvl])
-    return int(op.data.ranges[d]) * inner_multiplier
+    terms: list[Expr] = []
+    for lvl, dims in enumerate(loop_info.loop_tiled_dims):
+        if not dims:
+            continue
+        inner_multiplier = 1
+        for inner_lvl in range(lvl + 1, len(loop_info.loop_tiled_dims)):
+            if any(d in loop_info.loop_tiled_dims[inner_lvl] for d in dims):
+                inner_multiplier *= int(loop_info.loop_count[inner_lvl])
+        host_stride = sum(int(op.data.ranges[d]) for d in dims) * inner_multiplier
+        terms.append(sympy.Symbol(f"_ct_lvl{lvl}") * host_stride)
+    if not terms:
+        return None
+    return sympy.Add(*terms)
 
 
 def _propagate_tiled_op(
@@ -1423,29 +1434,17 @@ def _propagate_tiled_op(
         # op's device_coordinates (see coarse_tiling_loops.md's IR-rewiring
         # appendix and issue tracking the ct_test_1.py wrong-result bug).
         # Stamp it now, while loop_info/full_ranges are in scope, so
-        # create_op_spec can carry it into OpSpec.dim_advance_overrides.
+        # create_op_spec can carry it into OpSpec.tile_advance_expr.
         #
-        # This is a *list*, one dict per nesting level (outermost-first,
-        # matching loop_info.loop_tiled_dims/loop_count), not a single flat
-        # dict keyed by host dim. A host dim can be tiled at more than one
-        # level when the tensor doesn't have enough real dims to give each
-        # level a distinct one (e.g. two coarse-tiling hints stacked on a
-        # flattened 1-D tensor both tile host dim 0) — collapsing those two
-        # levels' independent advances into one dict entry silently drops
-        # one of them. Per level, supertile_count is that level's own trip
-        # count; tile_size is the byte/element extent one iteration of that
-        # level advances by, i.e. op.data.ranges[d] scaled up by the trip
-        # counts of every more-inner level that also tiles d.
-        op._coarse_tile_dim_advance = [  # type: ignore[attr-defined]
-            {
-                d: (
-                    _level_advance_size(loop_info, op, lvl, d),
-                    int(loop_info.loop_count[lvl]),
-                )
-                for d in dims
-            }
-            for lvl, dims in enumerate(loop_info.loop_tiled_dims)
-        ]
+        # A single sympy.Expr, one term per nesting level that tiles a host
+        # dim, summed. Free symbols are per-level placeholders (_ct_lvl0,
+        # _ct_lvl1, ...), coefficients are host-stride (element) extents.
+        # Using a sum of distinct terms -- rather than a flat dict keyed by
+        # host dim -- means a host dim tiled at more than one level (e.g.
+        # two coarse-tiling hints stacked on a flattened 1-D tensor) keeps
+        # both levels' independent contributions as separate addends instead
+        # of one overwriting the other.
+        op._coarse_tile_advance_expr = _build_advance_expr(loop_info, op)  # type: ignore[attr-defined]
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.
