@@ -70,6 +70,8 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
+    tile_advance_expr: Expr | None = None
+    full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -396,71 +398,6 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
-    # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
-    # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
-    # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
-    # terms) and substituted to device-stride terms by
-    # spyre_kernel.create_op_spec. The per-iteration *advance* across levels
-    # is handled later, in compute_ops.generate_sdsc's affine_strides
-    # construction (which is structured per level). Here we only need the
-    # **iteration-0 base** fact -- the actual (innermost) tile extent this
-    # arg is written/read at per iteration, and the full extent it sits
-    # within -- to compute a correct base offset/backGap, since
-    # device_coordinates cannot represent "which supertile" for these ops
-    # (see coarse_tiling_loops.md's IR-rewiring appendix). The innermost
-    # level that tiles a given dim owns its true per-iteration tile_size;
-    # the full extent is that tile_size times every level's supertile_count
-    # for that dim.
-    sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {}
-    if op_spec.tile_advance_expr is not None:
-        n_levels = len(op_spec.tiled_symbols)
-        # tile_advance_expr's coefficients are in bytes (matching
-        # compute_ops._tiled_byte_stride's byte-valued output), but
-        # sdsc_dim_advance / the stick-dim override branch below need
-        # element-scale tile_size, the same scale as arg.device_size (see
-        # the Non-goals note in the tile-advance-expression design doc:
-        # SDSCArgs.strides/backGap semantics are unchanged by this
-        # refactor). tile_advance_expr is stamped from the op's own output
-        # buffer's layout (spyre_kernel.create_op_spec's ir_node.get_layout()
-        # is the mutation target, i.e. op_spec.args[-1] by convention -- see
-        # e.g. line 886's out_coords lookup), so its output arg's
-        # device_dtype gives the correct byte-width to divide back out.
-        out_elem_bytes = num_bytes(op_spec.args[-1].device_dtype)
-        # tiled_symbols is innermost-first (see OpSpec's docstring); walk it
-        # in reverse (outermost first) so that when more than one level
-        # tiles the same symbol (the flattened-1D shared-host-dim case),
-        # the *last* write is the innermost level's tile_size -- matching
-        # the old dim_advance_overrides accumulation's "later writes win"
-        # semantics (that old list was itself outermost-first, so a plain
-        # forward walk there already visited the innermost level last).
-        for lvl_from_innermost, level_syms in reversed(
-            list(enumerate(op_spec.tiled_symbols))
-        ):
-            lvl = n_levels - 1 - lvl_from_innermost  # outermost-first index
-            byte_stride = _level_stride_from_expr(op_spec.tile_advance_expr, lvl)
-            if byte_stride is None:
-                continue
-            tile_size = byte_stride // out_elem_bytes
-            for sym in level_syms:
-                if sym not in symbol_mapping:
-                    continue
-                sdsc_sym = symbol_mapping[sym]
-                # full_tiled_extent (see OpSpec's docstring) carries the
-                # dim's true full extent directly from the op's committed
-                # device layout -- independent of any per-level trip-count
-                # math, which tile_advance_expr's coefficients alone cannot
-                # recover (see the known limitation flagged in the design
-                # doc). supertile_count = full_extent // tile_size gives
-                # the same (tile_size, supertile_count) shape the old
-                # dim_advance_overrides accumulation produced.
-                full_extent = op_spec.full_tiled_extent.get(sym)
-                supertile_count = (
-                    full_extent // tile_size
-                    if full_extent is not None and tile_size
-                    else 1
-                )
-                sdsc_dim_advance[sdsc_sym] = (tile_size, supertile_count)
-
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
     # and value tensors are those that contain IndirectAccess in their coordinates.
@@ -487,6 +424,46 @@ def _create_sdsc_tensors(
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
             dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec)
+
+        # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
+        # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
+        # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
+        # terms) and substituted to device-stride terms, per-arg, by
+        # spyre_kernel.create_tensor_arg. The per-iteration *advance* across
+        # levels is handled later, in compute_ops.generate_sdsc's
+        # affine_strides construction (which is structured per level). Here
+        # we only need the **iteration-0 base** fact -- the actual
+        # (innermost) tile extent this arg is written/read at per
+        # iteration, and the full extent it sits within -- to compute a
+        # correct base offset/backGap, since device_coordinates cannot
+        # represent "which supertile" for these ops (see
+        # coarse_tiling_loops.md's IR-rewiring appendix). The innermost
+        # level that tiles a given dim owns its true per-iteration
+        # tile_size; the full extent is that tile_size times every level's
+        # supertile_count for that dim.
+        sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {}
+        if arg.tile_advance_expr is not None:
+            n_levels = len(op_spec.tiled_symbols)
+            arg_elem_bytes = num_bytes(arg.device_dtype)
+            for lvl_from_innermost, level_syms in reversed(
+                list(enumerate(op_spec.tiled_symbols))
+            ):
+                lvl = n_levels - 1 - lvl_from_innermost
+                byte_stride = _level_stride_from_expr(arg.tile_advance_expr, lvl)
+                if byte_stride is None:
+                    continue
+                tile_size = byte_stride // arg_elem_bytes
+                for sym in level_syms:
+                    if sym not in symbol_mapping:
+                        continue
+                    sdsc_sym = symbol_mapping[sym]
+                    full_extent = arg.full_tiled_extent.get(sym)
+                    supertile_count = (
+                        full_extent // tile_size
+                        if full_extent is not None and tile_size
+                        else 1
+                    )
+                    sdsc_dim_advance[sdsc_sym] = (tile_size, supertile_count)
 
         scales: dict = {}
         strides: dict = {}
@@ -657,6 +634,8 @@ def _create_sdsc_tensors(
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
+                tile_advance_expr=arg.tile_advance_expr,
+                full_tiled_extent=arg.full_tiled_extent,
             )
         )
 
@@ -1014,6 +993,5 @@ def compile_op_spec(
         symbol_id_offset,
         tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
-        tile_advance_expr=op_spec.tile_advance_expr,
     )
     return result

@@ -116,6 +116,14 @@ class TensorArg:
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        tile_advance_expr: This arg's own device-byte-stride sympy.Expr for a Case 2
+            (MutationLayoutSHOULDREMOVE) op's coarse-tiled dims' per-iteration base-address
+            advance, derived from this arg's own device_coordinates (not shared across args).
+            One term per nesting level, summed: ``sum(Symbol(f"_ct_lvl{lvl}") * device_stride[lvl]
+            for lvl in tiled_levels)``. ``None`` for args without this metadata.
+        full_tiled_extent: This arg's own full (untiled) element extent of each coarse-tiled
+            dim, keyed by the same Inductor symbol as OpSpec.iteration_space. Empty for args
+            without coarse-tiled dims.
     """
 
     is_input: bool
@@ -126,6 +134,8 @@ class TensorArg:
     allocation: Any
     per_tile_fixed: bool = False
     name: str | None = None
+    tile_advance_expr: Expr | None = None
+    full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -167,36 +177,6 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
-    # Host-stride-to-device-stride-substituted sympy.Expr for a Case 2
-    # (MutationLayoutSHOULDREMOVE) op's coarse-tiled dims' per-iteration
-    # base-address advance. One term per nesting level, summed:
-    # ``sum(Symbol(f"_ct_lvl{lvl}") * device_stride[lvl] for lvl in
-    # tiled_levels)``. A host dim tiled at more than one level (e.g. two
-    # coarse-tiling hints stacked on a flattened 1-D tensor, where every
-    # level tiles the same host dim) contributes a separate addend per
-    # level — sympy keeps them distinct without a ratio-scaling special
-    # case, unlike a flat dict keyed by symbol.
-    # Populated by create_op_spec from ComputedBuffer._coarse_tile_advance_expr
-    # (stamped by coarse_tile._propagate_tiled_op in host-stride terms) via a
-    # single host-Symbol -> device-stride substitution, once the op's
-    # committed device layout is available. Consumed by
-    # compute_ops.generate_sdsc's per-level affine_strides construction via
-    # coefficient extraction. ``None`` for ops without this metadata.
-    tile_advance_expr: Expr | None = None
-    # Full (untiled) element extent of each coarse-tiled dim, keyed by the
-    # same Inductor symbol as ``iteration_space``. A Case 2
-    # (MutationLayoutSHOULDREMOVE) op's ``iteration_space`` only carries its
-    # own per-tile range for a coarse-tiled dim (device_coordinates has no
-    # side channel for "which supertile"), so neither it nor
-    # ``tile_advance_expr`` (whose coefficients are per-level advances, not
-    # trip counts) can recover the full extent a tile_size sits within.
-    # Populated by create_op_spec from the op's committed device layout
-    # (``ir_node.get_layout().real_layout().size``, i.e. the full buffer's
-    # own logical size — see coarse_tile._propagate_tiled_op's Case 2
-    # rewire). Consumed by superdsc.py's stick-dim override branch to
-    # compute ``dev_dim_size`` directly, without needing per-level trip
-    # counts. Empty for ops without coarse-tiled dims.
-    full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
     debug_handle: DebugHandle | None = None
 
 

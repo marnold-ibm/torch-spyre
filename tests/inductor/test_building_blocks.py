@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import math
 import unittest
 import torch
@@ -264,3 +265,26 @@ class TestBuildingBlocks(unittest.TestCase):
 
         cpu_result = fn(x_cpu)
         torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=1e-3, rtol=1e-3)
+
+
+def test_tensor_arg_has_tile_advance_fields():
+    from torch_spyre._inductor.op_spec import TensorArg
+
+    arg = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=None,
+        device_size=[4],
+        device_coordinates=[],
+        allocation={},
+    )
+    assert arg.tile_advance_expr is None
+    assert arg.full_tiled_extent == {}
+
+
+def test_op_spec_has_no_tile_advance_fields():
+    from torch_spyre._inductor.op_spec import OpSpec
+
+    field_names = {f.name for f in dataclasses.fields(OpSpec)}
+    assert "tile_advance_expr" not in field_names
+    assert "full_tiled_extent" not in field_names

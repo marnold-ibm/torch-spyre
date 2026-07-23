@@ -1483,6 +1483,37 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
+    def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
+        """Case 3 nested coarse-tiling where an input's device layout diverges
+        from the output's -- exercises per-arg tile_advance_expr (each arg
+        must compute its own device-byte-stride, not share the output's).
+
+        Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
+        but `b` is built by transposing a [D, Lq]-shaped tensor twice before
+        entering the compiled region, so its device layout's dim_order can
+        diverge from the output's while its logical [Lq, D] shape and named
+        dims stay the same.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        Lq, D = 256, 128
+        a = torch.randn(Lq, D, dtype=torch.float16)
+        b = torch.randn(D, Lq, dtype=torch.float16).transpose(0, 1).contiguous()
+
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["Lq", "D"])
+            _name_tensor_dims(b, ["Lq", "D"])
+            c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
+            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+                with spyre_hint(num_tiles_per_dim={"D": 2}):
+                    c.copy_(a + b)
+            return c
+
+        compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
+
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
         but on a flattened [Lq * D] 1-D tensor rather than [Lq, D] 2-D.

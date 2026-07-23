@@ -520,7 +520,6 @@ def generate_sdsc(
     symbol_id_offset: int = 0,
     tiled_symbols=None,
     use_symbols: bool = False,
-    tile_advance_expr=None,
 ):
     """Generate SDSC JSON for one OpSpec.
 
@@ -547,19 +546,21 @@ def generate_sdsc(
     IDs in the JSON and their values appended to ``symbols``, enabling
     ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
 
-    ``tile_advance_expr``: optional ``sympy.Expr | None``, one term per
-    nesting level (``Symbol(f"_ct_lvl{lvl}") * device_stride``, summed).
-    Only relevant for a symbol tiled at *more than one* nesting level (e.g.
-    a flattened 1-D tensor tiled by two independent coarse-tiling hints that
-    both land on the same host dim) -- for such a symbol,
+    ``tensor.tile_advance_expr``: each tensor's own ``sympy.Expr | None``, one
+    term per nesting level (``Symbol(f"_ct_lvl{lvl}") * device_stride``,
+    summed). Only relevant for a symbol tiled at *more than one* nesting
+    level (e.g. a flattened 1-D tensor tiled by two independent coarse-tiling
+    hints that both land on the same host dim) -- for such a symbol,
     ``tensor.strides[sym]`` is a single flat value that already matches the
     *innermost* overridden level's tile_size, but cannot also represent an
     outer level's larger advance. For a symbol tiled at only one level,
     ``tensor.strides[sym]`` (via ``_tiled_byte_stride``) is already exactly
     right and the expression's coefficient for that level is not consulted.
     For a multi-level symbol, each level's coefficient is read directly out
-    of the expression via ``_level_stride_from_expr`` -- no ratio-scaling
-    arithmetic needed.
+    of ``tensor.tile_advance_expr`` via ``_level_stride_from_expr`` -- no
+    ratio-scaling arithmetic needed. Each tensor supplies its own expression
+    (derived from its own device layout), not one shared value for the whole
+    op -- see the per-arg-tile-advance design doc.
     """
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
@@ -850,7 +851,7 @@ def generate_sdsc(
                         level_stride = None
                         if s in multi_level_syms:
                             level_stride = _level_stride_from_expr(
-                                tile_advance_expr, level_idx
+                                tensor.tile_advance_expr, level_idx
                             )
                         strides_for_level[s] = (
                             level_stride

@@ -26,7 +26,6 @@ from torch._inductor.codegen.common import (
     Kernel,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
@@ -42,7 +41,7 @@ from .constants import (
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
-from .codegen.compute_ops import num_bytes
+from .codegen.compute_ops import num_bytes, _level_stride_from_expr
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
@@ -493,6 +492,185 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         return self
 
+    def _per_arg_tile_advance(
+        self, tensor: TensorAccess, device_coords: list, index: "sympy.Expr"
+    ) -> "tuple[sympy.Expr | None, dict]":
+        """This arg's own per-level tile-advance expr/extent, derived from
+        its own device_coordinates (not shared across args -- see the
+        per-arg-tile-advance design doc's Design section 2).
+
+        ``index`` is this tensor's own (already-concretized) host index
+        expression -- the same one used to build ``device_coords`` via
+        ``compute_coordinates``. It is needed to convert
+        ``host_advance_expr``'s per-level coefficients (host-*element*
+        advances) into the iteration-space symbol's own native unit-step:
+        a coarse-tiled symbol's coefficient in ``index`` is not always 1
+        (e.g. an outer-tiled dim's symbol can have coefficient 128 when
+        it is combined with an inner dim via ``128*c0 + c1``), so "advance
+        this level by ``host_stride`` host elements" means "advance ``sym``
+        by ``host_stride / index.coeff(sym)`` of its own native units."
+
+        Returns (tile_advance_expr, full_tiled_extent), both empty/None when
+        this op has no coarse-tiled dims.
+        """
+        ir_node = self.current_node.node
+        host_advance_expr = getattr(ir_node, "_coarse_tile_advance_expr", None)
+        if host_advance_expr is None:
+            return None, {}
+
+        li = getattr(ir_node, "loop_info", None)
+        raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
+        raw_tiled_red_dims: list[list[int]] = (
+            li.loop_tiled_reduction_dims if li is not None else []
+        )
+        n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
+        if n_levels == 0:
+            return None, {}
+
+        it_space = iteration_space(self.current_node)
+        it_space_keys = list(it_space.keys())
+
+        host_to_it: dict[int, int] = {}
+        if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
+            it_idx = 0
+            for host_idx, r in enumerate(ir_node.data.ranges):
+                if int(r) != 1:
+                    host_to_it[host_idx] = it_idx
+                    it_idx += 1
+        else:
+            host_to_it = {i: i for i in range(len(it_space_keys))}
+
+        n_output_it_syms = sum(
+            1
+            for r in (
+                ir_node.data.ranges
+                if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges")
+                else []
+            )
+            if int(r) != 1
+        )
+
+        tiled_syms_per_level_outermost: list[list] = []
+        for lvl in range(n_levels):
+            level_syms: list = []
+            if lvl < len(raw_tiled_dims):
+                for d in raw_tiled_dims[lvl]:
+                    mapped = host_to_it.get(d)
+                    if mapped is not None and mapped < len(it_space_keys):
+                        level_syms.append(it_space_keys[mapped])
+            if lvl < len(raw_tiled_red_dims):
+                for r in raw_tiled_red_dims[lvl]:
+                    sym_idx = n_output_it_syms + r
+                    if sym_idx < len(it_space_keys):
+                        level_syms.append(it_space_keys[sym_idx])
+            tiled_syms_per_level_outermost.append(level_syms)
+
+        device_layout = tensor.layout.device_layout
+        elem_bytes = num_bytes(device_layout.device_dtype)
+        stride_map = device_layout.stride_map
+
+        # This arg's own device-element address as a function of the
+        # iteration-space symbols, decomposed exactly as
+        # compute_coordinates built device_coords (one floor/Mod term per
+        # device dim j, e.g. floor(c0/64)*64 + Mod(c0, 64) for a stick-tiled
+        # layout). host_advance_expr's per-level coefficients (extracted via
+        # _level_stride_from_expr, safe because _ct_lvl symbols never appear
+        # inside a floor/Mod -- they are sympy_kernel-synthetic, not part of
+        # device_coords) are *host-element* advances for that level's real
+        # iteration-space symbol. A symbol's device-element address is not
+        # generally linear in that symbol once floor/Mod split it across
+        # multiple device dims, so sympy.Poly(...).coeff_monomial(...)
+        # cannot extract "the byte stride per host-element step" directly.
+        # Instead, take the discrete derivative of this arg's own device
+        # address expression at that step size via substitution:
+        # addr(sym + host_stride) - addr(sym). This is well-defined and
+        # constant (independent of sym) for the affine, tile-aligned steps
+        # coarse-tiling produces, and correctly reduces to a plain scalar
+        # multiply when device order matches host order (the case the old
+        # op-level rescale handled) while also handling a floor/Mod split
+        # across device dims (the flattened-1D multi-level case) and a
+        # divergent per-arg dim_order alike.
+        device_addr = sum(
+            (coord * int(stride_map[j]) for j, coord in enumerate(device_coords)),
+            sympy.Integer(0),
+        )
+
+        loop_count = li.loop_count if li is not None else []
+
+        terms = []
+        elem_deltas: dict = {}
+        for lvl, level_syms in enumerate(tiled_syms_per_level_outermost):
+            if not level_syms:
+                continue
+            sym = level_syms[0]
+            host_stride = _level_stride_from_expr(host_advance_expr, lvl)
+            if not host_stride:
+                continue
+            # host_stride is in host-*element* units of the flattened host
+            # index -- but sym's own native unit-step is not always one
+            # host element (e.g. index == 128*c0 + c1: one unit of c0 is
+            # 128 host elements). Convert to sym's own unit-step by
+            # dividing out sym's coefficient in this tensor's index before
+            # substituting, so the two nested loop variables' units agree.
+            sym_index_coeff = index.coeff(sym)
+            if not sym_index_coeff:
+                continue
+            sym_step = sympy.nsimplify(host_stride) / sym_index_coeff
+            elem_delta = sympy.simplify(
+                device_addr.subs(sym, sym + sym_step) - device_addr
+            )
+            if elem_delta.free_symbols:
+                # Not sym-independent: this arg's device layout does not
+                # advance uniformly for this level's step size (e.g. the
+                # step does not evenly divide a floor/Mod boundary for this
+                # arg's own layout). No well-defined single byte_stride
+                # exists; skip this level for this arg.
+                continue
+            elem_delta = int(elem_delta)
+            byte_stride = elem_delta * elem_bytes
+            if byte_stride == 0:
+                continue
+            ct_sym = sympy.Symbol(f"_ct_lvl{lvl}")
+            terms.append(ct_sym * byte_stride)
+            elem_deltas[(sym, lvl)] = elem_delta
+
+        # full_tiled_extent: this arg's own full element extent of sym's
+        # dim(s), from its own per-arg advance. A device-size-product over
+        # dims sym appears in (as computed from this arg's own
+        # device_coordinates) is *not* reliable here: a per-tile op's outer
+        # supertile device dim can have a *constant* coordinate (e.g. dim0
+        # fixed at the current supertile index, invisible in this
+        # per-invocation device_coords), so it would silently drop that
+        # dim's contribution to the full extent. Instead use the innermost
+        # level's own per-arg elem_delta (its true tile_size in this arg's
+        # own elements) times every tiling level's loop_count for this sym
+        # (loop_count is host/op-level loop-structure metadata, not
+        # device-layout-derived, so it is legitimately shared across args --
+        # unlike byte_stride, the trip-count structure does not vary per-arg).
+        full_tiled_extent: dict = {}
+        for lvl, level_syms in enumerate(tiled_syms_per_level_outermost):
+            if not level_syms:
+                continue
+            sym = level_syms[0]
+            if sym in full_tiled_extent:
+                continue
+            sym_levels = [
+                lvl2
+                for lvl2, syms2 in enumerate(tiled_syms_per_level_outermost)
+                if syms2 and syms2[0] == sym
+            ]
+            innermost_lvl = max(sym_levels)
+            if (sym, innermost_lvl) not in elem_deltas:
+                continue
+            extent = elem_deltas[(sym, innermost_lvl)]
+            for lvl2 in sym_levels:
+                if lvl2 < len(loop_count):
+                    extent *= int(loop_count[lvl2])
+            full_tiled_extent[sym] = extent
+
+        tile_advance_expr = sympy.Add(*terms) if terms else None
+        return tile_advance_expr, full_tiled_extent
+
     def create_tensor_arg(
         self,
         is_input: bool,
@@ -521,6 +699,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             index,
             self.indirect_sizes,
         )
+        tile_advance_expr, full_tiled_extent = self._per_arg_tile_advance(
+            tensor, device_coords, index
+        )
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -530,6 +711,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.allocation,
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             name=opspec_name,
+            tile_advance_expr=tile_advance_expr,
+            full_tiled_extent=full_tiled_extent,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -612,8 +795,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
-        tile_advance_expr: "sympy.Expr | None" = None
-        full_tiled_extent: dict = {}
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -629,71 +810,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             else:
                 # Fallback: identity mapping (no unit-size dims to skip).
                 host_to_it = {i: i for i in range(len(it_space_keys))}
-
-            # Rescale _coarse_tile_advance_expr's host-stride (element)
-            # coefficients to device-stride (byte) terms, producing
-            # OpSpec.tile_advance_expr. This is the one place both the
-            # host-stride expression and the op's committed device layout
-            # are available at once: unwrap MutationLayoutSHOULDREMOVE the
-            # same way work_division._resolve_layout does to reach the real
-            # FixedTiledLayout, confirming a real device layout backs this
-            # op, then multiply every term by the element byte-width
-            # (matching compute_ops._tiled_byte_stride's byte-valued output
-            # -- generate_sdsc's affine_strides construction consumes
-            # tile_advance_expr's coefficients directly, with no further
-            # unit conversion).
-            #
-            # Each level's host coefficient (stamped by
-            # coarse_tile._build_advance_expr) is already the right
-            # *element* extent for that level -- it is derived from
-            # op.data.ranges (a per-tile size) scaled by inner levels' trip
-            # counts, not from a per-element address stride. A Case 2/3
-            # buffer's own committed device layout keeps coarse-tiled dims
-            # in their host element order (confirmed empirically: for both
-            # regression tests below, FixedTiledLayout.stride equals the
-            # plain host contiguous stride), so "device element stride" and
-            # "host element stride" coincide here and no further
-            # substitution through layout.stride is needed -- doing so
-            # instead of a uniform byte-width rescale would replace each
-            # level's distinct tile-size coefficient with a per-element
-            # stride that cannot tell two levels tiling the same host dim
-            # apart (this was tried and empirically falsified against
-            # test_hint_nested_tiling_copy_mutation_flat, see issue
-            # discovered during Task 6 of the tile-advance-expression plan).
-            # The expression's free symbols (_ct_lvl0, _ct_lvl1, ...) must
-            # survive this step unchanged -- only their coefficients scale
-            # -- since compute_ops._level_stride_from_expr and
-            # superdsc.py's sdsc_dim_advance accumulation both key off them
-            # via sympy.Poly(expr, sym).coeff_monomial(sym).
-            host_advance_expr = getattr(ir_node, "_coarse_tile_advance_expr", None)
-            if host_advance_expr is not None:
-                layout = ir_node.get_layout()
-                if isinstance(layout, MutationLayoutSHOULDREMOVE):
-                    layout = layout.real_layout()
-                if isinstance(layout, FixedTiledLayout):
-                    elem_bytes = num_bytes(layout.device_layout.device_dtype)
-                    tile_advance_expr = host_advance_expr * elem_bytes
-                    # layout is the Case 2 rewire's full (untiled) buffer's
-                    # own committed layout (MutationLayoutSHOULDREMOVE wraps
-                    # coarse_tile._propagate_tiled_op's full_buf) -- its
-                    # .size is the true full extent tiled dims sit within,
-                    # independent of tile_size/trip-count math. Neither
-                    # OpSpec.iteration_space (per-tile range only) nor
-                    # tile_advance_expr (per-level advance, not trip counts)
-                    # can recover this -- see superdsc.py's stick-dim
-                    # override branch, which needs it for a correct backGap.
-                    tiled_host_dims = {
-                        d for level_dims in raw_tiled_dims for d in level_dims
-                    }
-                    for host_idx in tiled_host_dims:
-                        extent_it_idx = host_to_it.get(host_idx)
-                        if extent_it_idx is None or extent_it_idx >= len(it_space_keys):
-                            continue
-                        if host_idx >= len(layout.size):
-                            continue
-                        full_tiled_extent[it_space_keys[extent_it_idx]] = int(
-                            layout.size[host_idx]
-                        )
 
             # For reduction dims: offset is the number of non-unit output-dim ranges.
             n_output_it_syms = sum(
@@ -763,8 +879,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
-            tile_advance_expr=tile_advance_expr,
-            full_tiled_extent=full_tiled_extent,
             debug_handle=debug_handle,
         )
 
@@ -1162,19 +1276,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
-                if op_spec.tile_advance_expr is not None:
-                    buf.writeline(
-                        f"tile_advance_expr={sympy_str(op_spec.tile_advance_expr)},"
-                    )
-                if op_spec.full_tiled_extent:
-                    buf.writeline(
-                        "full_tiled_extent={"
-                        + ", ".join(
-                            sympy_str(k) + ": " + str(v)
-                            for k, v in op_spec.full_tiled_extent.items()
-                        )
-                        + "},"
-                    )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
                     # generated-source -> exec round-trip. DebugHandle/SourceLoc
@@ -1202,6 +1303,19 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("per_tile_fixed=True,")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
+                            if arg.tile_advance_expr is not None:
+                                buf.writeline(
+                                    f"tile_advance_expr={sympy_str(arg.tile_advance_expr)},"
+                                )
+                            if arg.full_tiled_extent:
+                                buf.writeline(
+                                    "full_tiled_extent={"
+                                    + ", ".join(
+                                        sympy_str(k) + ": " + str(v)
+                                        for k, v in arg.full_tiled_extent.items()
+                                    )
+                                    + "},"
+                                )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
