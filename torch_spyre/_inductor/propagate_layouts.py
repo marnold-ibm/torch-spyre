@@ -1387,6 +1387,23 @@ def propagate_spyre_tensor_layouts(
                         target_name,
                         type(target_buf).__name__,
                     )
+                    # Pool buffers created by _insert_copy_op are full-sized HBM
+                    # scratch buffers written tile-by-tile (via dim_advance_overrides)
+                    # and read as a whole by the outer copy op.  Assigning the
+                    # per-tile STL from the tile-sized inputs would give the full
+                    # buffer wrong physical strides for the whole-buffer read.
+                    # Use generic_layout (standard row-major for the full size) instead.
+                    if getattr(target_buf, "_pool_layout_fixed", False):
+                        full_stl = generic_layout(target_buf)
+                        target_buf.layouts = [full_stl]
+                        rw = op.get_read_writes()
+                        output_dep = next(iter(rw.writes))
+                        all_args = _get_prop_args(rw.reads)
+                        op.layouts = [full_stl]
+                        op.restick_cost_fn = AllSameNode.from_args(
+                            all_args, [full_stl], output_dep, op
+                        )
+                        continue
                     # SpyreEmptyFallback accumulator has no device layout yet.
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the "new value" inputs
