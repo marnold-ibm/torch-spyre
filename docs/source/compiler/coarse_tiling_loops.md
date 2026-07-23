@@ -929,6 +929,8 @@ For each `ComputedBuffer` in a loop group the pass asks two questions:
    shares the same `loop_info.loop_group_id` tuple (i.e. it is another op in
    the same innermost loop body).
 
+(treatment-by-consumer-topology)=
+
 #### Treatment by consumer topology
 
 The perimeter is shape-asymmetric.  On the producer side (tile → full), a
@@ -1052,7 +1054,7 @@ host-dim-indexed list into `OpSpec.dim_advance_overrides`, translating each
 level's dict independently into the Inductor iteration-space `Symbol` space
 (using the same `host_to_it` correlation the rest of `create_op_spec`
 already builds), and preserving level order (outermost-first, no reversal —
-see [`LoopSpec` and `OpSpec.tiled_symbols`](#loopspec-and-opspecTiled_symbols-in-op_specpy)
+see [`LoopSpec` and `OpSpec.tiled_symbols`](#loopspec-and-opspectiled_symbols-in-op_specpy)
 below for why this is the one field on `OpSpec` that stays outermost-first
 rather than being reversed to match `tiled_symbols`).
 
