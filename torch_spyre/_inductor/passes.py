@@ -403,7 +403,7 @@ class CustomPreSchedulingPasses:
             split_multi_ops,
             propagate_spyre_tensor_layouts,
             validate_ops,
-            resolve_join_clusters,
+            #resolve_join_clusters,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
