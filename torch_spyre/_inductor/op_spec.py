@@ -183,6 +183,20 @@ class OpSpec:
     # compute_ops.generate_sdsc's per-level affine_strides construction via
     # coefficient extraction. ``None`` for ops without this metadata.
     tile_advance_expr: Expr | None = None
+    # Full (untiled) element extent of each coarse-tiled dim, keyed by the
+    # same Inductor symbol as ``iteration_space``. A Case 2
+    # (MutationLayoutSHOULDREMOVE) op's ``iteration_space`` only carries its
+    # own per-tile range for a coarse-tiled dim (device_coordinates has no
+    # side channel for "which supertile"), so neither it nor
+    # ``tile_advance_expr`` (whose coefficients are per-level advances, not
+    # trip counts) can recover the full extent a tile_size sits within.
+    # Populated by create_op_spec from the op's committed device layout
+    # (``ir_node.get_layout().real_layout().size``, i.e. the full buffer's
+    # own logical size — see coarse_tile._propagate_tiled_op's Case 2
+    # rewire). Consumed by superdsc.py's stick-dim override branch to
+    # compute ``dev_dim_size`` directly, without needing per-level trip
+    # counts. Empty for ops without coarse-tiled dims.
+    full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
     debug_handle: DebugHandle | None = None
 
 

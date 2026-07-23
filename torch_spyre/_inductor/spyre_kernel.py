@@ -42,6 +42,7 @@ from .constants import (
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
+from .codegen.compute_ops import num_bytes
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
@@ -612,6 +613,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
         tile_advance_expr: "sympy.Expr | None" = None
+        full_tiled_extent: dict = {}
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -628,39 +630,70 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Fallback: identity mapping (no unit-size dims to skip).
                 host_to_it = {i: i for i in range(len(it_space_keys))}
 
-            # Substitute host strides for device strides in
-            # _coarse_tile_advance_expr (host-stride terms, stamped by
-            # coarse_tile._propagate_tiled_op's Case 2 branch), producing
-            # OpSpec.tile_advance_expr (device-stride terms). This is the
-            # one place both the host-stride expression and the op's
-            # committed device layout are available at once: unwrap
-            # MutationLayoutSHOULDREMOVE the same way
-            # work_division._resolve_layout does to reach the real
-            # FixedTiledLayout, then substitute each level's host stride
-            # coefficient for the corresponding device stride. The
-            # expression's free symbols (_ct_lvl0, _ct_lvl1, ...) are
-            # per-level placeholders, not host Symbols -- coarse_tile.py
-            # never had access to iteration-space Symbols, only host dim
-            # indices, so there is no host_to_it-style remapping needed
-            # here; only the coefficients change.
+            # Rescale _coarse_tile_advance_expr's host-stride (element)
+            # coefficients to device-stride (byte) terms, producing
+            # OpSpec.tile_advance_expr. This is the one place both the
+            # host-stride expression and the op's committed device layout
+            # are available at once: unwrap MutationLayoutSHOULDREMOVE the
+            # same way work_division._resolve_layout does to reach the real
+            # FixedTiledLayout, confirming a real device layout backs this
+            # op, then multiply every term by the element byte-width
+            # (matching compute_ops._tiled_byte_stride's byte-valued output
+            # -- generate_sdsc's affine_strides construction consumes
+            # tile_advance_expr's coefficients directly, with no further
+            # unit conversion).
+            #
+            # Each level's host coefficient (stamped by
+            # coarse_tile._build_advance_expr) is already the right
+            # *element* extent for that level -- it is derived from
+            # op.data.ranges (a per-tile size) scaled by inner levels' trip
+            # counts, not from a per-element address stride. A Case 2/3
+            # buffer's own committed device layout keeps coarse-tiled dims
+            # in their host element order (confirmed empirically: for both
+            # regression tests below, FixedTiledLayout.stride equals the
+            # plain host contiguous stride), so "device element stride" and
+            # "host element stride" coincide here and no further
+            # substitution through layout.stride is needed -- doing so
+            # instead of a uniform byte-width rescale would replace each
+            # level's distinct tile-size coefficient with a per-element
+            # stride that cannot tell two levels tiling the same host dim
+            # apart (this was tried and empirically falsified against
+            # test_hint_nested_tiling_copy_mutation_flat, see issue
+            # discovered during Task 6 of the tile-advance-expression plan).
+            # The expression's free symbols (_ct_lvl0, _ct_lvl1, ...) must
+            # survive this step unchanged -- only their coefficients scale
+            # -- since compute_ops._level_stride_from_expr and
+            # superdsc.py's sdsc_dim_advance accumulation both key off them
+            # via sympy.Poly(expr, sym).coeff_monomial(sym).
             host_advance_expr = getattr(ir_node, "_coarse_tile_advance_expr", None)
             if host_advance_expr is not None:
                 layout = ir_node.get_layout()
                 if isinstance(layout, MutationLayoutSHOULDREMOVE):
                     layout = layout.real_layout()
                 if isinstance(layout, FixedTiledLayout):
-                    li_dims = raw_tiled_dims
-                    subs: dict[sympy.Symbol, int] = {}
-                    for lvl in range(len(li_dims)):
-                        lvl_sym = sympy.Symbol(f"_ct_lvl{lvl}")
-                        if lvl_sym not in host_advance_expr.free_symbols:
+                    elem_bytes = num_bytes(layout.device_layout.device_dtype)
+                    tile_advance_expr = host_advance_expr * elem_bytes
+                    # layout is the Case 2 rewire's full (untiled) buffer's
+                    # own committed layout (MutationLayoutSHOULDREMOVE wraps
+                    # coarse_tile._propagate_tiled_op's full_buf) -- its
+                    # .size is the true full extent tiled dims sit within,
+                    # independent of tile_size/trip-count math. Neither
+                    # OpSpec.iteration_space (per-tile range only) nor
+                    # tile_advance_expr (per-level advance, not trip counts)
+                    # can recover this -- see superdsc.py's stick-dim
+                    # override branch, which needs it for a correct backGap.
+                    tiled_host_dims = {
+                        d for level_dims in raw_tiled_dims for d in level_dims
+                    }
+                    for host_idx in tiled_host_dims:
+                        extent_it_idx = host_to_it.get(host_idx)
+                        if extent_it_idx is None or extent_it_idx >= len(it_space_keys):
                             continue
-                        dims_at_lvl = li_dims[lvl] if lvl < len(li_dims) else []
-                        if not dims_at_lvl:
+                        if host_idx >= len(layout.size):
                             continue
-                        device_stride = sum(int(layout.stride[d]) for d in dims_at_lvl)
-                        subs[lvl_sym] = device_stride
-                    tile_advance_expr = host_advance_expr.subs(subs)
+                        full_tiled_extent[it_space_keys[extent_it_idx]] = int(
+                            layout.size[host_idx]
+                        )
 
             # For reduction dims: offset is the number of non-unit output-dim ranges.
             n_output_it_syms = sum(
@@ -731,6 +764,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
             tile_advance_expr=tile_advance_expr,
+            full_tiled_extent=full_tiled_extent,
             debug_handle=debug_handle,
         )
 
@@ -1131,6 +1165,15 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 if op_spec.tile_advance_expr is not None:
                     buf.writeline(
                         f"tile_advance_expr={sympy_str(op_spec.tile_advance_expr)},"
+                    )
+                if op_spec.full_tiled_extent:
+                    buf.writeline(
+                        "full_tiled_extent={"
+                        + ", ".join(
+                            sympy_str(k) + ": " + str(v)
+                            for k, v in op_spec.full_tiled_extent.items()
+                        )
+                        + "},"
                     )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
