@@ -1362,6 +1362,24 @@ def propagate_spyre_tensor_layouts(
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
                 target_stl = _target_device_layout(target, target_name)
                 if target_stl is None:
+                    if not isinstance(target_buf, SpyreEmptyFallback):
+                        # op gets no .layouts/.restick_cost_fn at all; any
+                        # downstream consumer that requires them (e.g.
+                        # optimize_restickify.py's hasattr(op,
+                        # "restick_cost_fn") asserts) will fail loudly, but
+                        # not with this root cause visible -- warn here so
+                        # that failure is traceable back to this skip.
+                        logger.warning(
+                            "MutationLayoutSHOULDREMOVE target_stl=None, "
+                            "skipping layout assignment: op=%s target_name=%r "
+                            "buf_type=%s",
+                            op.get_operation_name(),
+                            target_name,
+                            type(target_buf).__name__,
+                        )
+                        continue
+                    # SpyreEmptyFallback accumulator has no device layout yet
+                    # -- expected, not exceptional; handled just below.
                     logger.debug(
                         "MutationLayoutSHOULDREMOVE target_stl=None: "
                         "op=%s target_name=%r buf_type=%s",
@@ -1369,8 +1387,6 @@ def propagate_spyre_tensor_layouts(
                         target_name,
                         type(target_buf).__name__,
                     )
-                    if not isinstance(target_buf, SpyreEmptyFallback):
-                        continue
                     # SpyreEmptyFallback accumulator has no device layout yet.
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the "new value" inputs

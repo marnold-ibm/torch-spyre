@@ -1787,6 +1787,16 @@ def _seed_buffer_for_carry(
         )
     ]
     if len(external_candidates) != 1:
+        logger.warning(
+            "_seed_buffer_for_carry: ambiguous carry detection for seed %s "
+            "(closure=%s) — found %d externally-fed closure members, "
+            "expected exactly 1; treating %s as not a carry step. See "
+            "_seed_buffer_for_carry's docstring, point 3.",
+            seed_name,
+            sorted(closure),
+            len(external_candidates),
+            op.get_name(),
+        )
         return None
 
     return seed_buf if external_candidates[0] == op.get_name() else None
@@ -3151,12 +3161,12 @@ def _replace_constant_fill_predecessors(
          with the same constant value but with the hinted dimension already
          divided by split_count.
       2. Insert the new tile-sized fill immediately before the tiling group in
-         operations (outside the loop — no loop_info stamped).
+         operations, stamped with loop_info (empty loop_tiled_dims) so
+         build_loop_scheduler_nodes places it inside the loop group.
 
     The tile-sized fill is a loop-invariant constant: its value is identical
     across all iterations, so creating it once and reading it every iteration
-    is semantically equivalent to slicing a per-iteration fill.  Because it
-    sits outside the loop it is also a candidate for LX scratchpad allocation.
+    is semantically equivalent to slicing a per-iteration fill.
 
     Returns a name_map {old_fill_name: new_tile_fill_name} for the caller to
     apply via _apply_fill_name_swap after _stamp_group has run (so that
