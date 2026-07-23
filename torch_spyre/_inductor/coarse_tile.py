@@ -2419,6 +2419,10 @@ def _insert_copy_op(
     # Stamp with the same loop metadata so this op is inside the same loop.
     copy_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
 
+    # Mark full_buf so stickification assigns a full-buffer STL rather than
+    # the per-tile STL it would infer from copy_buf's tile-sized inputs.
+    full_buf._pool_layout_fixed = True  # type: ignore[attr-defined]
+
     V.graph.name_to_buffer[copy_name] = copy_buf
 
     tiled_idx = operations.index(tiled_op)
