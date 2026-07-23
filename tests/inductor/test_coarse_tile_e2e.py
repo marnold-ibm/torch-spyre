@@ -860,6 +860,53 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
+    def test_spyre_empty_accumulator_layout_bug(self):
+        """Minimal reproducer for the SpyreEmptyFallback / ct_fill STL bug.
+
+        Bug: _all_constant_layouts offered dims with size < elems_per_stick as
+        stick candidates, producing invalid STLs (e.g. device_size=[2,...] with
+        stick stride 8192 gives stick expr 2*d0 for a per-tile dep).  The fix
+        is to filter stick candidates to dims whose size is a multiple of 64.
+
+        Model: output [B,H,Lq,D] accumulates a scaled reduction across H*Lq
+        tiles.  Each tile adds x_tile.amax(dim=-1).unsqueeze(-1) * scale_tile
+        into its slice of output.  With H:4, Lq:2 the per-tile shape is
+        [1,2,128,64], reproducing the problematic ct_fill shape.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, D = 1, 8, 256, 64
+        lq_slices = Lq // 128
+
+        x_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        scale_t = torch.randn(B, H, Lq, 1, dtype=torch.float16)
+        # acc is a real graph input (not zeros_like) so there is no ct_fill
+        # zeroing the tile each iteration — each tile genuinely accumulates.
+        acc_t = torch.zeros(B, H, Lq, D, dtype=torch.float16)
+
+        def fn(x, scale, acc):
+            with spyre_hint(num_tiles_per_dim={"H": 4}):
+                with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                    block_max = torch.amax(x, dim=-1, keepdim=True)
+                    acc.copy_(acc + block_max * scale)
+            return acc
+
+        ref = fn(x_t, scale_t, acc_t.clone())
+
+        x_dev = x_t.to("spyre")
+        scale_dev = scale_t.to("spyre")
+        acc_dev = acc_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(scale_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(acc_dev, ["B", "H", "Lq", "D"])
+
+        result = torch.compile(fn)(x_dev, scale_dev, acc_dev).cpu()
+        torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
+
     @config.patch(
         {
             "lx_planning": True,
