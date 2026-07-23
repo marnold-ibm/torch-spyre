@@ -61,7 +61,6 @@ from .propagate_layouts import (
     propagate_spyre_tensor_layouts,
 )
 from .optimize_restickify import optimize_restickify_locations
-from .resolve_join_clusters import resolve_join_clusters
 from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
@@ -403,7 +402,6 @@ class CustomPreSchedulingPasses:
             split_multi_ops,
             propagate_spyre_tensor_layouts,
             validate_ops,
-            resolve_join_clusters,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,

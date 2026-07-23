@@ -829,7 +829,6 @@ self.passes = [
     split_multi_ops,
     propagate_spyre_tensor_layouts,
     validate_ops,
-    resolve_join_clusters,
     optimize_restickify_locations,
     finalize_layouts,
     insert_restickify,
@@ -872,15 +871,6 @@ hardware memory budget, detected independently of hints) stays in the old
 post-stickification slot below, because span arithmetic needs
 `FixedTiledLayout.device_layout` (device size, stride map), which does not
 exist yet pre-stickification.
-
-**`resolve_join_clusters` must run before `optimize_restickify_locations`.**
-Per-op-local, greedy restickify placement cannot jointly optimize sibling
-ops that feed a shared multi-input `AllSameNode` join (e.g. both operands of
-a `torch.maximum`) — placing one sibling's restickify greedily can foreclose
-a jointly-better placement for the other. `resolve_join_clusters` searches
-the joint candidate space for clustered siblings first, so
-`optimize_restickify_locations`'s later per-op placement only has to handle
-what joint resolution didn't already fix.
 
 **Must run after stickify and padding.**  `propagate_spyre_tensor_layouts`,
 `insert_restickify`, and `insert_bmm_padding` establish the final tiled
@@ -1318,12 +1308,17 @@ op in the seed's closure (found via `max(..., key=operations.index)`),
 since sibling closure members like `correction` still need to run inside
 the same inner-loop iteration after the terminal op's write.
 
-**Connection to `resolve_join_clusters`.** A closure with multiple external
-members feeding a shared multi-input `AllSameNode` join (e.g. flash-
-attention's `M = torch.maximum(M, block_max)` join) is exactly the shape
-`resolve_join_clusters` was introduced to optimize jointly — per-op-local
-greedy restickify placement cannot see that two sibling ops' candidate
-layouts should be chosen together. See
+**Joint layout choices for closure members.** A closure with multiple
+external members feeding a shared multi-input `AllSameNode` join (e.g.
+flash-attention's `M = torch.maximum(M, block_max)` join) needs its
+siblings' candidate layouts chosen together, not independently — a
+per-op-local, greedy choice for one sibling can foreclose a jointly-better
+choice for the other. `optimize_restickify_locations`'s beam search
+(`beam_global_min_cost`) now searches this joint space directly, carrying
+multiple candidate assignments forward across ops rather than committing
+each op's placement in isolation; a prior, narrower join-conflict pre-pass
+that special-cased this specific shape was removed once the beam search
+covered it. See
 [Groups derivation and placement in `CustomPreSchedulingPasses`](#groups-derivation-and-placement-in-custompreschedulingpasses)
 for where that pass runs relative to coarse tiling.
 
