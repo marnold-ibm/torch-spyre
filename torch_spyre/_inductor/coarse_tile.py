@@ -89,7 +89,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .constants import BATCH_MATMUL_OP
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
-from .loop_info import CoarseTileInfo
+from .loop_info import CoarseTileInfo, copy_op_metadata
 from .propagate_hints import DimHint
 from .pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from .span_overflow_hint_analysis import (
@@ -2015,6 +2015,7 @@ def _propagate_carry_op(
         )
         copy_in_buf.origins = op.origins
         copy_in_buf.operation_name = copy_in_name
+        copy_op_metadata(op, copy_in_buf)
         copy_in_buf.loop_info = outer_loop_info  # type: ignore[attr-defined]
         V.graph.name_to_buffer[copy_in_name] = copy_in_buf
 
@@ -2091,6 +2092,7 @@ def _propagate_carry_op(
             )
             carry_prev_copy.origins = op.origins
             carry_prev_copy.operation_name = carry_prev_name
+            copy_op_metadata(op, carry_prev_copy)
             carry_prev_copy.loop_info = op_loop_info  # type: ignore[attr-defined]
             V.graph.name_to_buffer[carry_prev_name] = carry_prev_copy
             operations.insert(operations.index(op), carry_prev_copy)
@@ -2506,6 +2508,7 @@ def _insert_read_view_ops(
         view_buf = ComputedBuffer(name=view_name, layout=view_layout, data=view_data)
         view_buf.origins = tiled_op.origins
         view_buf.operation_name = view_name
+        copy_op_metadata(tiled_op, view_buf)
         view_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
 
         V.graph.name_to_buffer[view_name] = view_buf
@@ -3329,6 +3332,12 @@ def _replace_constant_fill_predecessors(
             )
             fill_buf.origins = buf.origins
             fill_buf.operation_name = fill_name
+            # buf (the old, untiled fill) has no dim_hints by construction --
+            # that's the whole reason this function exists (see docstring).
+            # Copy dim_hints from op (the tiled consumer) instead, so
+            # propagate_named_dims doesn't fall back to _untracked_* for this
+            # buffer.
+            copy_op_metadata(op, fill_buf)
             # Stamp loop_info so the fill is placed inside the loop group by
             # build_loop_scheduler_nodes, with empty loop_tiled_dims (loop-
             # invariant: executed once per loop body but no range is divided).
