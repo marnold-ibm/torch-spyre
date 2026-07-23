@@ -26,6 +26,7 @@ from torch._inductor.codegen.common import (
     Kernel,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
@@ -610,7 +611,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
-        dim_advance_overrides: list[dict[sympy.Symbol, tuple[int, int]]] = []
+        tile_advance_expr: "sympy.Expr | None" = None
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -627,28 +628,39 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Fallback: identity mapping (no unit-size dims to skip).
                 host_to_it = {i: i for i in range(len(it_space_keys))}
 
-            # Translate _coarse_tile_dim_advance (host-range-index keyed, one
-            # dict per nesting level outermost-first, see
-            # coarse_tile._propagate_tiled_op's Case 2 branch) into the
-            # iteration-space symbol space via the same host_to_it map used
-            # for tiled_syms above, so generate_sdsc can use these per-level
-            # facts directly instead of its flat, level-blind stride lookup,
-            # which cannot otherwise carry per-level advances for a host dim
-            # tiled at more than one nesting level. Kept outermost-first
-            # (NOT reversed, unlike tiled_syms above) to match
-            # loop_info.loop_tiled_dims/loop_count ordering.
-            dim_advance = getattr(ir_node, "_coarse_tile_dim_advance", None)
-            if dim_advance is not None:
-                for level_advance in dim_advance:
-                    level_overrides: dict[sympy.Symbol, tuple[int, int]] = {}
-                    for host_idx, (tile_size, supertile_count) in level_advance.items():
-                        mapped = host_to_it.get(host_idx)
-                        if mapped is not None and mapped < len(it_space_keys):
-                            level_overrides[it_space_keys[mapped]] = (
-                                tile_size,
-                                supertile_count,
-                            )
-                    dim_advance_overrides.append(level_overrides)
+            # Substitute host strides for device strides in
+            # _coarse_tile_advance_expr (host-stride terms, stamped by
+            # coarse_tile._propagate_tiled_op's Case 2 branch), producing
+            # OpSpec.tile_advance_expr (device-stride terms). This is the
+            # one place both the host-stride expression and the op's
+            # committed device layout are available at once: unwrap
+            # MutationLayoutSHOULDREMOVE the same way
+            # work_division._resolve_layout does to reach the real
+            # FixedTiledLayout, then substitute each level's host stride
+            # coefficient for the corresponding device stride. The
+            # expression's free symbols (_ct_lvl0, _ct_lvl1, ...) are
+            # per-level placeholders, not host Symbols -- coarse_tile.py
+            # never had access to iteration-space Symbols, only host dim
+            # indices, so there is no host_to_it-style remapping needed
+            # here; only the coefficients change.
+            host_advance_expr = getattr(ir_node, "_coarse_tile_advance_expr", None)
+            if host_advance_expr is not None:
+                layout = ir_node.get_layout()
+                if isinstance(layout, MutationLayoutSHOULDREMOVE):
+                    layout = layout.real_layout()
+                if isinstance(layout, FixedTiledLayout):
+                    li_dims = raw_tiled_dims
+                    subs: dict[sympy.Symbol, int] = {}
+                    for lvl in range(len(li_dims)):
+                        lvl_sym = sympy.Symbol(f"_ct_lvl{lvl}")
+                        if lvl_sym not in host_advance_expr.free_symbols:
+                            continue
+                        dims_at_lvl = li_dims[lvl] if lvl < len(li_dims) else []
+                        if not dims_at_lvl:
+                            continue
+                        device_stride = sum(int(layout.stride[d]) for d in dims_at_lvl)
+                        subs[lvl_sym] = device_stride
+                    tile_advance_expr = host_advance_expr.subs(subs)
 
             # For reduction dims: offset is the number of non-unit output-dim ranges.
             n_output_it_syms = sum(
@@ -718,7 +730,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
-            dim_advance_overrides=dim_advance_overrides,
+            tile_advance_expr=tile_advance_expr,
             debug_handle=debug_handle,
         )
 
@@ -1116,19 +1128,9 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
-                if op_spec.dim_advance_overrides:
+                if op_spec.tile_advance_expr is not None:
                     buf.writeline(
-                        "dim_advance_overrides=["
-                        + ", ".join(
-                            "{"
-                            + ", ".join(
-                                f"{sympy_str(sym)}: {v!r}"
-                                for sym, v in level_overrides.items()
-                            )
-                            + "}"
-                            for level_overrides in op_spec.dim_advance_overrides
-                        )
-                        + "],"
+                        f"tile_advance_expr={sympy_str(op_spec.tile_advance_expr)},"
                     )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
