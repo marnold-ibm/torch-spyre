@@ -1504,7 +1504,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         ever sees them (see docs/source/compiler/coarse_tiling_loops.md's
         note on `_get_device_dim_order`'s stick-dim placement, and the
         divergent-stick-dim case being a separate, pre-existing,
-        out-of-scope gap -- confirmed by direct repro, not exercised here).
+        out-of-scope gap -- confirmed by direct repro, not exercised here;
+        tracked as https://github.com/torch-spyre/torch-spyre/issues/3332).
         Nesting num_tiles_per_dim={"Lq": 2} outer / {"B": 2} inner tiles two
         non-stick dims, each with a distinct per-arg device_coordinates walk.
         """

@@ -1561,6 +1561,7 @@ class OpSpec:
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = field(default_factory=list)
     symbolic_dim_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
+    debug_handle: DebugHandle | None = None
 
 @dataclasses.dataclass
 class TensorArg:
