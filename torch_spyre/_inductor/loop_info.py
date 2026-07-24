@@ -79,7 +79,7 @@ _SPYRE_METADATA_ATTRS = (
     # Host-stride sympy.Expr for a Case 2 (MutationLayoutSHOULDREMOVE) op's
     # coarse-tiled dims' per-iteration base-address advance; set by
     # coarse_tile._propagate_tiled_op, read by spyre_kernel.create_op_spec to
-    # drive OpSpec.tile_advance_expr.
+    # drive each arg's own TensorArg.tile_advance_expr.
     "_coarse_tile_advance_expr",
 )
 

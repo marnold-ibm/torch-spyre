@@ -1434,7 +1434,8 @@ def _propagate_tiled_op(
         # op's device_coordinates (see coarse_tiling_loops.md's IR-rewiring
         # appendix and issue tracking the ct_test_1.py wrong-result bug).
         # Stamp it now, while loop_info/full_ranges are in scope, so
-        # create_op_spec can carry it into OpSpec.tile_advance_expr.
+        # create_op_spec can carry it into each arg's own
+        # TensorArg.tile_advance_expr.
         #
         # A single sympy.Expr, one term per nesting level that tiles a host
         # dim, summed. Free symbols are per-level placeholders (_ct_lvl0,

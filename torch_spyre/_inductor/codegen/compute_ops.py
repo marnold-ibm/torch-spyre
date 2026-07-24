@@ -429,7 +429,7 @@ def _level_stride_from_expr(expr, level_idx: int) -> int | None:
 
     ``expr`` is a sympy.Expr with one term per nesting level,
     ``Symbol(f"_ct_lvl{lvl}") * device_stride`` summed (see
-    ``OpSpec.tile_advance_expr``). Returns ``None`` when ``expr`` is
+    ``TensorArg.tile_advance_expr``). Returns ``None`` when ``expr`` is
     ``None`` or has no term for ``level_idx`` (that level is not part of
     this op's coarse-tiled advance).
     """

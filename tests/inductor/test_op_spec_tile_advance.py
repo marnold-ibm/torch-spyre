@@ -11,35 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit test for OpSpec.tile_advance_expr's default and shape."""
+"""Unit test for TensorArg.tile_advance_expr's default and shape."""
 
 import sympy
 
-from torch_spyre._inductor.op_spec import OpSpec
+from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 
-def _minimal_op_spec(**kwargs):
-    return OpSpec(
-        op="add",
-        is_reduction=False,
-        iteration_space={},
-        args=[],
-        op_info={},
+def _minimal_tensor_arg(**kwargs):
+    return TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=None,
+        device_size=[],
+        device_coordinates=[],
+        allocation=None,
         **kwargs,
     )
 
 
 def test_tile_advance_expr_defaults_to_none():
-    spec = _minimal_op_spec()
-    assert spec.tile_advance_expr is None
+    arg = _minimal_tensor_arg()
+    assert arg.tile_advance_expr is None
 
 
 def test_tile_advance_expr_accepts_sympy_expr():
     expr = sympy.Symbol("_ct_lvl0") * 128
-    spec = _minimal_op_spec(tile_advance_expr=expr)
-    assert spec.tile_advance_expr == expr
+    arg = _minimal_tensor_arg(tile_advance_expr=expr)
+    assert arg.tile_advance_expr == expr
 
 
 def test_dim_advance_overrides_field_removed():
-    spec = _minimal_op_spec()
-    assert not hasattr(spec, "dim_advance_overrides")
+    arg = _minimal_tensor_arg()
+    assert not hasattr(arg, "dim_advance_overrides")
+    assert not hasattr(OpSpec, "dim_advance_overrides")
