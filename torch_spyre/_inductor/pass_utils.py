@@ -38,12 +38,8 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
-from .codegen.superdsc import (
-    _get_core_to_slice_mapping,
-    _k_fast_core_to_slice_mapping,
-    _should_use_k_fast_mapping,
-)
-from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
+from .core_mapping import core_to_slice_mapping
+from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -1362,12 +1358,12 @@ def _is_matmul_op(op: Operation) -> bool:
     return (
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == BATCH_MATMUL_OP
+        and op.data.reduction_type in MATMUL_REDUCTION_OPS
     )
 
 
-# TODO: refactor core assignment so the LX planner consumes determined
-# assignments instead of re-deriving them here.
+# TODO: Select and store the core mapping before LX planning, then pass the
+# winning mapping to codegen.
 class _ViewPrep(NamedTuple):
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.
@@ -1578,16 +1574,23 @@ def _per_core_view_from_prep(
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
 
-    # Step 3: build the core→slot mapping using the same gate codegen uses
-    # (_should_use_k_fast_mapping), so K-fast matmul ops compare under the
-    # K-cohort-adjacent ordering they will actually emit.
+    # Step 4: model the same physical ownership SDSC will emit. LX compatibility
+    # requires producer and consumer to assign each slice to the same physical
+    # core; matching split factors alone is insufficient.
     num_cores = int(math.prod(per_sym.values()))
-    is_matmul = prep.is_matmul
-    if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
-        _mapping_func = _k_fast_core_to_slice_mapping
-    else:
-        _mapping_func = _get_core_to_slice_mapping
-    core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
+    iter_symbols = tuple(iter_space)
+    dim_splits = tuple(int(per_sym[sym]) for sym in iter_symbols)
+    contiguous_dim = (
+        len(dim_splits) - 1
+        if prep.is_matmul and config.core_id_k_fast_emission
+        else None
+    )
+    core_to_slot_by_name = core_to_slice_mapping(
+        iter_symbols,
+        dim_splits,
+        num_cores,
+        contiguous_dim=contiguous_dim,
+    )
     # Re-key by the buffer's device-dim index (canonical) instead of the op's
     # iter symbol name. Two ops with the same per-core slicing on this buffer
     # compare equal even if they name their iter axes differently.
