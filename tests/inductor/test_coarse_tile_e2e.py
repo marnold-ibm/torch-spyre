@@ -1484,35 +1484,57 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
-        """Case 3 nested coarse-tiling where an input's device layout diverges
-        from the output's -- exercises per-arg tile_advance_expr (each arg
-        must compute its own device-byte-stride, not share the output's).
+        """Case 3 nested coarse-tiling where `a`'s device layout genuinely
+        diverges from `b`'s -- exercises per-arg tile_advance_expr (each arg
+        must compute its own device-byte-stride/device_coordinates, not
+        share the output's).
 
-        Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
-        but `b` is built by transposing a [D, Lq]-shaped tensor twice before
-        entering the compiled region, so its device layout's dim_order can
-        diverge from the output's while its logical [Lq, D] shape and named
-        dims stay the same.
+        Uses a 3-D [B, Lq, D] shape (unlike
+        test_hint_nested_tiling_copy_mutation_correct's 2-D [Lq, D]) so the
+        divergence can be constructed with an explicit ``SpyreTensorLayout``
+        ``dim_order`` swap on two *non-stick* dims (B and Lq): `a` gets
+        dim_order [1, 0, 2] (Lq outermost, B next, D -- last -- still the
+        stick dim) while `b`/`c` keep the default [0, 1, 2] (B outermost, Lq
+        next, D the stick dim). Both tensors still end with D as the stick
+        dimension, so no restickify is inserted to normalize the mismatch
+        away before the coarse-tiled `add` runs -- unlike a 2-D [Lq, D]
+        tensor, where any dim_order divergence necessarily swaps the stick
+        dim itself and pointwise-op restickify insertion collapses the two
+        inputs onto one shared layout before coarse-tiling's per-arg logic
+        ever sees them (see docs/source/compiler/coarse_tiling_loops.md's
+        note on `_get_device_dim_order`'s stick-dim placement, and the
+        divergent-stick-dim case being a separate, pre-existing,
+        out-of-scope gap -- confirmed by direct repro, not exercised here).
+        Nesting num_tiles_per_dim={"Lq": 2} outer / {"B": 2} inner tiles two
+        non-stick dims, each with a distinct per-arg device_coordinates walk.
         """
+        from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor import spyre_hint
 
-        Lq, D = 256, 128
-        a = torch.randn(Lq, D, dtype=torch.float16)
-        b = torch.randn(D, Lq, dtype=torch.float16).transpose(0, 1).contiguous()
+        B, Lq, D = 4, 256, 128
+        a = torch.randn(B, Lq, D, dtype=torch.float16)
+        b = torch.randn(B, Lq, D, dtype=torch.float16)
 
+        _declare_tensor_dim("B", B)
         _declare_tensor_dim("Lq", Lq)
         _declare_tensor_dim("D", D)
 
+        a_stl = SpyreTensorLayout(a.size(), a.stride(), torch.float16, [1, 0, 2])
+        _ = a.to("spyre")  # required for lazy device initialization
+        a_dev = a.to(device_layout=a_stl)
+        b_dev = b.to("spyre")
+
         def fn(a, b):
-            _name_tensor_dims(a, ["Lq", "D"])
-            _name_tensor_dims(b, ["Lq", "D"])
-            c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
+            _name_tensor_dims(a, ["B", "Lq", "D"])
+            _name_tensor_dims(b, ["B", "Lq", "D"])
+            c = torch.full((B, Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-                with spyre_hint(num_tiles_per_dim={"D": 2}):
+                with spyre_hint(num_tiles_per_dim={"B": 2}):
                     c.copy_(a + b)
             return c
 
-        compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
+        spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
+        compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
 
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,

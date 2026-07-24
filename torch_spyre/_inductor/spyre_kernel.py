@@ -614,6 +614,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             # substituting, so the two nested loop variables' units agree.
             sym_index_coeff = index.coeff(sym)
             if not sym_index_coeff:
+                # sym.coeff(sym) == 0 is the expected, legitimate case when
+                # sym does not appear in this tensor's index at all (e.g. a
+                # broadcast arg that doesn't depend on this level's loop
+                # variable). It is *not* a reliable signal when sym appears
+                # non-linearly (e.g. wrapped in a Mod/floor): index.coeff(sym)
+                # can silently return 0 even though sym is genuinely a free
+                # symbol of index. Distinguish the two: only the "sym not
+                # present at all" case is safe to silently skip.
+                if sym in index.free_symbols:
+                    raise ValueError(
+                        f"{sym} appears non-linearly in this tensor's host "
+                        f"index {index!r} (index.coeff({sym}) == 0 despite "
+                        f"{sym} being a free symbol) -- per-arg tile advance "
+                        f"cannot be computed for this arg/level."
+                    )
                 continue
             sym_step = sympy.nsimplify(host_stride) / sym_index_coeff
             elem_delta = sympy.simplify(
@@ -626,6 +641,15 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # arg's own layout). No well-defined single byte_stride
                 # exists; skip this level for this arg.
                 continue
+            if not elem_delta.is_Integer:
+                raise ValueError(
+                    f"Per-arg tile advance for level {lvl} (sym={sym}) "
+                    f"computed a non-integer element delta {elem_delta} "
+                    f"(sym_step={sym_step}, host_stride={host_stride}, "
+                    f"sym_index_coeff={sym_index_coeff}) -- this indicates "
+                    f"host_stride does not evenly divide by this tensor's "
+                    f"own index coefficient for {sym}."
+                )
             elem_delta = int(elem_delta)
             byte_stride = elem_delta * elem_bytes
             if byte_stride == 0:
