@@ -29,8 +29,8 @@ happens to produce. Three known cases where non-stick ordering matters:
   (Exact rules TBD pending discussion with team.)
 
 - **Gather**: the indirect-access dimension must be the outermost device
-  dimension on the input. If it is not, a restickify is required before the
-  gather op, at the same cost as any other restickify.
+  dimension on the input. If it is not, a copy is required before the
+  gather op.
 
 - **Scatter**: the indirect-access dimension must be outermost on the *output*.
   This is a producer-side hard constraint.
