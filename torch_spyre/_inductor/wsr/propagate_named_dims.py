@@ -63,10 +63,6 @@ def reset():
     _enabled = False
 
 
-def declare_tensor_dim(name: str, size: int) -> None:
-    """Declare a named tensor dimension and its size."""
-    _named_dims[name] = size
-
 
 def name_tensor_dims(tensor: torch.Tensor, named_dims: list[str]) -> torch.Tensor:
     """Annotate a tensor with its named dimensions: [name, ...]"""
@@ -118,25 +114,17 @@ def _untracked_name(context: str, sym, size: int) -> str:
     return name
 
 
-def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
-    """Return the prefix of remaining whose declared sizes multiply to layout_size."""
-    product = 1
-    for i, name in enumerate(remaining):
-        if name not in _named_dims:
-            raise KeyError(
-                f"Named dim '{name}' used in name_tensor_dims but not declared -- "
-                f"call declare_tensor_dim('{name}', size) before compiling"
-            )
-        product *= _named_dims[name]
-        if product == layout_size:
-            return remaining[: i + 1]
-    logger.warning(
-        f"_consume_names: no prefix of {remaining} multiplies to {layout_size}"
-    )
-    return []
+def _assign_name(name: str, size: int) -> None:
+    """Register name->size in _named_dims (first write wins)."""
+    _named_dims.setdefault(name, size)
 
 
-def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
+def compute_input_named_dims(
+    dep: MemoryDep,
+    op=None,
+    ind_sizes=None,
+    view_split: dict[str, list[str]] | None = None,
+) -> dict:
     """Map loop vars to named dim names for a single input dep."""
     dpi = _get_dim_prop_info(dep)
     buf_named_dims = dpi.named_dims if dpi is not None else None
@@ -164,10 +152,8 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             # raise here without breaking legitimate unannotated size-1 dims.
             # See test_broadcast_expand_*
             continue
-        names = _consume_names(remaining, dim_size)
-        if not names:
-            break
-        remaining = remaining[len(names) :]
+        name = remaining.pop(0)
+        _assign_name(name, dim_size)
         # Loop vars for this layout dim: symbols in the coord that are also
         # loop variables of this dep (dep.ranges.keys()), sorted by coefficient
         # descending so the outermost (largest-stride) var comes first.
@@ -177,8 +163,7 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             reverse=True,
         )
         if len(loop_vars) == 1:
-            # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
-            result.setdefault(loop_vars[0], []).extend(names)
+            result.setdefault(loop_vars[0], []).append(name)
         elif len(loop_vars) == 0:
             # This layout dim is index-selected by a gather/scatter index
             # symbol (e.g. `tmp0`).  Raise for anything else — a constant
@@ -188,40 +173,34 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
                 continue
             raise Unsupported(
                 f"{dep.name}: layout dim {i} (size {dim_size}) has no loop vars "
-                f"and no indirect index symbol in coord {coord!r} for names {names}"
+                f"and no indirect index symbol in coord {coord!r} for name {name}"
             )
-        elif len(loop_vars) > len(names):
-            # More loop vars than named dims: a reshape split this layout dim.
-            if all(n.startswith("_untracked_") for n in names):
-                # The split name is only an _untracked_ placeholder (no
-                # meaningful name to preserve, e.g. a k/v projection output
-                # reshaped into heads).  Assign fresh untracked names per loop
-                # var rather than aborting the whole pass.
+        elif len(loop_vars) > 1:
+            # More loop vars than one name: a reshape split this layout dim.
+            if name.startswith("_untracked_"):
+                # No meaningful name to preserve — assign fresh untracked names
+                # per loop var (e.g. a k/v projection output reshaped into heads).
                 for loop_var in loop_vars:
                     size = int(dep.ranges[loop_var])
                     result.setdefault(loop_var, []).append(
                         _untracked_name(dep.name, loop_var, size)
                     )
                 continue
-            # A real (meaningful) name was split — the caller must re-annotate
-            # after the reshape; we cannot guess the split.
-            raise Unsupported(
-                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars but only "
-                f"{len(names)} name(s) {names} -- reshape split a named dim, "
-                f"re-annotate after the reshape"
-            )
-        elif len(loop_vars) < len(names):
-            # Fewer loop vars than names: a size-1 declared dim was fused into
-            # this layout dim and zip would silently drop the trailing name(s).
-            raise Unsupported(
-                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop var(s) "
-                f"but {len(names)} name(s) {names} -- a declared size-1 name "
-                f"may be fused here; omit size-1 names from the annotation"
-            )
-        else:
-            # Multi-loop-var coord: match each loop var to one name by coefficient order
-            for loop_var, name in zip(loop_vars, names):
-                result.setdefault(loop_var, []).append(name)
+            split_names = (view_split or {}).get(name)
+            if split_names is None:
+                raise Unsupported(
+                    f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars for "
+                    f"name '{name}' -- use spyre_hint(view_split={{'{name}': [...]}})"
+                )
+            if len(split_names) != len(loop_vars):
+                raise Unsupported(
+                    f"{dep.name}: view_split '{name}' -> {split_names} has "
+                    f"{len(split_names)} names but {len(loop_vars)} loop vars"
+                )
+            for loop_var, split_name in zip(loop_vars, split_names):
+                size = int(dep.ranges[loop_var])
+                _assign_name(split_name, size)
+                result.setdefault(loop_var, []).append(split_name)
     return result
 
 
@@ -249,8 +228,9 @@ def get_input_named_dims(inputs: list, op=None) -> dict:
     """
     loop_var_dims: dict[sympy.Symbol, list[str]] = {}
     ind_sizes = indirect_sizes_from_op(op)
+    view_split = getattr(op, "_view_split_hint", {}) if op is not None else {}
     for inp in inputs:
-        new = compute_input_named_dims(inp, op, ind_sizes=ind_sizes)
+        new = compute_input_named_dims(inp, op, ind_sizes=ind_sizes, view_split=view_split)
         for sym, names in new.items():
             if sym not in loop_var_dims or all(
                 n.startswith("_untracked_") for n in loop_var_dims[sym]
@@ -424,11 +404,14 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
             hint = False
+            view_split_hint: dict[str, list[str]] = {}
             for hint_dict in get_op_hints(op).values():
                 if "named_dims" in hint_dict:
                     hint = True
                     named_dims = hint_dict["named_dims"]
-                    break
+                if "view_split" in hint_dict:
+                    view_split_hint.update(hint_dict["view_split"])
+            op._view_split_hint = view_split_hint  # type: ignore[attr-defined]
             if hint:
                 coords = op_out_coords(op)
                 layout_size = op.get_layout().size
@@ -447,10 +430,8 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
                 for i, (coord, dim_name) in enumerate(zip(coords, named_dims)):
                     # Register the size for every name (including size-1 dims) so
                     # downstream consumers resolve it: named_dims_for_sym filters
-                    # on `name in _named_dims`, and _consume_names raises KeyError
-                    # for an undeclared name.  setdefault preserves the
-                    # declare-once contract (a driver-side declare_tensor_dim or
-                    # an earlier op naming the same dim wins).
+                    # on `name in _named_dims`.  setdefault means the first op
+                    # to see a name wins.
                     _named_dims.setdefault(dim_name, int(layout_size[i]))
                     # A size-1 dim yields coord == 0 (sym is None): the name stays
                     # in named_dims for positional alignment and is declared

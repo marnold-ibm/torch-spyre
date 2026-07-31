@@ -51,17 +51,15 @@ B, H, Lq, Lk, D = 12, 32, 256, 256, 128
 def _run_and_capture(
     fn,
     args,
-    named_dims,
     tensor_dims,
     *,
     expected_propagated_dims=None,
     expected_dim_hints=None,
 ):
-    """Declare dims, annotate device tensors, compile, return _CaptureResult.
+    """Annotate device tensors, compile, return _CaptureResult.
 
-    named_dims: the output op's _dim_prop_info.named_dims (captured between
-        propagate_named_dims and assign_dim_hints).
-    dim_hints: the output op's dim_hints list (captured after assign_dim_hints).
+    tensor_dims: maps each input tensor to its list of named dims.
+    Sizes are inferred lazily from tensor layouts — no declare_tensor_dim needed.
 
     If expected_propagated_dims is provided, asserts result.propagated_dims matches.
     If expected_dim_hints is provided, asserts that the captured dim_hints match.
@@ -71,8 +69,6 @@ def _run_and_capture(
 
     Only the final output op is captured — same scope as named_dims.
     """
-    for name, size in named_dims.items():
-        _pnd.declare_tensor_dim(name, size)
     for tensor, dims in tensor_dims.items():
         _pnd.name_tensor_dims(tensor, dims)
 
@@ -169,7 +165,6 @@ def test_2d_add():
     _run_and_capture(
         fn,
         [x, y],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"], y: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -195,7 +190,6 @@ def test_2d_add_transposed():
     _run_and_capture(
         fn,
         [x, y],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"], y: ["N", "M"]},
         expected_dim_hints=[
             {
@@ -220,7 +214,6 @@ def test_2d_reduce_on_M():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -245,7 +238,6 @@ def test_2d_reduce_on_N():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -270,7 +262,6 @@ def test_2d_reduce_on_M_contiguous_before():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -295,7 +286,6 @@ def test_2d_reduce_on_M_contiguous_after():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -320,7 +310,6 @@ def test_2d_reduce_on_N_contiguous_before():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -345,7 +334,6 @@ def test_2d_reduce_on_N_contiguous_after():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -370,7 +358,6 @@ def test_2d_transposed_reduce_on_M():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["N", "M"]},
         expected_dim_hints=[
             {
@@ -395,7 +382,6 @@ def test_2d_transposed_reduce_on_N():
     _run_and_capture(
         fn,
         [x],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["N", "M"]},
         expected_dim_hints=[
             {
@@ -424,7 +410,6 @@ def test_no_permute():
     _run_and_capture(
         fn,
         [queries],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "H", "Lq", "D"]},
         expected_dim_hints=[
             {
@@ -450,7 +435,6 @@ def test_permute_then_contiguous():
     _run_and_capture(
         fn,
         [queries],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
         expected_dim_hints=[
             {
@@ -476,7 +460,6 @@ def test_permute_no_contiguous():
     _run_and_capture(
         fn,
         [queries, scale],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
         expected_dim_hints=[
             {
@@ -502,7 +485,6 @@ def test_contiguous_then_mul():
     _run_and_capture(
         fn,
         [queries],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
         expected_dim_hints=[
             {
@@ -536,7 +518,6 @@ def test_permute_matmul():
     _run_and_capture(
         fn,
         [queries, keys],
-        named_dims={"B": B, "H": H, "L": Lq, "D": D},
         tensor_dims={
             queries: ["B", "L", "H", "D"],
             keys: ["B", "L", "H", "D"],
@@ -553,6 +534,27 @@ def test_permute_matmul():
     )
 
 
+def test_basic_view():
+    """1-D tensor [1024] viewed into [2, 512].
+
+    x annotated ["AB"] (one name for the flat dim).
+    view_split splits "AB" into ["A", "B"] at the view call.
+    Output propagated dims should be ["A", "B"].
+    """
+    x = torch.randn(1024, dtype=torch.float16, device=DEVICE)
+
+    def fn(x):
+        with _spyre_hint(view_split={"AB": ["A", "B"]}):
+            return x.view(2, 512).exp()
+
+    _run_and_capture(
+        fn,
+        [x],
+        tensor_dims={x: ["AB"]},
+        expected_propagated_dims=["A", "B"],
+    )
+
+
 def test_view_reshape_a():
     """View/reshape with shared name for equal-size dims (A==D, both called AD).
 
@@ -561,7 +563,8 @@ def test_view_reshape_a():
     so any hint triggers an InductorError during compilation.
 
     Dims of size 2 share one name AD; all other dims are distinct.
-    w, x: [1, AD, B*AD*E] annotated ["AD", "B", "AD", "E"]
+    w, x: [1, AD, B*AD*E] annotated ["AD", "BADE"] — one name per physical dim.
+    view_split splits "BADE" into ["B", "AD", "E"] at the view call.
     y:    [1, AD, C, AD, E] annotated ["AD", "C", "AD", "E"]
     z:    [1, AD, C, 1, 1, 1] annotated ["AD", "C"]
     output shape: [1, AD, C, B, AD, E]
@@ -574,17 +577,17 @@ def test_view_reshape_a():
 
     def fn(w, x, y, z):
         t = w + x
-        t = t.view(1, ad, b, ad, e)
+        with _spyre_hint(view_split={"BADE": ["B", "AD", "E"]}):
+            t = t.view(1, ad, b, ad, e)
         t = t.unsqueeze(2) + y.unsqueeze(3)
         return t + z
 
     _run_and_capture(
         fn,
         [w, x, y, z],
-        named_dims={"AD": ad, "B": b, "C": c, "E": e},
         tensor_dims={
-            w: ["AD", "B", "AD", "E"],
-            x: ["AD", "B", "AD", "E"],
+            w: ["AD", "BADE"],
+            x: ["AD", "BADE"],
             y: ["AD", "C", "AD", "E"],
             z: ["AD", "C"],
         },
@@ -595,7 +598,8 @@ def test_view_reshape_a():
 def test_view_reshape_b():
     """View/reshape with all unique dim sizes.
 
-    w, x: [1, A, B*D*E] annotated ["A", "B", "D", "E"]
+    w, x: [1, A, B*D*E] annotated ["A", "BDE"] — one name per physical dim.
+    view_split splits "BDE" into ["B", "D", "E"] at the view call.
     y:    [1, A, C, D, E] annotated ["A", "C", "D", "E"]
     z:    [1, A, C, 1, 1, 1] annotated ["A", "C"]
     output shape: [1, A, C, B, D, E]
@@ -608,17 +612,17 @@ def test_view_reshape_b():
 
     def fn(w, x, y, z):
         t = w + x
-        t = t.view(1, a, b, d, e)
+        with _spyre_hint(view_split={"BDE": ["B", "D", "E"]}):
+            t = t.view(1, a, b, d, e)
         t = t.unsqueeze(2) + y.unsqueeze(3)
         return t + z
 
     _run_and_capture(
         fn,
         [w, x, y, z],
-        named_dims={"A": a, "B": b, "C": c, "D": d, "E": e},
         tensor_dims={
-            w: ["A", "B", "D", "E"],
-            x: ["A", "B", "D", "E"],
+            w: ["A", "BDE"],
+            x: ["A", "BDE"],
             y: ["A", "C", "D", "E"],
             z: ["A", "C"],
         },
@@ -642,7 +646,6 @@ def test_permute_exp():
     _run_and_capture(
         fn,
         [queries],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
         expected_dim_hints=[
             {
@@ -679,7 +682,6 @@ def test_permute_matmul_distinct_lqlk():
     _run_and_capture(
         fn,
         [queries, keys],
-        named_dims={"B": _B, "H": _H, "Lq": _Lq, "Lk": _Lk, "D": _D},
         tensor_dims={
             queries: ["B", "Lq", "H", "D"],
             keys: ["B", "Lk", "H", "D"],
@@ -705,7 +707,6 @@ def test_permute_mul_equal_dims():
     _run_and_capture(
         fn,
         [queries],
-        named_dims={"B": _B, "L": _L, "D": _D},
         tensor_dims={queries: ["B", "L", "L", "D"]},
         expected_propagated_dims=["B", "L", "L", "D"],
     )
@@ -730,7 +731,6 @@ def test_broadcast_unsqueeze_mul():
     _run_and_capture(
         fn,
         [x, c],
-        named_dims={"B": B, "H": H, "Lq": Lq, "Lk": Lk, "D": D},
         tensor_dims={
             c: ["B", "H", "Lk", "D"],
         },
@@ -764,7 +764,6 @@ def test_permute_matmul_equal_lqlk_distinct_names():
     _run_and_capture(
         fn,
         [queries, keys],
-        named_dims={"B": B, "H": H, "Lq": Lq, "Lk": Lk, "D": D},
         tensor_dims={
             queries: ["B", "Lq", "H", "D"],
             keys: ["B", "Lk", "H", "D"],
@@ -800,7 +799,6 @@ def test_permuted_intermediate_then_reduce():
     _run_and_capture(
         fn,
         [q],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={q: ["B", "Lq", "H", "D"]},
         expected_dim_hints=[
             {
@@ -838,7 +836,6 @@ def test_permuted_intermediate_then_pointwise():
     _run_and_capture(
         fn,
         [q, bias],
-        named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={q: ["B", "Lq", "H", "D"]},
         expected_dim_hints=[
             {
@@ -856,6 +853,9 @@ def test_view_reshape_a_distinct_names():
     """Like test_view_reshape_a but with distinct names A/D for the equal-size dims.
 
     No expected_dim_hints: same b=3 fractional coordinate limitation as test_view_reshape_a.
+
+    w, x: [1, A, B*D*E] annotated ["A", "BDE"] — one name per physical dim.
+    view_split splits "BDE" into ["B", "D", "E"] at the view call.
     """
     a, b, c, d, e = 2, 3, 4, 2, 64
     w = torch.randn(1, a, b * d * e, dtype=torch.float16, device=DEVICE) * 0.1
@@ -865,17 +865,17 @@ def test_view_reshape_a_distinct_names():
 
     def fn(w, x, y, z):
         t = w + x
-        t = t.view(1, a, b, d, e)
+        with _spyre_hint(view_split={"BDE": ["B", "D", "E"]}):
+            t = t.view(1, a, b, d, e)
         t = t.unsqueeze(2) + y.unsqueeze(3)
         return t + z
 
     _run_and_capture(
         fn,
         [w, x, y, z],
-        named_dims={"A": a, "B": b, "C": c, "D": d, "E": e},
         tensor_dims={
-            w: ["A", "B", "D", "E"],
-            x: ["A", "B", "D", "E"],
+            w: ["A", "BDE"],
+            x: ["A", "BDE"],
             y: ["A", "C", "D", "E"],
             z: ["A", "C"],
         },
@@ -888,7 +888,9 @@ def test_view_reshape_then_reduce():
 
     No expected_dim_hints: same b=3 fractional coordinate limitation as test_view_reshape_a.
 
-    w, x: [1, A, B*D*E] -> add -> view(1, A, B, D, E) -> sum(dim=-1) -> [1, A, B, D]
+    w, x: [1, A, B*D*E] annotated ["A", "BDE"] — one name per physical dim.
+    view_split splits "BDE" into ["B", "D", "E"] at the view call.
+    -> add -> view(1, A, B, D, E) -> sum(dim=-1) -> [1, A, B, D]
 
     The view intermediate has fused dims in its layout (dep.index has multi-symbol
     coords). Tests that compute_input_named_dims handles this correctly for Reduction.
@@ -899,16 +901,16 @@ def test_view_reshape_then_reduce():
 
     def fn(w, x):
         t = w + x
-        t = t.view(1, a, b, d, e)
+        with _spyre_hint(view_split={"BDE": ["B", "D", "E"]}):
+            t = t.view(1, a, b, d, e)
         return t.sum(dim=-1)
 
     _run_and_capture(
         fn,
         [w, x],
-        named_dims={"A": a, "B": b, "D": d, "E": e},
         tensor_dims={
-            w: ["A", "B", "D", "E"],
-            x: ["A", "B", "D", "E"],
+            w: ["A", "BDE"],
+            x: ["A", "BDE"],
         },
         expected_propagated_dims=["A", "B", "D"],
     )
@@ -928,7 +930,6 @@ def test_permute_mul_equal_dims_distinct_names():
     _run_and_capture(
         fn,
         [queries],
-        named_dims={"B": _B, "H": _H, "Lq": _Lq, "D": _D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
@@ -972,7 +973,6 @@ def test_reshape_split_untracked_dim_tolerated():
     _run_and_capture(
         fn,
         [x, y],
-        named_dims={"T": _T, "H": _Hh, "D": _Dd},
         tensor_dims={y: ["T", "H", "D"]},
     )
 
@@ -989,11 +989,10 @@ def test_reshape_1d_to_2d_exp():
     def fn(x):
         return x.reshape(64, 64).exp()
 
-    with pytest.raises(Exception, match="reshape split a named dim"):
+    with pytest.raises(Exception, match="use spyre_hint.view_split"):
         _run_and_capture(
             fn,
             [x],
-            named_dims={"A": _A},
             tensor_dims={x: ["A"]},
         )
 
@@ -1002,13 +1001,11 @@ def test_reshape_1d_to_2d_exp():
 
 
 def test_broadcast_expand_leading_dim():
-    """Broadcast annotation not yet supported: [1,N] annotated ["M","N"] produces _untracked_.
+    """[1,N] broadcast expanded to [M,N], added with [M,N].
 
-    The size-1 leading dim is skipped; _consume_names(["M","N"], 256) fails because
-    "M"=128 is at the front of remaining. Both loop vars fall back to _untracked_.
-    See broadcast_named_dims_fix.txt for the full fix.
-
-    loop_var is None because the broadcast path cannot identify the output loop var.
+    x annotated ["N"] — only the physical dim, not the broadcast dim.
+    y annotated ["M", "N"].
+    The pass picks up "M" from y and "N" from x; output dims are ["M", "N"].
     """
     x = torch.randn(1, _N, dtype=torch.float16, device=DEVICE)
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
@@ -1020,17 +1017,16 @@ def test_broadcast_expand_leading_dim():
     _run_and_capture(
         fn,
         [x, y],
-        named_dims={"M": _M, "N": _N},
-        tensor_dims={x: ["M", "N"]},
+        tensor_dims={x: ["N"], y: ["M", "N"]},
         expected_dim_hints=[
             {
-                "loop_var": None,
+                "loop_var": "d0",
                 "dim_names": ["M"],
                 "split_count": 2,
                 "is_reduction": False,
             },
         ],
-        expected_propagated_dims=["_untracked_128", "_untracked_256"],
+        expected_propagated_dims=["M", "N"],
     )
 
 
@@ -1052,7 +1048,6 @@ def test_broadcast_expand_trailing_dims():
     _run_and_capture(
         fn,
         [x, y],
-        named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
         expected_dim_hints=[
             {
@@ -1067,15 +1062,14 @@ def test_broadcast_expand_trailing_dims():
 
 
 def test_broadcast_expand_middle_dim():
-    """Broadcast annotation not yet supported: [B,1,D] annotated ["B","H","D"] mis-maps.
+    """[B,1,D] broadcast expanded to [B,H,D], added with [B,H,D].
+
+    x annotated ["B2", "D2"] — only the physical non-unit dims.
+    y annotated ["B2", "H2", "D2"].
+    The pass picks up "H2" from y; output dims are ["B2", "H2", "D2"].
 
     No expected_dim_hints: all dims too small to tile safely (B=4, H=32, D=64;
     split_count=2 gives tile sizes 2, 16, and 32, all below the 64-element minimum).
-
-    B is assigned correctly; the middle size-1 dim is skipped and "H" stays in
-    remaining. _consume_names(["H","D"], D2=64) fails because "H"=32 is at the
-    front. D falls back to _untracked_ as well.
-    See broadcast_named_dims_fix.txt for the full fix.
     """
     _B2, _H2, _D2 = 4, 32, 64
     x = torch.randn(_B2, 1, _D2, dtype=torch.float16, device=DEVICE)
@@ -1087,9 +1081,8 @@ def test_broadcast_expand_middle_dim():
     _run_and_capture(
         fn,
         [x, y],
-        named_dims={"B2": _B2, "H2": _H2, "D2": _D2},
-        tensor_dims={x: ["B2", "H2", "D2"]},
-        expected_propagated_dims=["B2", "_untracked_32", "_untracked_64"],
+        tensor_dims={x: ["B2", "D2"], y: ["B2", "H2", "D2"]},
+        expected_propagated_dims=["B2", "H2", "D2"],
     )
 
 
@@ -1112,7 +1105,6 @@ def test_gather_advanced_indexing_2d():
     _run_and_capture(
         fn,
         [x, i],
-        named_dims={"M": _GM, "N": _GN, "P": _GP},
         tensor_dims={x: ["M", "N"], i: ["P"]},
         expected_propagated_dims=["P", "N"],
     )
@@ -1130,7 +1122,6 @@ def test_gather_advanced_indexing_with_exp():
     _run_and_capture(
         fn,
         [x, i],
-        named_dims={"M": _GM, "N": _GN, "P": _GP},
         tensor_dims={x: ["M", "N"], i: ["P"]},
         expected_propagated_dims=["P", "N"],
     )
@@ -1148,7 +1139,6 @@ def test_gather_3d_data():
     _run_and_capture(
         fn,
         [x, i],
-        named_dims={"A": _GA, "B": _GB, "C": _GC, "P": _GP},
         tensor_dims={x: ["A", "B", "C"], i: ["P"]},
         expected_propagated_dims=["P", "B", "C"],
     )
@@ -1165,7 +1155,6 @@ def test_index_select_2d():
     _run_and_capture(
         fn,
         [x, i],
-        named_dims={"M": _GM, "N": _GN, "P": _GP},
         tensor_dims={x: ["M", "N"], i: ["P"]},
         expected_propagated_dims=["P", "N"],
     )
@@ -1183,7 +1172,6 @@ def test_gather_2d_index():
     _run_and_capture(
         fn,
         [x, i],
-        named_dims={"M": _GM, "N": _GN, "P": _GP, "Q": _GQ},
         tensor_dims={x: ["M", "N"], i: ["P", "Q"]},
         expected_propagated_dims=["P", "Q", "N"],
     )
