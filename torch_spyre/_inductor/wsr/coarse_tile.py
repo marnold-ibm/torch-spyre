@@ -3291,10 +3291,7 @@ def _is_assembly_op(op: Operation, operations: list[Operation]) -> bool:
     if loop_info is None:
         return False
 
-    try:
-        target_buf = op.layout.get_buffer()
-    except Exception:
-        return False
+    target_buf = op.layout.get_buffer()
 
     # If the target has no outside consumers it will be eliminated — nothing
     # to validate.  Accumulation targets (e.g. accum_tile) also have no
@@ -3344,13 +3341,15 @@ def _assembly_coverage(
 
 
 def validate_assembly_ops_partition_target(operations: list[Operation]) -> None:
-    """Every assembly op's iterations must partition its target buffer exactly.
+    """Check that each assembly op's total writes equal its target buffer size.
 
-    Invariant: the union of all writes across every loop iteration covers each
-    element of the target buffer exactly once — no gaps, no overlaps.
-
-    Gaps mean output elements are never written (wrong results for consumers).
-    Overlaps would mean out-of-bounds writes past the buffer end.
+    This is a count-only check: writes_per_iter × product(advancing_counts)
+    must equal the number of elements in the target buffer.  It catches the
+    case where output_tiled_dims=[] so the write pointer never advances and
+    only the first slice is written, and the symmetric case where the pointer
+    advances further than the buffer.  It does NOT detect wrong-stride writes
+    (e.g. the pointer advances but skips a region, or wraps and double-writes)
+    — those would require address-level coverage analysis.
     """
     for op in operations:
         if not _is_assembly_op(op, operations):
@@ -3367,10 +3366,10 @@ def validate_assembly_ops_partition_target(operations: list[Operation]) -> None:
             raise RuntimeError(
                 f"coarse_tile: assembly op {op.get_name()!r} does not partition "
                 f"its target buffer:\n"
-                f"  writes per iteration: {writes_per_iter}"
-                f"  ×  advancing loop counts: {advancing_counts}"
+                f"  writes per iteration: {writes_per_iter}\n"
+                f"  ×  advancing loop counts: {advancing_counts}\n"
                 f"  =  total written: {total_written}\n"
-                f"  target size: {target_elements}"
+                f"  target size: {target_elements}\n"
                 f"  (layout.size={[int(s) for s in op.layout.get_buffer().layout.size]!r})\n"
                 f"  output_tiled_dims={loop_info.output_tiled_dims!r}  "
                 f"loop_count={list(loop_info.loop_count)!r}"

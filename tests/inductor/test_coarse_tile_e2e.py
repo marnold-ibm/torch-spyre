@@ -27,7 +27,7 @@ STRUCTURED TESTS (Groups 1-10)
     Group 2: 3D tensors — [A=512, B=256, C=256], all tiling combinations
     Group 3: Pointwise op chains — abs(a+b)*c, exp(abs(...)), etc.
     Group 4: Reductions — amin over 2D (all tiling combos) and 3D (all-dims)
-    Group 5: Mixed pointwise + reduction — add_min, reduce_both, softmax
+    Group 5: Mixed pointwise + reduction — mul_min, reduce_both, softmax
     Group 6: Restickify + coarse tiling — transpose inputs with tiling
     Group 7: Copies — pre-allocated buffers, in-place accumulators, RMW
     Group 8: Tiled ops with outside consumers
@@ -1034,7 +1034,7 @@ def test_mul_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
 
 
 def test_reduce_both_dense_mul_2d_512x256_A4():
-    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 — dense*dense."""
+    """amin(a,dim=0) * amin(b,dim=0) on [512,256] tiled A÷4 — dense*dense."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1049,7 +1049,7 @@ def test_reduce_both_dense_mul_2d_512x256_A4():
 
 
 def test_reduce_both_dense_mul_2d_512x256_B4():
-    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled B÷4 — dense*dense."""
+    """amin(a,dim=0) * amin(b,dim=0) on [512,256] tiled B÷4 — dense*dense."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1064,7 +1064,7 @@ def test_reduce_both_dense_mul_2d_512x256_B4():
 
 
 def test_reduce_both_dense_mul_2d_512x256_A4_B4():
-    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 B÷4 — dense*dense."""
+    """amin(a,dim=0) * amin(b,dim=0) on [512,256] tiled A÷4 B÷4 — dense*dense."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1080,7 +1080,7 @@ def test_reduce_both_dense_mul_2d_512x256_A4_B4():
 
 
 def test_reduce_both_sparse_mul_2d_512x256_A4():
-    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled A÷4 — sparse*sparse."""
+    """amin(a,dim=1) * amin(b,dim=1) on [512,256] tiled A÷4 — sparse*sparse."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1095,7 +1095,7 @@ def test_reduce_both_sparse_mul_2d_512x256_A4():
 
 
 def test_reduce_both_sparse_mul_2d_512x256_B4():
-    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled B÷4 — sparse*sparse."""
+    """amin(a,dim=1) * amin(b,dim=1) on [512,256] tiled B÷4 — sparse*sparse."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1110,7 +1110,7 @@ def test_reduce_both_sparse_mul_2d_512x256_B4():
 
 
 def test_reduce_both_sparse_mul_2d_512x256_A4_B4():
-    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled A÷4 B÷4 — sparse*sparse."""
+    """amin(a,dim=1) * amin(b,dim=1) on [512,256] tiled A÷4 B÷4 — sparse*sparse."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1798,7 +1798,7 @@ def test_copy_after_reduction_512x256_A4_B4():
                     out.copy_(x.amin(dim=0))
         return out
 
-    run_coarse_tile_test(fn, inputs, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_copy_running_max_4d_H4_Lq4():
