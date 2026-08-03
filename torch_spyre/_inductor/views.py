@@ -35,6 +35,11 @@ def find_repeat_vars(index_exprs, var_ranges):
                 if m.has(var):
                     mods.append(m)
             if len(mods) != 1:
+                if len(mods) > 1:
+                    raise Unsupported(
+                        f"variable {var} (range {var_range}) appears in multiple Mod "
+                        f"expressions {mods} and cannot be mapped to coordinates."
+                    )
                 continue
             node = mods[0]
             base, modulus = node.args

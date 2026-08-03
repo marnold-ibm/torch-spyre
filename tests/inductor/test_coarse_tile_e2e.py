@@ -4643,8 +4643,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    # Consider deleting — superseded by Group 10 structured tests (_flash_v4_fn)
-    @pytest.mark.skip
+    @pytest.mark.skip(
+        reason="propagate_named_dims bug: view+transpose produces index with var in two Mod "
+        "expressions that compute_coordinates cannot handle. "
+        "Root cause: find_repeat_vars skips len(mods)!=1 case silently; "
+        "compute_coordinates then produces coord=0 for num_heads dim. "
+        "Error (with PR#3034 fix): variable d2 (range 8192) appears in multiple Mod "
+        "expressions [Mod((d2//256), 32), Mod(d2, 256)] and cannot be mapped to coordinates."
+    )
     def test_hint_flash_attention_v4(self):
         """This test attempts to replicate the standalone test_granite_attn.py with views
         but the flash logic is inlined rather than relying on decompositions.py
