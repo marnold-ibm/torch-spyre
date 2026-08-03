@@ -106,39 +106,6 @@ class _RetiledBufferInfo(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
-# Group validation
-# ---------------------------------------------------------------------------
-
-
-def validate_coarse_tile_groups(groups: list[tuple]) -> None:
-    """Raise RuntimeError if any hint_id appears in more than one group.
-
-    Each spyre_hint scope has a unique hint_id.  All ops sharing a hint scope
-    must be contiguous in the operation list and therefore land in a single group.
-    A hint_id appearing in two groups means ops from the same hint scope were
-    split — e.g. because an unrelated op migrated into the middle of the run —
-    producing two separate loop nests over the same hint scope that would iterate
-    different tiles in an unsynchronized fashion.
-    """
-    hint_id_to_group: dict[int, int] = {}
-    for group_idx, (group_ops, _levels) in enumerate(groups):
-        group_hint_ids: set[int] = set()
-        for op in group_ops:
-            for h in getattr(op, "dim_hints", []):
-                group_hint_ids.add(h.hint_id)
-        for hint_id in group_hint_ids:
-            prior = hint_id_to_group.get(hint_id)
-            if prior is not None:
-                raise RuntimeError(
-                    f"coarse_tile: hint_id={hint_id} appears in both group {prior} "
-                    f"and group {group_idx}. Ops from the same hint scope were split "
-                    "across two separate loop nests, which would produce unsynchronized "
-                    "tiling."
-                )
-            hint_id_to_group[hint_id] = group_idx
-
-
-# ---------------------------------------------------------------------------
 # Cache-invalidation helpers
 # ---------------------------------------------------------------------------
 
@@ -3259,3 +3226,164 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
             candidate = candidate.data
         if isinstance(candidate, ComputedBuffer) and candidate.get_name() == old_name:
             outputs[i] = new_tb
+
+
+# ---------------------------------------------------------------------------
+# Validation passes
+# ---------------------------------------------------------------------------
+
+
+def validate_coarse_tile_groups(groups: list[tuple]) -> None:
+    """Raise RuntimeError if any hint_id appears in more than one group.
+
+    Each spyre_hint scope has a unique hint_id.  All ops sharing a hint scope
+    must be contiguous in the operation list and therefore land in a single group.
+    A hint_id appearing in two groups means ops from the same hint scope were
+    split — e.g. because an unrelated op migrated into the middle of the run —
+    producing two separate loop nests over the same hint scope that would iterate
+    different tiles in an unsynchronized fashion.
+    """
+    hint_id_to_group: dict[int, int] = {}
+    for group_idx, (group_ops, _levels) in enumerate(groups):
+        group_hint_ids: set[int] = set()
+        for op in group_ops:
+            for h in getattr(op, "dim_hints", []):
+                group_hint_ids.add(h.hint_id)
+        for hint_id in group_hint_ids:
+            prior = hint_id_to_group.get(hint_id)
+            if prior is not None:
+                raise RuntimeError(
+                    f"coarse_tile: hint_id={hint_id} appears in both group {prior} "
+                    f"and group {group_idx}. Ops from the same hint scope were split "
+                    "across two separate loop nests, which would produce unsynchronized "
+                    "tiling."
+                )
+            hint_id_to_group[hint_id] = group_idx
+
+
+def _is_assembly_op(op: Operation, operations: list[Operation]) -> bool:
+    """Return True if op is an assembly op that must partition its target.
+
+    An assembly op writes a distinct slice of a full output buffer on each
+    loop iteration, so that all iterations together cover the buffer exactly
+    once.  This is distinct from an accumulation op, which overwrites the
+    same scratch slot every iteration and does not need to partition anything.
+
+    We detect assembly ops by name prefix: these are the copy ops the tiling
+    pass inserts to assemble per-tile results into full output buffers.
+    """
+    # Only coarse_tile_copy_* and coarse_tile_reduce_copy_* are assembly ops.
+    # coarse_tile_fill_* is excluded — fills are accumulation ops.
+    # Widen this filter when new assembly op types are added.
+    if not isinstance(op, ComputedBuffer):
+        return False
+    name = op.get_name()
+    if not (
+        name.startswith("coarse_tile_copy_")
+        or name.startswith("coarse_tile_reduce_copy_")
+    ):
+        return False
+
+    # Assembly ops write into a separately-allocated full buffer via mutation.
+    if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+        return False
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
+        return False
+
+    try:
+        target_buf = op.layout.get_buffer()
+    except Exception:
+        return False
+
+    # If the target has no outside consumers it will be eliminated — nothing
+    # to validate.  Accumulation targets (e.g. accum_tile) also have no
+    # outside consumers, so this check excludes them too.
+    outside_consumers, is_graph_output = _find_outside_consumers(
+        target_buf.get_name(), loop_info.loop_group_id, operations
+    )
+    return bool(outside_consumers or is_graph_output)
+
+
+def _assembly_coverage(
+    op: ComputedBuffer,
+) -> tuple[int, int, list[int]]:
+    """Compute (total_written, target_elements, advancing_counts) for an assembly op.
+
+    op.data.ranges is the per-tile iteration space (already divided by loop counts),
+    so writes_per_iter covers one loop-body execution, not the full buffer.
+
+    total_written     = writes_per_iter × product(advancing_counts)
+    target_elements   = product(target buffer size dimensions)
+    advancing_counts  = loop_count[i] for each level i where output_tiled_dims[i]
+                        is non-empty (i.e. the write pointer actually advances)
+
+    The invariant is total_written == target_elements.
+    """
+    loop_info = op.loop_info  # type: ignore[attr-defined]
+    target_buf = op.layout.get_buffer()
+
+    writes_per_iter = 1
+    for r in op.data.ranges:
+        writes_per_iter *= int(r)
+
+    advancing_counts = [
+        int(loop_info.loop_count[i])
+        for i, otd in enumerate(loop_info.output_tiled_dims)
+        if otd
+    ]
+    total_written = writes_per_iter
+    for c in advancing_counts:
+        total_written *= c
+
+    target_elements = 1
+    for s in target_buf.layout.size:
+        target_elements *= int(s)
+
+    return total_written, target_elements, advancing_counts
+
+
+def validate_assembly_ops_partition_target(operations: list[Operation]) -> None:
+    """Every assembly op's iterations must partition its target buffer exactly.
+
+    Invariant: the union of all writes across every loop iteration covers each
+    element of the target buffer exactly once — no gaps, no overlaps.
+
+    Gaps mean output elements are never written (wrong results for consumers).
+    Overlaps would mean out-of-bounds writes past the buffer end.
+    """
+    for op in operations:
+        if not _is_assembly_op(op, operations):
+            continue
+        assert isinstance(op, ComputedBuffer)
+
+        total_written, target_elements, advancing_counts = _assembly_coverage(op)
+
+        if total_written != target_elements:
+            loop_info = op.loop_info  # type: ignore[attr-defined]
+            writes_per_iter = total_written
+            for c in advancing_counts:
+                writes_per_iter //= c
+            raise RuntimeError(
+                f"coarse_tile: assembly op {op.get_name()!r} does not partition "
+                f"its target buffer:\n"
+                f"  writes per iteration: {writes_per_iter}"
+                f"  ×  advancing loop counts: {advancing_counts}"
+                f"  =  total written: {total_written}\n"
+                f"  target size: {target_elements}"
+                f"  (layout.size={[int(s) for s in op.layout.get_buffer().layout.size]!r})\n"
+                f"  output_tiled_dims={loop_info.output_tiled_dims!r}  "
+                f"loop_count={list(loop_info.loop_count)!r}"
+            )
+
+
+def validate_coarse_tiling(graph: GraphLowering) -> None:
+    """Validate invariants on the coarse-tiled IR.
+
+    Called from passes.py after each coarse_tile() invocation, once all
+    combine ops and their loop_info are in place.
+    """
+    validate_assembly_ops_partition_target(graph.operations)
+    #
+    # More validations coming here soon...
+    #

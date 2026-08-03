@@ -45,7 +45,7 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .wsr.coarse_tile import validate_coarse_tile_groups
+from .wsr.coarse_tile import validate_coarse_tile_groups, validate_coarse_tiling
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
 from .wsr.coarse_tile_hints import (
     hints_to_coarse_tile_groups,
@@ -330,6 +330,7 @@ def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
     coarse_tile(graph, groups=groups)
+    validate_coarse_tiling(graph)
 
 
 @_runs(
@@ -369,6 +370,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
     coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
+    validate_coarse_tiling(graph)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
