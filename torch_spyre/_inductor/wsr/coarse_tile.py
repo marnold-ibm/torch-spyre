@@ -2476,7 +2476,12 @@ def _insert_read_copy_ops(
             # data.ranges (what SpyreKernel._host_dim_to_index_symbol will
             # later squeeze again when it runs against copy_buf) -- i.e. the
             # squeezed position computed above, not tiled_op's raw d.
-            copy_dim = squeeze_pos[d]
+            copy_dim = squeeze_pos.get(d)
+            if copy_dim is None or copy_dim >= len(copy_ranges):
+                # Dim d is unit-sized (squeezed out) or absent from this dep
+                # (broadcast read — dep covers fewer dims than tiled_op).
+                # The copy is loop-invariant along this dim; omit it.
+                continue
             running = sympy.sympify(copy_ranges[copy_dim])
             for level_idx in reversed(levels_tiling_d):
                 read_level_extents[level_idx][copy_dim] = running
@@ -2658,6 +2663,12 @@ def _insert_combine_op(
     combine_buf.origins = tiled_op.origins
     combine_buf.operation_name = combine_name
     combine_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+    # The combine mutates accum_buf in-place (MutationLayout).  The mutation
+    # is a cross-iteration dependency invisible to the single-pass DCE the
+    # scheduler runs: the next iteration's fill reads accum_buf, but the
+    # previous iteration's combine that updated it has no visible downstream
+    # reader in the pre-unroll IR.  Mark force_live so DCE keeps it.
+    combine_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
     V.graph.name_to_buffer[combine_name] = combine_buf
 
     tiled_idx = operations.index(tiled_op)
@@ -2703,7 +2714,27 @@ def _insert_reduction_copy_op(
     )
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
-    copy_buf.loop_info = outer_loop_info  # type: ignore[attr-defined]
+
+    # output_tiled_dims must reflect that accum_full's write pointer advances
+    # at each outer output-dim level.  outer_loop_info.output_tiled_dims is []
+    # (correct for the fill op, which writes accum_tile in-place).  Build the
+    # correct per-level extents: innermost outer level uses the per-tile ranges
+    # directly; each more-outer level multiplies by the next-inner count.
+    per_tile_ranges = tiled_op.data.ranges
+    otd: list[list[tuple[int, sympy.Expr]]] = []
+    n = len(outer_loop_info.loop_tiled_dims)
+    for i, level_dims in enumerate(outer_loop_info.loop_tiled_dims):
+        level: list[tuple[int, sympy.Expr]] = []
+        for d in level_dims:
+            extent: sympy.Expr = per_tile_ranges[d]
+            # Multiply by every more-inner level's count that also tiles dim d.
+            for j in range(i + 1, n):
+                if d in outer_loop_info.loop_tiled_dims[j]:
+                    extent = extent * outer_loop_info.loop_count[j]
+            level.append((d, extent))
+        otd.append(level)
+    copy_loop_info = dataclasses.replace(outer_loop_info, output_tiled_dims=otd)
+    copy_buf.loop_info = copy_loop_info  # type: ignore[attr-defined]
     if force_live:
         copy_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
     V.graph.name_to_buffer[copy_name] = copy_buf
@@ -2725,30 +2756,74 @@ def _insert_reduction_copy_op(
 def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
     """Return the loop_info to stamp on the fill op for a nested tiled reduction.
 
-    For a flat (pure reduction) tiling the fill has no loop_info — it runs
-    once before all loops.  Returns None.
+    For a flat tiling (no output-dim levels, or all output-dim levels are inner
+    to all reduction-dim levels) the fill has no loop_info — it runs once before
+    all loops.  Returns None.
 
-    For a nested tiling where outer level(s) tile output dims and the inner
-    level tiles a reduction dim, the fill must run inside the outer loop (once
-    per outer tile) so the accumulator is per-outer-tile sized.  Returns a
+    For a nested tiling where outer level(s) tile output dims and an inner level
+    tiles a reduction dim, the fill must run inside the outer output-dim loop
+    (once per outer tile) so the accumulator is per-outer-tile sized.  Returns a
     CoarseTileInfo covering only the outer output-dim levels.
+
+    If all reduction-dim levels are outer to all output-dim levels (e.g. A-outer
+    B-inner with reduction over A), the output-dim tiling is inner and the flat
+    scheme applies: a single full-output accumulator initialized once.
     """
     loop_info = op.loop_info
     tiled_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
 
+    # Find the outermost output-dim level index and innermost reduction-dim level
+    # index.  Nested case requires an output-dim level to be outer to a reduction
+    # level (output_idx < reduction_idx).  If every reduction level is outer to
+    # every output level, the output tiling is inner → flat case.
+    output_level_indices = [
+        i for i, dims in enumerate(loop_info.loop_tiled_dims) if dims
+    ]
+    reduction_level_indices = [i for i, rdims in enumerate(tiled_rdims) if rdims]
+
+    if not output_level_indices:
+        return None  # flat: no output-dim tiling at all
+
+    outermost_output = min(output_level_indices)
+    if not reduction_level_indices or outermost_output > max(reduction_level_indices):
+        # All reduction levels are outer to all output levels → flat case.
+        return None
+
+    # Detect interleaved topology: output-dim levels appear both outer and inner
+    # to reduction-dim levels (e.g. A-output, B-reduction, C-output).  The
+    # accumulator design requires all output-dim levels to be outer to all
+    # reduction-dim levels so the fill op can run at the outermost output level
+    # and cover the full per-outer-tile accumulator.  Interleaved topologies
+    # cannot be handled; reorder the hints so output dims are outer to
+    # reduction dims (e.g. use A→C→B instead of A→B→C).
+    innermost_reduction = max(reduction_level_indices)
+    if max(output_level_indices) > innermost_reduction:
+        inner_output = [i for i in output_level_indices if i > innermost_reduction]
+        outer_output = [i for i in output_level_indices if i < innermost_reduction]
+        from torch._inductor.exc import Unsupported  # deferred to avoid circular
+
+        raise Unsupported(
+            f"coarse_tile: interleaved reduction tiling not supported — "
+            f"output-dim levels {outer_output} are outer to reduction levels "
+            f"{reduction_level_indices} but output-dim levels {inner_output} are "
+            f"inner.  Reorder spyre_hint scopes so all output dims are outer to "
+            f"all reduction dims."
+        )
+
+    # Nested: collect only the output-dim levels that are outer to a reduction level.
     outer_counts: list[sympy.Expr] = []
     outer_tiled_dims: list[list[int]] = []
     outer_tiled_rdims: list[list[int]] = []
-    for dims, rdims, count in zip(
-        loop_info.loop_tiled_dims, tiled_rdims, loop_info.loop_count
+    for i, (dims, rdims, count) in enumerate(
+        zip(loop_info.loop_tiled_dims, tiled_rdims, loop_info.loop_count)
     ):
-        if dims:  # non-empty output-dim list → this is an output-dim level
+        if dims and i < innermost_reduction:
             outer_counts.append(count)
             outer_tiled_dims.append(dims)
             outer_tiled_rdims.append([])
 
     if not outer_counts:
-        return None  # flat: fill runs before all loops
+        return None
 
     outer_gid = loop_info.loop_group_id[: len(outer_counts)]
     return CoarseTileInfo(
@@ -2865,11 +2940,14 @@ def _propagate_tiled_reduction_op(
     scalar_op.layout = FixedTiledLayout(device, dtype, [], [], scalar_stl)
     scalar_loader = TensorBox.create(scalar_op).make_loader()
 
+    # Flat case: fill_target is accum_full (full_output_ranges).
+    # Nested case: fill_target is accum_tile (per_tile_ranges).
+    fill_ranges = full_output_ranges if fill_target is accum_full else per_tile_ranges
     fill_data = Pointwise(
         device=device,
         dtype=dtype,
         inner_fn=lambda index, _loader=scalar_loader: _loader([]),
-        ranges=per_tile_ranges,
+        ranges=fill_ranges,
     )
     fill_name = V.graph.qualify_name(f"coarse_tile_fill_{op.get_name()}")
     fill_buf = ComputedBuffer(
@@ -2926,23 +3004,72 @@ def _propagate_tiled_reduction_op(
     outside_consumers, is_graph_output = _find_outside_consumers(
         buf_name, loop_group_id, operations
     )
+    # Consumers inside the same outermost loop group may need to read accum_full
+    # rather than buf0.  The safety condition differs by nesting mode:
+    #
+    # Nested (is_nested=True): reduce_copy writes accum_tile → accum_full at
+    # the outer-loop boundary, so any inside consumer running AFTER reduce_copy
+    # within the same outer-tile iteration sees the fully-accumulated value.
+    # All inside consumers are safe to redirect.
+    #
+    # Flat (is_nested=False): the combine accumulates directly into accum_full
+    # via MutationLayout inside the innermost loop body.  A consumer is safe to
+    # redirect only if it has the SAME loop_tiled_dims as the reduction op —
+    # both advance through accum_full along exactly the same dimensions, so
+    # accum_full is always fully accumulated (across whatever dimensions the
+    # outer loop adds) before the consumer reads it.  A consumer with EXTRA
+    # tiled dimensions (e.g., sub in softmax_dim0 which tiles the A dimension
+    # that the max reduction reduces over) would read a partially-accumulated
+    # accum_full mid-loop — wrong.  Those consumers are left reading buf0
+    # (per-tile scratch), which is correct because:
+    #   - For subsequent pointwise consumers (like softmax's sub→exp), the
+    #     per-tile result is numerically valid (shift invariance for softmax).
+    #   - Consumers that genuinely need the globally-accumulated value will
+    #     always have the SAME loop_tiled_dims as the reduction, since they
+    #     operate on the same output shape and tiling.
+    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{buf_name}")
+    copy_name = V.graph.qualify_name(f"coarse_tile_reduce_copy_{buf_name}")
+    outer_key = loop_group_id[0]
+    op_tiled_dims = loop_info.loop_tiled_dims
+    inside_consumers = [
+        o
+        for o in operations
+        if isinstance(o, ComputedBuffer)
+        and o.get_name() not in (combine_name, copy_name)
+        and _reads_buffer(o, buf_name)
+        and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        == outer_key
+        and (
+            is_nested
+            or getattr(getattr(o, "loop_info", None), "loop_tiled_dims", None)
+            == op_tiled_dims
+        )
+    ]
+    all_consumers = outside_consumers + inside_consumers
     accum_name = accum_full.get_name()
     retile_info = _RetiledBufferInfo(
         tuple(op.layout.stride), tuple(accum_full.layout.stride)
     )
-    _patch_consumers(outside_consumers, buf_name, accum_name, operations, retile_info)
-    if is_graph_output:
-        _patch_graph_outputs(buf_name, accum_full)
-
     logger.debug(
         "coarse_tile: tiled reduction %s → accum_full %s (fill=%s, identity=%s, "
-        "nested=%s)",
+        "nested=%s, outside_consumers=%s, inside_consumers=%s)",
         buf_name,
         accum_name,
         fill_name,
         identity,
         is_nested,
+        [o.get_name() for o in outside_consumers],
+        [
+            (
+                o.get_name(),
+                getattr(getattr(o, "loop_info", None), "loop_tiled_dims", None),
+            )
+            for o in inside_consumers
+        ],
     )
+    _patch_consumers(all_consumers, buf_name, accum_name, operations, retile_info)
+    if is_graph_output:
+        _patch_graph_outputs(buf_name, accum_full)
 
 
 # ---------------------------------------------------------------------------
@@ -3376,6 +3503,115 @@ def validate_assembly_ops_partition_target(operations: list[Operation]) -> None:
             )
 
 
+def validate_flat_reduction_accum_readers(operations: list[Operation]) -> None:
+    """Check that no inside consumer reads an accum_full buffer with finer tiling.
+
+    In the flat (non-nested) reduction case, the combine op accumulates
+    partial results into accum_full inside the innermost loop body.  An inside
+    consumer (same outermost loop group) is only safe to read accum_full if its
+    loop_tiled_dims exactly matches the combine's — both then advance through
+    accum_full along the same dimensions, so each slot is fully accumulated
+    before the consumer reads it.
+
+    A consumer with strictly finer loop_tiled_dims (extra tiled dimensions)
+    would advance into un-accumulated slots mid-loop, reading partial data.
+    This check fires if such a reader is present after _propagate_tiled_reduction_op
+    has run, i.e. if the fix (same-dims guard) was bypassed or regressed.
+
+    Detection: for each combine op, get its accum_full target; find all ops in
+    the same outermost loop group that read accum_full (excluding combine
+    itself and reduce_copy); verify their loop_tiled_dims ⊆ combine's at each
+    level.
+    """
+    # Infrastructure ops allowed to read accum_full regardless of loop_tiled_dims:
+    # - coarse_tile_combine_*:      accumulates INTO accum_full; its read of
+    #   accum_full is the combine-then-write-back pattern, always correct.
+    # - coarse_tile_reduce_copy_*:  copies accum_tile → accum_full at the outer
+    #   boundary in the nested case; not a consumer of accum_full per se.
+    # - coarse_tile_fill_*:         initialises accum_full before the loop.
+    # read_copy and copy ops inserted for USER ops are NOT excluded — if a
+    # read_copy op reading accum_full has finer loop_tiled_dims than the combine,
+    # that is the bug (the read_copy was created to serve an unsafe consumer).
+    _INFRA_PREFIXES = (
+        "coarse_tile_combine_",
+        "coarse_tile_reduce_copy_",
+        "coarse_tile_fill_",
+    )
+
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        name = op.get_name()
+        if not name.startswith("coarse_tile_combine_"):
+            continue
+        combine_loop_info = getattr(op, "loop_info", None)
+        if combine_loop_info is None:
+            continue
+        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            continue
+
+        accum_buf = op.layout.get_buffer()
+        accum_name = accum_buf.get_name()
+        combine_tiled_dims = combine_loop_info.loop_tiled_dims
+        outer_key = combine_loop_info.loop_group_id[0]
+
+        for other in operations:
+            if not isinstance(other, ComputedBuffer):
+                continue
+            other_name = other.get_name()
+            if other_name == name:
+                continue
+            if any(other_name.startswith(p) for p in _INFRA_PREFIXES):
+                continue
+            other_loop_info = getattr(other, "loop_info", None)
+            if other_loop_info is None:
+                continue
+            if other_loop_info.loop_group_id[0] != outer_key:
+                continue
+            if not _reads_buffer(other, accum_name):
+                continue
+
+            # other is a non-infrastructure inside consumer of accum_full.
+            # Its loop_tiled_dims must not be strictly finer than the combine's.
+            other_tiled_dims = other_loop_info.loop_tiled_dims
+            n = min(len(other_tiled_dims), len(combine_tiled_dims))
+            for level in range(n):
+                combine_dims_at_level = set(combine_tiled_dims[level])
+                other_dims_at_level = set(other_tiled_dims[level])
+                extra = other_dims_at_level - combine_dims_at_level
+                if extra:
+                    raise RuntimeError(
+                        f"coarse_tile: op {other_name!r} reads accum_full buffer "
+                        f"{accum_name!r} (written by combine {name!r}) from inside "
+                        f"the same outermost loop group, but has finer tiling:\n"
+                        f"  at level {level}: combine tiles {sorted(combine_dims_at_level)}, "
+                        f"reader tiles {sorted(other_dims_at_level)} "
+                        f"(extra: {sorted(extra)})\n"
+                        f"  combine loop_tiled_dims: {combine_tiled_dims}\n"
+                        f"  reader  loop_tiled_dims: {other_tiled_dims}\n"
+                        "This means the reader advances into un-accumulated slots "
+                        "mid-loop, reading partial results.  Fix: leave readers with "
+                        "extra tiled dimensions on buf0 (per-tile scratch) rather than "
+                        "redirecting them to accum_full."
+                    )
+            # Also check if reader has MORE levels than combine and those
+            # extra levels are non-empty.
+            for level in range(n, len(other_tiled_dims)):
+                extra = set(other_tiled_dims[level])
+                if extra:
+                    raise RuntimeError(
+                        f"coarse_tile: op {other_name!r} reads accum_full buffer "
+                        f"{accum_name!r} (written by combine {name!r}) from inside "
+                        f"the same outermost loop group, but has extra tiling levels:\n"
+                        f"  level {level} (beyond combine depth): "
+                        f"reader tiles {sorted(extra)}\n"
+                        f"  combine loop_tiled_dims: {combine_tiled_dims}\n"
+                        f"  reader  loop_tiled_dims: {other_tiled_dims}\n"
+                        "This means the reader advances through accum_full at a finer "
+                        "granularity than the combine writes it."
+                    )
+
+
 def validate_coarse_tiling(graph: GraphLowering) -> None:
     """Validate invariants on the coarse-tiled IR.
 
@@ -3383,6 +3619,4 @@ def validate_coarse_tiling(graph: GraphLowering) -> None:
     combine ops and their loop_info are in place.
     """
     validate_assembly_ops_partition_target(graph.operations)
-    #
-    # More validations coming here soon...
-    #
+    validate_flat_reduction_accum_readers(graph.operations)
