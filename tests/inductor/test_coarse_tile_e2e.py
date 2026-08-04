@@ -27,7 +27,7 @@ STRUCTURED TESTS (Groups 1-10)
     Group 2: 3D tensors — [A=512, B=256, C=256], all tiling combinations
     Group 3: Pointwise op chains — abs(a+b)*c, exp(abs(...)), etc.
     Group 4: Reductions — amin over 2D (all tiling combos) and 3D (all-dims)
-    Group 5: Mixed pointwise + reduction — add_min, reduce_both, softmax
+    Group 5: Mixed pointwise + reduction — mul_min, reduce_both, softmax
     Group 6: Restickify + coarse tiling — transpose inputs with tiling
     Group 7: Copies — pre-allocated buffers, in-place accumulators, RMW
     Group 8: Tiled ops with outside consumers
@@ -133,7 +133,7 @@ def run_coarse_tile_test(
     correctness=True,
     atol=None,
     rtol=None,
-    scale=0.01,
+    scale=0.1,
 ):
     """Compile fn on Spyre once, then check loopspec and/or correctness.
 
@@ -148,6 +148,7 @@ def run_coarse_tile_test(
     Always compiles exactly once, regardless of which checks are enabled.
     """
 
+    torch.manual_seed(0xC0A75E)
     cpu_tensors = [
         s.value
         if s.value is not None
@@ -715,9 +716,7 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
                 ):
                     return x.amin(dim=0)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_2d_512x256_reduce_dim1_A4():
@@ -756,12 +755,9 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                 ):
                     return x.amin(dim=1)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
 def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
     """amin over dim=0 on [512,256,256] tiled A÷4 B÷2 C÷4."""
     inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
@@ -775,12 +771,10 @@ def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     ):
                         return x.amin(dim=0)
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: inconsistent loop_count across reduction fill/combine nodes
+    run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
+@pytest.mark.skip(reason="Unsupported: interleaved reduction tiling not supported")
 def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
     """amin over dim=1 on [512,256,256] tiled A÷4 B÷2 C÷4."""
     inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
@@ -794,9 +788,7 @@ def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
                     ):
                         return x.amin(dim=1)
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: inconsistent loop_count across reduction fill/combine nodes
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
@@ -812,22 +804,20 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     ):
                         return x.amin(dim=2)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 # ---------------------------------------------------------------------------
-# Group 5: mixed pointwise + reduction — add_min, reduce_both, softmax
-# add_min: min(a + abs(amin(b))) — 2D all 3 tiling variants × 2 reduction dims,
+# Group 5: mixed pointwise + reduction — mul_min, reduce_both, softmax
+# mul_min: min(a * abs(amin(b))) — 2D all 3 tiling variants × 2 reduction dims,
 #   3D all-dims tiling × 3 reduction dims
 # reduce_both: amin(a,dim) + amin(b,dim) — dense+dense and sparse+sparse, 3 tiling variants
 # softmax: decomposes into amax+pointwise+sum+pointwise — dim0 and dim1, 3 tiling variants each
 # ---------------------------------------------------------------------------
 
 
-def test_add_min_2d_512x256_reduce_dim0_A4():
-    """min(a + abs(amin(b, dim=0))) on [512,256] tiled A÷4."""
+def test_mul_min_2d_512x256_reduce_dim0_A4():
+    """min(a * abs(amin(b, dim=0))) on [512,256] tiled A÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -840,13 +830,13 @@ def test_add_min_2d_512x256_reduce_dim0_A4():
             with spyre_hint(expected_named_dims=["B"]):
                 temp = torch.abs(r)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                return a + temp
+                return a * temp
 
     run_coarse_tile_test(fn, inputs)
 
 
-def test_add_min_2d_512x256_reduce_dim0_B4():
-    """min(a + abs(amin(b, dim=0))) on [512,256] tiled B÷4."""
+def test_mul_min_2d_512x256_reduce_dim0_B4():
+    """min(a * abs(amin(b, dim=0))) on [512,256] tiled B÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -859,13 +849,13 @@ def test_add_min_2d_512x256_reduce_dim0_B4():
             with spyre_hint(expected_named_dims=["B"]):
                 temp = torch.abs(r)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                return a + temp
+                return a * temp
 
     run_coarse_tile_test(fn, inputs)
 
 
-def test_add_min_2d_512x256_reduce_dim0_A4_B4():
-    """min(a + abs(amin(b, dim=0))) on [512,256] tiled A÷4 B÷4."""
+def test_mul_min_2d_512x256_reduce_dim0_A4_B4():
+    """min(a * abs(amin(b, dim=0))) on [512,256] tiled A÷4 B÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -881,13 +871,13 @@ def test_add_min_2d_512x256_reduce_dim0_A4_B4():
                 with spyre_hint(expected_named_dims=["B"]):
                     temp = torch.abs(r)
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    return a + temp
+                    return a * temp
 
     run_coarse_tile_test(fn, inputs)
 
 
-def test_add_min_2d_512x256_reduce_dim1_A4():
-    """min(a + abs(amin(b, dim=1))) on [512,256] tiled A÷4."""
+def test_mul_min_2d_512x256_reduce_dim1_A4():
+    """min(a * abs(amin(b, dim=1))) on [512,256] tiled A÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -900,13 +890,13 @@ def test_add_min_2d_512x256_reduce_dim1_A4():
             with spyre_hint(expected_named_dims=["A"]):
                 temp = torch.abs(r)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                return a + temp
+                return a * temp
 
     run_coarse_tile_test(fn, inputs)
 
 
-def test_add_min_2d_512x256_reduce_dim1_B4():
-    """min(a + abs(amin(b, dim=1))) on [512,256] tiled B÷4."""
+def test_mul_min_2d_512x256_reduce_dim1_B4():
+    """min(a * abs(amin(b, dim=1))) on [512,256] tiled B÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -919,13 +909,13 @@ def test_add_min_2d_512x256_reduce_dim1_B4():
             with spyre_hint(expected_named_dims=["A"]):
                 temp = torch.abs(r)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                return a + temp
+                return a * temp
 
     run_coarse_tile_test(fn, inputs)
 
 
-def test_add_min_2d_512x256_reduce_dim1_A4_B4():
-    """min(a + abs(amin(b, dim=1))) on [512,256] tiled A÷4 B÷4."""
+def test_mul_min_2d_512x256_reduce_dim1_A4_B4():
+    """min(a * abs(amin(b, dim=1))) on [512,256] tiled A÷4 B÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -941,14 +931,14 @@ def test_add_min_2d_512x256_reduce_dim1_A4_B4():
                 with spyre_hint(expected_named_dims=["A"]):
                     temp = torch.abs(r)
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    return a + temp
+                    return a * temp
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
-def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
-    """min(a + abs(amin(b, dim=0))) on [512,256,256] tiled A÷4 B÷2 C÷4."""
+def test_mul_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
+    """min(a * abs(amin(b, dim=0))) on [512,256,256] tiled A÷4 B÷2 C÷4."""
     inputs = [
         tensor("a", shape=(512, 256, 256), dims=["A", "B", "C"]),
         tensor("b", shape=(512, 256, 256), dims=["A", "B", "C"]),
@@ -965,16 +955,14 @@ def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["B", "C"]):
                         temp = torch.abs(r)
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
-                        return a + temp
+                        return a * temp
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: mixed loop counts in 3D nested tiling + reduction
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
-def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
-    """min(a + abs(amin(b, dim=1))) on [512,256,256] tiled A÷4 B÷2 C÷4."""
+def test_mul_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
+    """min(a * abs(amin(b, dim=1))) on [512,256,256] tiled A÷4 B÷2 C÷4."""
     inputs = [
         tensor("a", shape=(512, 256, 256), dims=["A", "B", "C"]),
         tensor("b", shape=(512, 256, 256), dims=["A", "B", "C"]),
@@ -991,16 +979,14 @@ def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "C"]):
                         temp = torch.abs(r)
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
-                        return a + temp
+                        return a * temp
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: mixed loop counts in 3D nested tiling + reduction
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
-def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
-    """min(a + abs(amin(b, dim=2))) on [512,256,256] tiled A÷4 B÷2 C÷4."""
+def test_mul_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
+    """min(a * abs(amin(b, dim=2))) on [512,256,256] tiled A÷4 B÷2 C÷4."""
     inputs = [
         tensor("a", shape=(512, 256, 256), dims=["A", "B", "C"]),
         tensor("b", shape=(512, 256, 256), dims=["A", "B", "C"]),
@@ -1017,11 +1003,9 @@ def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B"]):
                         temp = torch.abs(r)
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
-                        return a + temp
+                        return a * temp
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: mixed loop counts in 3D nested tiling + reduction
+    run_coarse_tile_test(fn, inputs)
 
 
 # dense+dense: both inputs reduce over dim=0 → [B] dense outputs, then add
