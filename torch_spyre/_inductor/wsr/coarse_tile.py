@@ -2014,16 +2014,56 @@ def _insert_copy_op(
     # next-inner level's trip count (same per-level formula as
     # _planned_tile_extents_per_level's _per_level_extent_for).
     copy_ranges = list(copy_data.ranges)
+    # Map raw host dim indices to their squeezed positions (unit-sized dims dropped
+    # by extract_read_writes). write_level_extents keys must use squeezed indices
+    # because _tiled_dims_for_dep matches them against dep.index free symbols d0,d1,...
+    # which are also squeezed-indexed. Using raw d as the key causes a mismatch when
+    # any dim before d is unit-sized (e.g. B=1): raw d=2 (Lq) would collide with
+    # squeezed d=2 (D), leaving Lq unrecognized and output_tiled_dims empty.
+    squeeze_pos: dict[int, int] = {}
+    sq_it = 0
+    for host_idx, r in enumerate(tiled_op.data.ranges):
+        if int(r) != 1:
+            squeeze_pos[host_idx] = sq_it
+            sq_it += 1
     write_level_extents: list[dict[int, Expr]] = [
         {} for _ in tiled_op_info.loop_tiled_dims
     ]
     for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
+        copy_dim = squeeze_pos.get(d)
+        if copy_dim is None:
+            # Unit-sized dim — squeezed out of dep entirely, never in dep_dims.
+            continue
+        # Non-unit dims before d in the raw host layout (i.e. dims with larger
+        # strides than d) change the device stride of the tiled dim in a way
+        # _general_tile_advance / SDSC cannot currently handle.  The write-copy
+        # advance path works only when the tiled dim is the outermost non-unit
+        # dimension in the copy's ranges.
+        dims_before = [
+            int(copy_ranges[i])
+            for i in range(d)
+            if int(copy_ranges[i]) != 1
+        ]
+        if dims_before:
+            raise NotImplementedError(
+                f"coarse_tile: write-copy for {copy_name!r} tiles dim {d} "
+                f"(squeezed pos {copy_dim}) but non-unit dim(s) {dims_before!r} "
+                f"appear before it in copy_ranges="
+                f"{[int(r) for r in copy_ranges]!r}.  "
+                f"Tiling a non-outermost dimension in a write-copy op is not "
+                f"yet supported."
+            )
         levels_tiling_d = [
             i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
         ]
+        # Use copy_ranges[d] (the raw-dim tile size) as the extent, NOT
+        # copy_ranges[copy_dim]: copy_dim is the squeezed key index, but
+        # copy_ranges is indexed by raw host dim. Using copy_dim as the index
+        # would pick the wrong entry (e.g. H=8 instead of Lq=128 when d=2
+        # and B=1 is squeezed out, making copy_dim=1 point at H in the raw list).
         running = sympy.sympify(copy_ranges[d])
         for level_idx in reversed(levels_tiling_d):
-            write_level_extents[level_idx][d] = running
+            write_level_extents[level_idx][copy_dim] = running
             running = running * tiled_op_info.loop_count[level_idx]
     copy_reads = [
         dep for dep in copy_buf.get_read_writes().reads if isinstance(dep, MemoryDep)
@@ -2525,6 +2565,13 @@ def _insert_read_copy_ops(
             if copy_dim >= len(copy_ranges):
                 # Broadcast read — dep covers fewer dims than tiled_op.
                 # The copy is loop-invariant along this dim; omit it.
+                continue
+            if int(copy_ranges[copy_dim]) != int(tiled_op.data.ranges[d]):
+                # This dep's positional dim copy_dim has a different range
+                # than tiled_op's dim d — they are not the same semantic
+                # dimension (e.g. V's Lk=256 at position 1 vs tiled_op's
+                # Lq_tile=128 at position 1 when tiling Lq). The dep is
+                # loop-invariant along dim d; omit it from read_level_extents.
                 continue
             running = sympy.sympify(copy_ranges[copy_dim])
             for level_idx in reversed(levels_tiling_d):
@@ -3207,7 +3254,6 @@ def _retile_load_index_from_strides(
     rewrites: dict[Expr, Expr],
 ) -> Expr:
     """Rewrite separable affine load-index terms from full strides to tile strides."""
-
     if not rewrites:
         return index
 
@@ -3262,12 +3308,6 @@ def _retile_load_index_from_strides(
             adjusted_index += term
 
     if changed:
-        logger.debug(
-            "coarse_tile: retiled load index for %s: %s -> %s",
-            buf_name,
-            index,
-            adjusted_index,
-        )
         return sympy.simplify(adjusted_index)
     return index
 
@@ -3661,6 +3701,89 @@ def validate_flat_reduction_accum_readers(operations: list[Operation]) -> None:
                     )
 
 
+def validate_read_copy_coverage(operations: list[Operation]) -> None:
+    """Check that each read-copy op covers its source buffer exactly once.
+
+    For each coarse_tile_read_copy_* op, the tile size times all tiling loop
+    counts must equal the source buffer's total element count.  A mismatch
+    means the read copy either skips elements (silent wrong-address reads) or
+    covers them multiple times.
+    """
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if not op.get_name().startswith("coarse_tile_read_copy_"):
+            continue
+        loop_info = getattr(op, "loop_info", None)
+        if loop_info is None:
+            continue
+
+        reads = [r for r in op.get_read_writes().reads if isinstance(r, MemoryDep)]
+        if not reads:
+            continue
+        src_name = reads[0].name
+        src_buf = V.graph.get_buffer(src_name)
+        if src_buf is None:
+            continue
+
+        # Skip post-stickify read copies: their layout is FixedTiledLayout and
+        # their iteration ranges may include device stick dimensions, making the
+        # host-space element count formula unreliable.  The pre-stickify check
+        # (FixedLayout) is sufficient to catch the bugs this validator targets.
+        if isinstance(op.layout, FixedTiledLayout):
+            continue
+
+        tile_elements = 1
+        for r in op.data.ranges:
+            tile_elements *= int(r)
+
+        # Only count loop levels where this dep actually advances (non-empty
+        # tiled_dims_per_read entry or non-zero squeezed_dim_host_advances).
+        # Loop-invariant levels (empty tiled dims and no squeezed advance) do
+        # not move the read pointer, so they don't multiply coverage.
+        tdpr = loop_info.tiled_dims_per_read[0] if loop_info.tiled_dims_per_read else []
+        sq_adv = (
+            loop_info.squeezed_dim_host_advances[0]
+            if getattr(loop_info, "squeezed_dim_host_advances", [])
+            else []
+        )
+        advancing_counts = [
+            int(loop_info.loop_count[i])
+            for i in range(len(loop_info.loop_count))
+            if (i < len(tdpr) and tdpr[i])
+            or (i < len(sq_adv) and sq_adv[i] != 0)
+        ]
+        total_read = tile_elements
+        for c in advancing_counts:
+            total_read *= c
+
+        src_elements = 1
+        for s in src_buf.layout.size:
+            src_elements *= int(s)
+
+        # Only check coverage when the tile is genuinely a sub-slice of the source
+        # (tile_elements <= src_elements). When tile_elements > src_elements the
+        # input is broadcast/expanded across the tiling dimension — that's correct
+        # by construction and not a coverage violation.
+        # When the tile is a sub-slice and advancing_counts is non-empty, the
+        # total covered must equal the source. When advancing_counts is empty but
+        # the tile is a sub-slice, the read copy can never cover the source —
+        # that's the silent-wrong-address bug this validator targets.
+        if tile_elements < src_elements and total_read != src_elements:
+            raise RuntimeError(
+                f"coarse_tile: read-copy op {op.get_name()!r} does not cover "
+                f"its source buffer {src_name!r}:\n"
+                f"  tile size: {[int(r) for r in op.layout.size]!r} "
+                f"= {tile_elements} elements\n"
+                f"  × advancing loop counts: {advancing_counts!r}\n"
+                f"  = total read: {total_read}\n"
+                f"  source size: {src_elements} "
+                f"(layout.size={[int(s) for s in src_buf.layout.size]!r})\n"
+                f"  tiled_dims_per_read={loop_info.tiled_dims_per_read!r}  "
+                f"loop_count={list(loop_info.loop_count)!r}"
+            )
+
+
 def validate_coarse_tiling(graph: GraphLowering) -> None:
     """Validate invariants on the coarse-tiled IR.
 
@@ -3669,3 +3792,4 @@ def validate_coarse_tiling(graph: GraphLowering) -> None:
     """
     validate_assembly_ops_partition_target(graph.operations)
     validate_flat_reduction_accum_readers(graph.operations)
+    validate_read_copy_coverage(graph.operations)
