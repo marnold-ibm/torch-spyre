@@ -2310,6 +2310,25 @@ def _insert_read_copy_ops(
         # at call time, whatever free variables that particular trace uses.
         full_strides = [dep.index.coeff(v) for v in dep.var_names]
 
+        # When a dimension of full_buf was tiled to size=1, extract_read_writes
+        # squeezes it out of dep.var_names (range=1 → no loop var). But
+        # tiled_op's inner_fn still references that dimension via its full-buffer
+        # stride (e.g. 131072*index0 for B with stride B*H*Lq*D=131072).
+        # Augment the strides used by _NameSwapHandler/_rescale_index to include
+        # any layout stride not already covered by dep, mapped to tile_stride=0
+        # (the squeezed dim contributes nothing to the within-tile index; its
+        # contribution to addressing is handled by tile-base-address advance).
+        # The copy buffer's own tile_ranges/tile_strides are NOT modified.
+        name_map_full_strides = list(full_strides)
+        name_map_tile_strides = list(tile_strides)
+        covered = {int(s) for s in full_strides}
+        for s in full_buf.layout.stride:
+            s_int = int(s)
+            if s_int > 0 and s_int not in covered:
+                name_map_full_strides.append(sympy.Integer(s_int))
+                name_map_tile_strides.append(sympy.Integer(0))
+                covered.add(s_int)
+
         def _copy_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
             subs = dict(zip(_dep.var_names, idx))
             flat_index = sympy_subs(_dep.index, subs)
@@ -2468,6 +2487,14 @@ def _insert_read_copy_ops(
         read_level_extents: list[dict[int, Expr]] = [
             {} for _ in tiled_op_info.loop_tiled_dims
         ]
+        # Per-level extra host-space advance from squeezed-but-tiled dims (e.g.
+        # B tiled to size=1). Those dims are absent from dep.index so the normal
+        # _general_tile_advance dep.index.subs path produces zero for them. We
+        # accumulate their stride × tile-extent contribution here and pass it via
+        # CoarseTileInfo.squeezed_dim_host_advances so _general_tile_advance can
+        # add it alongside the dep.index term.
+        n_levels = len(tiled_op_info.loop_tiled_dims)
+        squeezed_extra: list[Expr] = [sympy.Integer(0)] * n_levels
         for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
             levels_tiling_d = [
                 i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
@@ -2477,9 +2504,26 @@ def _insert_read_copy_ops(
             # later squeeze again when it runs against copy_buf) -- i.e. the
             # squeezed position computed above, not tiled_op's raw d.
             copy_dim = squeeze_pos.get(d)
-            if copy_dim is None or copy_dim >= len(copy_ranges):
-                # Dim d is unit-sized (squeezed out) or absent from this dep
-                # (broadcast read — dep covers fewer dims than tiled_op).
+            if copy_dim is None:
+                # Dim d is unit-sized in tiled_op (tile_size == full_size) --
+                # squeezed out of dep entirely. dep.index has no loop variable
+                # for it, so _general_tile_advance's dep.index.subs path gives
+                # zero. Compute the missing host-stride × tile-extent advance
+                # and accumulate it into squeezed_extra for each level that
+                # tiles d. The tile-size for this dep is 1 (copy reads one
+                # slice of d per tile invocation) -- its full_buf stride IS
+                # the per-step advance.
+                if d < len(full_buf.layout.stride):
+                    d_stride = full_buf.layout.stride[d]
+                    running_sq: Expr = sympy.Integer(1)
+                    for level_idx in reversed(levels_tiling_d):
+                        squeezed_extra[level_idx] = (
+                            squeezed_extra[level_idx] + d_stride * running_sq
+                        )
+                        running_sq = running_sq * tiled_op_info.loop_count[level_idx]
+                continue
+            if copy_dim >= len(copy_ranges):
+                # Broadcast read — dep covers fewer dims than tiled_op.
                 # The copy is loop-invariant along this dim; omit it.
                 continue
             running = sympy.sympify(copy_ranges[copy_dim])
@@ -2520,10 +2564,15 @@ def _insert_read_copy_ops(
             if copy_writes
             else []
         )
+        # Build per-dep squeezed_dim_host_advances: the same extra advance
+        # applies to every read dep (all reads of copy_buf are reads of
+        # full_buf at a common B-tile offset).
+        squeezed_host_advances = [list(squeezed_extra) for _ in copy_reads]
         copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
             tiled_op_info,
             tiled_dims_per_read=tiled_dims_per_read,
             output_tiled_dims=output_tiled_dims,
+            squeezed_dim_host_advances=squeezed_host_advances,
         )
 
         V.graph.name_to_buffer[copy_name] = copy_buf
@@ -2537,7 +2586,7 @@ def _insert_read_copy_ops(
         # smaller, freshly allocated buffer with its own contiguous
         # tile_strides, so _NameSwapHandler rescales the index's coefficients
         # from full_strides to tile_strides at call time (_rescale_index).
-        name_map[dep.name] = (copy_name, full_strides, tile_strides)
+        name_map[dep.name] = (copy_name, name_map_full_strides, name_map_tile_strides)
 
     # Patch tiled_op's inner_fn once with the full name_map (wrap, not
     # reconstruct — see _NameSwapHandler docstring).  Rebuild via

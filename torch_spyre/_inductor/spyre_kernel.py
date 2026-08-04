@@ -692,12 +692,28 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not per_level_dims:
             return None
 
+        # Extra per-level host-advance from squeezed-but-tiled dims (e.g. B
+        # tiled to size=1). Those dims are absent from dep.index, so the
+        # normal dep.index.subs path produces zero for them.
+        # For reads: CoarseTileInfo.squeezed_dim_host_advances indexed by
+        # [dep_idx][level_idx]. For writes: no squeezed write support yet.
+        squeezed_advances: "list[sympy.Expr] | None" = None
+        if is_input:
+            sq = getattr(loop_info, "squeezed_dim_host_advances", [])
+            if consumed < len(sq):
+                squeezed_advances = sq[consumed]
+
         device_size = tensor.layout.device_layout.device_size
         stride_map = tensor.layout.device_layout.stride_map
 
         total_device_expr: "sympy.Expr | None" = None
         for level_idx, dim_extent_pairs in enumerate(per_level_dims):
-            if not dim_extent_pairs:
+            extra = (
+                squeezed_advances[level_idx]
+                if squeezed_advances is not None and level_idx < len(squeezed_advances)
+                else sympy.Integer(0)
+            )
+            if not dim_extent_pairs and not extra:
                 continue
             level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
             tiled_dim_extents = {
@@ -712,7 +728,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                     if sym not in subs
                 }
             )
-            host_expr = dep.index.subs(subs)
+            host_expr = dep.index.subs(subs) + extra * level_symbol
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
             total_device_expr = (
                 device_expr

@@ -1046,6 +1046,9 @@ def compute_restickify_target_layout(
         host_size[new_sd],
         stick_size,
     )
+    # A valid restickify only reorders device dimensions; total element count must be unchanged.
+    if math.prod(device_size) != math.prod(stl.device_size):
+        return None
     stride_map = restickify_stride_map(
         old_stride_map,
         old_sd_outer_dim,

@@ -2582,7 +2582,7 @@ def _flash_v1_fn(
     return output / denominator.unsqueeze(-1)
 
 
-@pytest.mark.skip(reason="finalize_layouts: restickify needed but infeasible ")
+@pytest.mark.skip(reason="finalize_layouts: restickify needed but infeasible")
 def test_flash_tile_H():
     """Flash v1: tile H÷4 only."""
     run_coarse_tile_test(
@@ -2596,9 +2596,7 @@ def test_flash_tile_H():
     )
 
 
-@pytest.mark.skip(
-    reason=" RuntimeError: _rescale_index: no matching full_stride for term 131072*index0 in index 131072*index0 + 16384*index1 + 64*index2 + index3; full_strides=[16384, 64, 1]"
-)
+@pytest.mark.skip(reason="finalize_layouts: restickify needed but infeasible")
 def test_flash_tile_B():
     """Flash v1: tile B÷2 only. B=2."""
     run_coarse_tile_test(
@@ -2610,9 +2608,9 @@ def test_flash_tile_B():
     )
 
 
-@pytest.mark.skip(
-    reason="RuntimeError: coarse_tile: assembly op 'coarse_tile_copy_buf23' does not partition its target buffer:"
-)
+# @pytest.mark.skip(
+#     reason="RuntimeError: coarse_tile: assembly op 'coarse_tile_copy_buf23' does not partition its target buffer:"
+# )
 def test_flash_tile_Lq():
     """Flash v1: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -2650,9 +2648,9 @@ def test_flash_tile_B_H():
     )
 
 
-@pytest.mark.skip(
-    reason=" RuntimeError: coarse_tile: assembly op 'coarse_tile_copy_buf23' does not partition its target buffer"
-)
+# @pytest.mark.skip(
+#     reason=" RuntimeError: coarse_tile: assembly op 'coarse_tile_copy_buf23' does not partition its target buffer"
+# )
 def test_flash_tile_H_Lq():
     """Flash v1: tile H÷4 Lq÷2."""
     run_coarse_tile_test(
