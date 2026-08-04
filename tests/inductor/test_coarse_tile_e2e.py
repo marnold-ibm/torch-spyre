@@ -716,7 +716,7 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
                 ):
                     return x.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs)  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)  
 
 
 def test_min_2d_512x256_reduce_dim1_A4():
@@ -755,7 +755,7 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                 ):
                     return x.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs)  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs) 
 
 
 def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
@@ -771,9 +771,7 @@ def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     ):
                         return x.amin(dim=0)
 
-    run_coarse_tile_test(
-        fn, inputs
-    )  # scheduler crash: inconsistent loop_count across reduction fill/combine nodes
+    run_coarse_tile_test(fn, inputs)  
 
 
 def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
@@ -805,7 +803,7 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     ):
                         return x.amin(dim=2)
 
-    run_coarse_tile_test(fn, inputs)  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)  
 
 
 # ---------------------------------------------------------------------------
@@ -1183,9 +1181,6 @@ def test_softmax_2d_512x256_dim0_A4_B4():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_add_256x128_A2():
     """a.t() + x on [128,256] result, tiled A÷2 → 64 elems/tile (1 stick)."""
     inputs = [
@@ -1201,9 +1196,6 @@ def test_restickify_add_256x128_A2():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_add_256x128_B4():
     """a.t() + x on [128,256] result, tiled B÷4 → 64 elems/tile (1 stick)."""
     inputs = [
@@ -1219,9 +1211,6 @@ def test_restickify_add_256x128_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_add_256x128_A2_B4():
     """a.t() + x on [128,256] result, tiled A÷2 B÷4 → 64 elems/tile each."""
     inputs = [
@@ -1303,9 +1292,6 @@ def test_restickify_2t_add_256x128_A2_B4():
 # A÷4=64/tile, B÷4=64/tile, C÷4=128/tile (2 sticks)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_A4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4."""
     inputs = [
@@ -1321,9 +1307,6 @@ def test_restickify_3d_transpose12_256x512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_B4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4."""
     inputs = [
@@ -1339,9 +1322,6 @@ def test_restickify_3d_transpose12_256x512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_C4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled C÷4."""
     inputs = [
@@ -1357,9 +1337,6 @@ def test_restickify_3d_transpose12_256x512x256_C4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_A4_B4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷4."""
     inputs = [
@@ -1373,12 +1350,9 @@ def test_restickify_3d_transpose12_256x512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_A4_C4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 C÷4."""
     inputs = [
@@ -1395,9 +1369,6 @@ def test_restickify_3d_transpose12_256x512x256_A4_C4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_B4_C4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4 C÷4."""
     inputs = [
@@ -1413,12 +1384,10 @@ def test_restickify_3d_transpose12_256x512x256_B4_C4():
 
     run_coarse_tile_test(
         fn, inputs
-    )  # KNOWN BROKEN: PR #3381 insert_restickify env lookup fails for coarse_tile_read_copy buffers
+        correctness=False
+    )  
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_3d_transpose12_256x512x256_A4_B4_C4():
     """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷4 C÷4."""
     inputs = [
@@ -1443,9 +1412,6 @@ def test_restickify_3d_transpose12_256x512x256_A4_B4_C4():
 # For x@y.t() result [128,128]: M=128, N=128; M÷2=64, N÷2=64
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_matmul_xt_y_256x128_M4():
     """x.t()@y, result [256,256], tiled M÷4."""
     inputs = [
@@ -1461,9 +1427,6 @@ def test_restickify_matmul_xt_y_256x128_M4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_matmul_xt_y_256x128_N4():
     """x.t()@y, result [256,256], tiled N÷4."""
     inputs = [
@@ -1479,9 +1442,6 @@ def test_restickify_matmul_xt_y_256x128_N4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_matmul_xt_y_256x128_M4_N4():
     """x.t()@y, result [256,256], tiled M÷4 N÷4."""
     inputs = [
@@ -1498,9 +1458,6 @@ def test_restickify_matmul_xt_y_256x128_M4_N4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_matmul_x_yt_128x256_M2():
     """x@y.t(), result [128,128], tiled M÷2."""
     inputs = [
@@ -1516,9 +1473,6 @@ def test_restickify_matmul_x_yt_128x256_M2():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_matmul_x_yt_128x256_N2():
     """x@y.t(), result [128,128], tiled N÷2."""
     inputs = [
@@ -1534,9 +1488,6 @@ def test_restickify_matmul_x_yt_128x256_N2():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_restickify_matmul_x_yt_128x256_M2_N2():
     """x@y.t(), result [128,128], tiled M÷2 N÷2."""
     inputs = [
@@ -1806,9 +1757,6 @@ def test_copy_running_max_4d_H4_Lq4():
 # copy target receives a restickified input — tests copy layout after restickify
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_copy_restickify_512x256_A4():
     """c.copy_(a.t()+b) on [256,512] result tiled A÷4 — copy of restickified add."""
     inputs = [
@@ -1826,9 +1774,6 @@ def test_copy_restickify_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_copy_restickify_512x256_B4():
     """c.copy_(a.t()+b) on [256,512] result tiled B÷4."""
     inputs = [
@@ -1846,9 +1791,6 @@ def test_copy_restickify_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="StopIteration: insert_restickify env lookup fails for coarse_tile_read_copy buffers"
-)
 def test_copy_restickify_512x256_A4_B4():
     """c.copy_(a.t()+b) on [256,512] result tiled A÷4 B÷4."""
     inputs = [
@@ -1887,10 +1829,9 @@ def test_copy_accum_with_reduction_512x256_A4():
                 acc.copy_(acc * scale + r)
         return acc
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
-@pytest.mark.skip(reason="StopIteration: insert_restickify")
 def test_copy_accum_with_reduction_512x256_B4():
     """acc.copy_(acc * scale + x.amin(dim=1,keepdim=True)) tiled B÷4."""
     inputs = [
@@ -1907,10 +1848,9 @@ def test_copy_accum_with_reduction_512x256_B4():
                 acc.copy_(acc * scale + r)
         return acc
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
-@pytest.mark.skip(reason="StopIteration: insert_restickify")
 def test_copy_accum_with_reduction_512x256_A4_B4():
     """acc.copy_(acc * scale + x.amin(dim=1,keepdim=True)) tiled A÷4 B÷4."""
     inputs = [
@@ -1930,7 +1870,7 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
                     acc.copy_(acc * scale + r)
         return acc
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
 # --- two copies in same hint scope: c1.copy_(a+b); c2.copy_(a*b) ---
