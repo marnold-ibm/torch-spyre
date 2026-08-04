@@ -73,6 +73,22 @@ class CoarseTileInfo:
     output_tiled_dims:
         The analogous per-level ``(op_dim_index, extent)`` list for this
         op's own write dependency. Defaults to ``[]`` (no levels tiled).
+    squeezed_dim_host_advances:
+        Extra per-dep per-level host-element advance contributions from
+        dimensions that are tiled in the outer (tiled) op but squeezed out
+        of this op's ``dep.size`` because their tile size is 1 (e.g. batch
+        dim B when B is split into B tiles of size 1). Those dims have no
+        loop variable in ``dep.index`` so ``_general_tile_advance``'s normal
+        dep.index substitution produces zero for them. This field stores the
+        missing host-space advance per level as a plain ``sympy.Expr`` that
+        ``_general_tile_advance`` adds alongside the dep.index-derived term.
+
+        Shape: ``len(squeezed_dim_host_advances) == len(tiled_dims_per_read)``
+        (one entry per read dep); each inner list has one element per nesting
+        level (matching ``loop_count``). An element of zero means no extra
+        advance is needed at that level. Defaults to ``[]`` (no extra
+        advances needed -- the common case for ops without squeezed-tiled
+        dims).
     """
 
     loop_group_id: tuple[int, ...]
@@ -83,6 +99,7 @@ class CoarseTileInfo:
         default_factory=list
     )
     output_tiled_dims: list[list[tuple[int, sympy.Expr]]] = field(default_factory=list)
+    squeezed_dim_host_advances: list[list[sympy.Expr]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
