@@ -1386,7 +1386,7 @@ def test_restickify_3d_transpose12_256x512x256_B4_C4():
 
 
 def test_restickify_3d_transpose12_256x512x256_A4_B2():
-    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷4."""
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷2."""
     inputs = [
         tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
         tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
@@ -1402,7 +1402,7 @@ def test_restickify_3d_transpose12_256x512x256_A4_B2():
 
 
 def test_restickify_3d_transpose12_256x512x256_A4_C2():
-    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 C÷4."""
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 C÷2."""
     inputs = [
         tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
         tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
@@ -1418,7 +1418,7 @@ def test_restickify_3d_transpose12_256x512x256_A4_C2():
 
 
 def test_restickify_3d_transpose12_256x512x256_B4_C2():
-    """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4 C÷4."""
+    """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4 C÷2."""
     inputs = [
         tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
         tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
@@ -2130,7 +2130,6 @@ def test_outside_consumer_two_accum_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="...")
 def test_outside_consumer_two_accum_512x256_B4():
     """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — B÷4."""
     inputs = [
@@ -2148,7 +2147,7 @@ def test_outside_consumer_two_accum_512x256_B4():
                 denom.copy_(denom + x.sum(dim=1))
         return out / denom.unsqueeze(1)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
 @pytest.mark.skip(

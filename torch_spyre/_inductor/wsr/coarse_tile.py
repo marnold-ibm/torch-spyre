@@ -2800,8 +2800,6 @@ def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
     if max(output_level_indices) > innermost_reduction:
         inner_output = [i for i in output_level_indices if i > innermost_reduction]
         outer_output = [i for i in output_level_indices if i < innermost_reduction]
-        from torch._inductor.exc import Unsupported  # deferred to avoid circular
-
         raise Unsupported(
             f"coarse_tile: interleaved reduction tiling not supported — "
             f"output-dim levels {outer_output} are outer to reduction levels "
