@@ -716,7 +716,7 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
                 ):
                     return x.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs)  
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_2d_512x256_reduce_dim1_A4():
@@ -755,7 +755,7 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                 ):
                     return x.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs) 
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
@@ -771,7 +771,7 @@ def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     ):
                         return x.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs)  
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
@@ -803,7 +803,7 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     ):
                         return x.amin(dim=2)
 
-    run_coarse_tile_test(fn, inputs)  
+    run_coarse_tile_test(fn, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -1350,7 +1350,7 @@ def test_restickify_3d_transpose12_256x512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
-    run_coarse_tile_test(fn, inputs, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_restickify_3d_transpose12_256x512x256_A4_C4():
@@ -1382,10 +1382,55 @@ def test_restickify_3d_transpose12_256x512x256_B4_C4():
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
-    run_coarse_tile_test(
-        fn, inputs
-        correctness=False
-    )  
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_A4_B2():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_A4_C2():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 C÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"C": 2}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_B4_C2():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4 C÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(num_tiles_per_dim={"C": 2}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_restickify_3d_transpose12_256x512x256_A4_B4_C4():

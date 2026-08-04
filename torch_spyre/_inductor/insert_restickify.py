@@ -150,8 +150,9 @@ def _create_restickify_node(
             restick_fx_node = fx_graph.create_node(
                 "call_function", torch.ops.spyre.restickify.default, ()
             )
-        with IRNode.current_origins(OrderedSet([restick_fx_node])), V.set_current_node(
-            restick_fx_node
+        with (
+            IRNode.current_origins(OrderedSet([restick_fx_node])),
+            V.set_current_node(restick_fx_node),
         ):
             restick_tb = lower_restickify(arg_tb)
         restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
