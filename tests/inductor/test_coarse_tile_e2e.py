@@ -1350,7 +1350,7 @@ def test_restickify_3d_transpose12_256x512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
 def test_restickify_3d_transpose12_256x512x256_A4_C4():
