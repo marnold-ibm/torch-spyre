@@ -1228,7 +1228,7 @@ def test_restickify_add_256x128_B4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a.t() + x
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_restickify_add_256x128_A2_B4():
@@ -1301,7 +1301,7 @@ def test_restickify_2t_add_256x128_A2_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a.t() + b.t() + x
 
-    run_coarse_tile_test(fn, inputs)  # d0+d1 stick expr bug
+    run_coarse_tile_test(fn, inputs)  
 
 
 # 3D transpose: a.transpose(1,2) + x
