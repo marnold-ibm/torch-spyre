@@ -2787,6 +2787,17 @@ def _retile_load_index_from_strides(
         )
         return index
 
+    # Pre-compute the set of per-variable coefficients already in the index.
+    # Used below to skip rewrites whose target coefficient already appears —
+    # that means the index is already correct (post-divide) and the rewrite
+    # would double-apply the stride correction (e.g. col-major restickify
+    # where old=(1,128) → new=(256,1): index 256*d0+1*d1 already has new
+    # coefficient 256 for d0, so rewriting 1→256 on d1 would be wrong).
+    current_coeffs: set[Expr] = set()
+    for var in loop_vars:
+        term = projection_terms[var]
+        current_coeffs.add(sympy.simplify(term.coeff(var)))
+
     adjusted_index = offset
     changed = False
     for var in sorted(loop_vars, key=str):
@@ -2808,6 +2819,7 @@ def _retile_load_index_from_strides(
             new_coeff
             for old_coeff, new_coeff in rewrites.items()
             if sympy.simplify(coeff - old_coeff) == 0
+            and new_coeff not in current_coeffs
         ]
         if len(matches) == 1:
             adjusted_index += matches[0] * var

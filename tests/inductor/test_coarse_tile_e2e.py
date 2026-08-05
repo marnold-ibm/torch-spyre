@@ -1252,7 +1252,6 @@ def test_restickify_add_256x128_A2_B4():
 # A÷2=64/tile (1 stick), B÷4=64/tile (1 stick)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_A2():
     """a.t()+b.t()+x on [128,256] result, tiled A÷2."""
     inputs = [
@@ -1269,7 +1268,6 @@ def test_restickify_2t_add_256x128_A2():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_B4():
     """a.t()+b.t()+x on [128,256] result, tiled B÷4."""
     inputs = [
@@ -1286,7 +1284,6 @@ def test_restickify_2t_add_256x128_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_A2_B4():
     """a.t()+b.t()+x on [128,256] result, tiled A÷2 B÷4."""
     inputs = [
