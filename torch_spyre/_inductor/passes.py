@@ -416,20 +416,20 @@ def log_index_functions(graph: GraphLowering) -> None:
         if not isinstance(op, ComputedBuffer):
             continue
         name = op.get_name()
-        ranges = [int(r) for r in op.data.ranges]
         rw = op.get_read_writes()
+        var_ranges = {str(k): int(v) for k, v in rw.var_ranges.items()}
         for dep in rw.reads:
             print(
                 f"SPYRE_INDEX_FN {name} read"
                 f" {sympy_str(dep.index)}"
-                f" | {ranges}"
+                f" | {var_ranges}"
                 f" | {sympy.srepr(dep.index)}"
             )
         for dep in rw.writes:
             print(
                 f"SPYRE_INDEX_FN {name} write"
                 f" {sympy_str(dep.index)}"
-                f" | {ranges}"
+                f" | {var_ranges}"
                 f" | {sympy.srepr(dep.index)}"
             )
 
