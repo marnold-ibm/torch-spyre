@@ -1729,6 +1729,66 @@ def test_copy_not_deleted():
         run_coarse_tile_test(fn, inputs)
 
 
+def test_copy_out_not_deleted():
+    """Regression: aten.copy.out must not be eliminated by noop_registry.
+
+    aten.copy.out normalizes to aten.copy.default before remove_noop_ops runs,
+    so the existing copy.default registry pop covers it.  This test confirms
+    that coverage: if copy.out were eliminated, the hint would never fire.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            amin = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                torch.ops.aten.copy.out(amin, amin, out=out)
+        return out
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_clone_not_deleted():
+    """Regression: aten.clone must not be eliminated by noop_registry.
+
+    If clone is eliminated before lowering, the hint never fires and
+    pytest.raises fails.  If it survives, validate_named_dims raises on
+    the wrong expected_reduction_dims.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            amin = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                return amin.clone()
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_clone_out_not_deleted():
+    """Regression: aten.clone.out must not be eliminated by noop_registry.
+
+    aten.clone.out is the out-variant of clone.  Confirms it is covered by
+    the clone.out registry pop (or normalizes to clone.default which is covered).
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            amin = x.amin(dim=0)
+            out = torch.empty_like(amin)
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                torch.ops.aten.clone.out(amin, out=out)
+        return out
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
 def test_copy_after_reduction_512x256_A4():
     """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
