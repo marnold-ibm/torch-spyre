@@ -7,17 +7,18 @@ Usage:
 """
 from __future__ import annotations
 
+import ast
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 import sympy
 
 
-def parse_line(line: str) -> tuple[str, str, sympy.Expr] | None:
+def parse_line(line: str) -> tuple[str, str, sympy.Expr, list[int]] | None:
     """Parse one SPYRE_INDEX_FN line.
 
-    Format: SPYRE_INDEX_FN <buf> <read|write> <pretty> | <srepr>
-    Returns (buf_name, direction, expr) or None if unparseable.
+    Format: SPYRE_INDEX_FN <buf> <read|write> <pretty> | <srepr> | <ranges>
+    Returns (buf_name, direction, expr, ranges) or None if unparseable.
     """
     line = line.strip()
     if not line.startswith("SPYRE_INDEX_FN "):
@@ -27,14 +28,20 @@ def parse_line(line: str) -> tuple[str, str, sympy.Expr] | None:
     if len(parts) < 3:
         return None
     buf, direction, remainder = parts
-    if " | " not in remainder:
+    fields = remainder.split(" | ")
+    if len(fields) < 2:
         return None
-    _, srepr_str = remainder.split(" | ", 1)
+    ranges: list[int] = []
+    try:
+        ranges = ast.literal_eval(fields[1])
+    except Exception:
+        pass
+    srepr_str = fields[2] if len(fields) >= 3 else fields[1]
     try:
         expr = sympy.sympify(srepr_str)
     except Exception:
         return None
-    return buf, direction, expr
+    return buf, direction, expr, ranges
 
 
 def main() -> None:
@@ -46,21 +53,28 @@ def main() -> None:
 
     counts: Counter[str] = Counter()
     exprs: dict[str, sympy.Expr] = {}
+    ranges_seen: dict[str, list[list[int]]] = defaultdict(list)
 
     for line in lines:
         result = parse_line(line)
         if result is None:
             continue
-        _buf, _direction, expr = result
+        _buf, _direction, expr, ranges = result
         key = sympy.srepr(expr)
         counts[key] += 1
         exprs[key] = expr
+        if ranges and ranges not in ranges_seen[key]:
+            ranges_seen[key].append(ranges)
+
+    for key in ranges_seen:
+        ranges_seen[key].sort(key=lambda r: (len(r), r))
 
     print(f"Unique index expressions: {len(counts)}")
     print()
     for key, count in counts.most_common():
         expr = exprs[key]
-        print(f"  count={count:4d}  {expr}")
+        range_strs = ", ".join(str(r) for r in ranges_seen[key])
+        print(f"  count={count:4d}  {expr}    ranges={range_strs}")
 
 
 if __name__ == "__main__":
