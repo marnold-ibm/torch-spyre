@@ -15,8 +15,11 @@
 
 import inspect
 import logging
+import os
 import time
 from typing import Optional, Any, Callable
+
+import sympy
 
 import torch
 import torch.fx.graph
@@ -32,8 +35,9 @@ except ImportError:
 
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
+from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.utils import sympy_str
 
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
@@ -405,6 +409,28 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph)
 
 
+def log_index_functions(graph: GraphLowering) -> None:
+    if os.environ.get("SPYRE_LOG_INDEX_FNS", "1") != "1":
+        return
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        name = op.get_name()
+        rw = op.get_read_writes()
+        for dep in rw.reads:
+            print(
+                f"SPYRE_INDEX_FN {name} read"
+                f" {sympy_str(dep.index)}"
+                f" | {sympy.srepr(dep.index)}"
+            )
+        for dep in rw.writes:
+            print(
+                f"SPYRE_INDEX_FN {name} write"
+                f" {sympy_str(dep.index)}"
+                f" | {sympy.srepr(dep.index)}"
+            )
+
+
 class CustomPreSchedulingPasses:
     """
     Spyre-specific passes that run on the GraphLowering immediately before the
@@ -423,6 +449,7 @@ class CustomPreSchedulingPasses:
 
     def __init__(self):
         self.passes = [
+            log_index_functions,
             deadcode_elimination,
             #
             # Working Set Reduction (hint-driven, pre-stickification)
