@@ -17,6 +17,7 @@ import inspect
 import logging
 import os
 import time
+import uuid
 from typing import Optional, Any, Callable
 
 import sympy
@@ -409,6 +410,9 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph)
 
 
+_RUN_ID = uuid.uuid4().hex[:8]
+
+
 def log_index_functions(graph: GraphLowering) -> None:
     if os.environ.get("SPYRE_LOG_INDEX_FNS", "1") != "1":
         return
@@ -418,20 +422,27 @@ def log_index_functions(graph: GraphLowering) -> None:
         name = op.get_name()
         rw = op.get_read_writes()
         var_ranges = {str(k): int(v) for k, v in rw.var_ranges.items()}
+        key = f"{_RUN_ID}:{name}"
         for dep in rw.reads:
             print(
-                f"SPYRE_INDEX_FN {name} read"
+                f"SPYRE_INDEX_FN {key} read"
                 f" {sympy_str(dep.index)}"
                 f" | {var_ranges}"
                 f" | {sympy.srepr(dep.index)}"
             )
         for dep in rw.writes:
             print(
-                f"SPYRE_INDEX_FN {name} write"
+                f"SPYRE_INDEX_FN {key} write"
                 f" {sympy_str(dep.index)}"
                 f" | {var_ranges}"
                 f" | {sympy.srepr(dep.index)}"
             )
+        # Emit stack trace line for source attribution
+        origin = getattr(op, "origin_node", None)
+        if origin is not None:
+            stack = getattr(origin, "stack_trace", None) or ""
+            escaped = stack.replace("\n", "\\n")
+            print(f"SPYRE_INDEX_STACK {key} | {escaped}")
 
 
 class CustomPreSchedulingPasses:

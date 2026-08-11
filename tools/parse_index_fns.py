@@ -2,8 +2,11 @@
 """Parse SPYRE_INDEX_FN log lines and summarize unique index expressions by group.
 
 Usage:
-    grep "^SPYRE_INDEX_FN" run_*.log | python3 tools/parse_index_fns.py
+    grep -E "^SPYRE_INDEX_FN|^SPYRE_INDEX_STACK" run_*.log | python3 tools/parse_index_fns.py
     python3 tools/parse_index_fns.py all_index_fns.txt
+
+Always writes stack traces to index_stacks.txt in the current directory.
+Grep that file for an ex= key shown in the histogram to find its source.
 """
 from __future__ import annotations
 
@@ -144,20 +147,20 @@ def _classify(expr: sympy.Expr, var_ranges: dict[str, int]) -> str:
 # Parsing
 # ---------------------------------------------------------------------------
 
-def parse_line(line: str) -> tuple[str, str, sympy.Expr, dict[str, int]] | None:
+def parse_fn_line(line: str) -> tuple[str, str, sympy.Expr, dict[str, int]] | None:
     """Parse one SPYRE_INDEX_FN line.
 
-    Format: SPYRE_INDEX_FN <buf> <read|write> <pretty> | <var_ranges> | <srepr>
-    Returns (buf_name, direction, expr, var_ranges) or None if unparseable.
+    Format: SPYRE_INDEX_FN <run_id:buf> <read|write> <pretty> | <var_ranges> | <srepr>
+    Returns (key, direction, expr, var_ranges) or None if unparseable.
     """
     line = line.strip()
     if not line.startswith("SPYRE_INDEX_FN "):
         return None
     rest = line[len("SPYRE_INDEX_FN "):]
-    parts = rest.split(None, 2)  # buf, direction, remainder
+    parts = rest.split(None, 2)  # key, direction, remainder
     if len(parts) < 3:
         return None
-    buf, direction, remainder = parts
+    key, direction, remainder = parts
     fields = remainder.split(" | ")
     if len(fields) < 2:
         return None
@@ -171,7 +174,24 @@ def parse_line(line: str) -> tuple[str, str, sympy.Expr, dict[str, int]] | None:
         expr = sympy.sympify(srepr_str)
     except Exception:
         return None
-    return buf, direction, expr, var_ranges
+    return key, direction, expr, var_ranges
+
+
+def parse_stack_line(line: str) -> tuple[str, str] | None:
+    """Parse one SPYRE_INDEX_STACK line.
+
+    Format: SPYRE_INDEX_STACK <run_id:buf> | <escaped_stack>
+    Returns (key, stack) or None if unparseable.
+    """
+    line = line.strip()
+    if not line.startswith("SPYRE_INDEX_STACK "):
+        return None
+    rest = line[len("SPYRE_INDEX_STACK "):]
+    if " | " not in rest:
+        return None
+    key, escaped = rest.split(" | ", 1)
+    stack = escaped.replace("\\n", "\n")
+    return key, stack
 
 
 # ---------------------------------------------------------------------------
@@ -184,23 +204,35 @@ def main() -> None:
             lines = f.readlines()
     else:
         lines = sys.stdin.readlines()
+    stacks_path = "index_stacks.txt"
 
     # Key is (expr_srepr, var_ranges_tuple) — classify per pair
     counts: Counter[tuple] = Counter()
     exprs: dict[str, sympy.Expr] = {}
     groups: dict[tuple, str] = {}
+    # Map pair_key -> one example run_id:buf key for stack lookup
+    examples: dict[tuple, str] = {}
+    # Map run_id:buf -> stack string
+    stacks: dict[str, str] = {}
 
     for line in lines:
-        result = parse_line(line)
+        stack_result = parse_stack_line(line)
+        if stack_result is not None:
+            buf_key, stack = stack_result
+            stacks[buf_key] = stack
+            continue
+        result = parse_fn_line(line)
         if result is None:
             continue
-        _buf, _direction, expr, var_ranges = result
+        buf_key, _direction, expr, var_ranges = result
         expr_key = sympy.srepr(expr)
         pair_key = (expr_key, tuple(sorted(var_ranges.items())))
         counts[pair_key] += 1
         exprs[expr_key] = expr
         if pair_key not in groups:
             groups[pair_key] = _classify(expr, var_ranges)
+        if pair_key not in examples:
+            examples[pair_key] = buf_key
 
     group_order = [
         "scalar", "symbolic", "non-linear", "indirect",
@@ -225,8 +257,24 @@ def main() -> None:
         for pair_key in sorted(pairs, key=lambda p: -counts[p]):
             expr_key, vr_tuple = pair_key
             expr = exprs[expr_key]
-            print(f"  count={counts[pair_key]:4d}  {expr}    var_ranges={dict(vr_tuple)}")
+            example = examples.get(pair_key, "")
+            print(
+                f"  count={counts[pair_key]:4d}"
+                f"  {expr}"
+                f"    var_ranges={dict(vr_tuple)}"
+                f"  ex={example}"
+            )
         print()
+
+    # Write stacks file
+    with open(stacks_path, "w") as f:
+        for buf_key, stack in sorted(stacks.items()):
+            f.write(f"=== {buf_key} ===\n")
+            f.write(stack)
+            if not stack.endswith("\n"):
+                f.write("\n")
+            f.write("\n")
+    print(f"Stack traces written to {stacks_path} — grep for a key to find its source.")
 
 
 if __name__ == "__main__":
