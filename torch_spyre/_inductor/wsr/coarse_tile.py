@@ -980,6 +980,9 @@ def _reads_incomplete_reduction(
         buf = V.graph.get_buffer(n)
         if not isinstance(buf, ComputedBuffer):
             continue
+        # group_ops is topologically ordered, so any in-group sibling is
+        # already in plan by the time we reach op. A missing entry means
+        # buf is outside this group (cross-group read) — not a partial result.
         entry = plan.get(id(buf))
         if entry is None:
             continue

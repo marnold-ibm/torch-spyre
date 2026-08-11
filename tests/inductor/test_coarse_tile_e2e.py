@@ -52,6 +52,7 @@ import torch
 import unittest
 from unittest.mock import patch as mock_patch
 
+from torch._inductor.exc import InductorError
 from torch._inductor.test_case import TestCase as InductorTestCase, fresh_cache
 from torch._inductor.utils import run_and_get_code
 
@@ -1790,6 +1791,28 @@ def test_copy_rmw_correction_512x256_A4_B4():
 
 # --- copy after reduction: out.copy_(x.amin(dim=0)) ---
 # copies sparse reduction result into a dense buffer
+
+
+def test_copy_not_deleted():
+    """Regression: copy_ must not be eliminated by noop_registry removal.
+
+    If copy_ is deleted before lowering, the expected_reduction_dims hint on
+    the copy op is never checked (no op to check), and the test passes
+    vacuously.  If copy_ is present, validate_named_dims fires and raises
+    because copy_ has no reduction dim -- that AssertionError is the expected
+    outcome, proving the copy survived.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                out.copy_(x.amin(dim=0))
+        return out
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_copy_after_reduction_512x256_A4():
