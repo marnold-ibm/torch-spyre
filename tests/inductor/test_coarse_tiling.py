@@ -2030,104 +2030,6 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
             ):
                 plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
 
-    def test_plan_raises_unsupported_for_carry(self):
-        """Planning raises Unsupported for an op requiring carry propagation.
-
-        Models the flash-attention online-softmax shape
-        (tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention's
-        running_max/QK^T pattern): a Reduction op ("red0", e.g. the QK^T
-        matmul) tiles its reduction dim at the group's only level, and a
-        sibling Pointwise op ("carry0", e.g. the running-max update) is
-        loop-invariant at that level (no output-dim tiling there) and reads
-        a pre-loop constant-fill seed buffer directly -- the exact shape
-        _seed_buffer_for_carry's docstring describes.
-
-        The seed itself must be a ComputedBuffer(Pointwise) wrapping a
-        SpyreConstantFallback scalar (matching lowering.py's real
-        full.default lowering and coarse_tile.py's own fill-insertion code
-        at ~line 2023) -- _seed_buffer_for_carry only accepts ComputedBuffer
-        reads as seed candidates (see coarse_tile.py's
-        `isinstance(buf, ComputedBuffer)` check), so carry0 must read this
-        wrapper buffer ("seed0"), not the raw SpyreConstantFallback scalar
-        directly.
-
-        _seed_buffer_for_carry uses _seed_closure_pre_stamp, which scans
-        group_ops directly rather than requiring a stamped loop_info --
-        planning is zero-mutation and runs before _apply_plan, so no op
-        has loop_info yet. No fixture pre-stamping is needed or performed
-        here; this exercises the real, never-stamped-during-planning path.
-        """
-        from torch._inductor.ir import (
-            ComputedBuffer,
-            FixedLayout,
-            Pointwise,
-            StorageBox,
-            TensorBox,
-        )
-        from torch_spyre._inductor.ir import SpyreConstantFallback
-
-        red_op = _make_real_reduction_op(
-            ranges=[Integer(8)],
-            reduction_ranges=[Integer(16)],
-            input_shape_stride=([8, 16], [16, 1]),
-            name="red0",
-            hints=((1, 1),),
-        )
-
-        # Seed buffer: a constant-fill wrapper -- ComputedBuffer(Pointwise)
-        # whose only read resolves to a SpyreConstantFallback scalar (see
-        # _is_constant_fill). Mirrors torch.full's real lowering shape.
-        scalar_op = SpyreConstantFallback(
-            torch.ops.spyre.constant.default, 0.0, torch.float32, torch.device("cpu")
-        )
-        scalar_loader = TensorBox(StorageBox(scalar_op)).make_loader()
-
-        def seed_inner_fn(index, _loader=scalar_loader):
-            return _loader([])
-
-        seed_pw = Pointwise(
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            inner_fn=seed_inner_fn,
-            ranges=[Integer(8)],
-        )
-        seed_buf = ComputedBuffer(
-            name="seed0",
-            layout=FixedLayout(torch.device("cpu"), torch.float32, [Integer(8)], None),
-            data=seed_pw,
-        )
-        seed_buf.operation_name = "seed0"
-        V.graph.name_to_buffer["seed0"] = seed_buf
-
-        # carry0 reads the seed buffer directly -- the running-max-style
-        # carry step, loop-invariant at the reduction-tiled level.
-        seed_loader = TensorBox(StorageBox(seed_buf)).make_loader()
-
-        def carry_inner_fn(index, _loader=seed_loader):
-            return _loader(index)
-
-        carry_pw = Pointwise(
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            inner_fn=carry_inner_fn,
-            ranges=[Integer(8)],
-        )
-        carry_op = ComputedBuffer(
-            name="carry0",
-            layout=FixedLayout(torch.device("cpu"), torch.float32, [Integer(8)], None),
-            data=carry_pw,
-        )
-        carry_op.operation_name = "carry0"
-        V.graph.name_to_buffer["carry0"] = carry_op
-        carry_op._test_out_coords = [sympy.Symbol("c0")]
-        carry_op.dim_hints = []  # loop-invariant: no dim_hints tile any level
-
-        group_ops = [red_op, carry_op]
-        levels = [(1, Integer(4))]
-
-        with self.assertRaisesRegex(Unsupported, "requiring carry propagation"):
-            plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
-
 
 # ===========================================================================
 # 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
@@ -4381,30 +4283,22 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [other_group])
 
     def test_carry_propagation_functions_removed(self):
-        """_carry_terminal_op/_propagate_carry_op are deleted.
-
-        _seed_buffer_for_carry is deliberately NOT checked here: it remains
-        live, called from plan_coarse_tile_groups (Task 3) as the
-        carry-detection predicate behind its Unsupported raise — only the
-        transformation-time carry mechanism (_carry_terminal_op,
-        _propagate_carry_op, and _propagate_tiled_op's carry-trigger branch
-        that called all three) is dead code and removed by this task.
-        """
+        """_carry_terminal_op/_propagate_carry_op and the seed-detection helpers
+        are deleted."""
         import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
 
         for name in (
             "_carry_terminal_op",
             "_propagate_carry_op",
+            "_seed_buffer_for_carry",
+            "_seed_closure_pre_stamp",
+            "_is_constant_fill",
+            "_closure_member_has_external_operands_only",
         ):
             self.assertFalse(
                 hasattr(coarse_tile_module, name),
                 f"{name} should have been deleted",
             )
-        self.assertTrue(
-            hasattr(coarse_tile_module, "_seed_buffer_for_carry"),
-            "_seed_buffer_for_carry must stay defined -- plan_coarse_tile_groups "
-            "still calls it as its carry-detection predicate",
-        )
 
     def test_has_loop_internal_real_input_removed(self):
         """_has_loop_internal_real_input is deleted along with the direct-

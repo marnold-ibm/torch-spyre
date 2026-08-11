@@ -231,6 +231,11 @@ def plan_coarse_tile_groups(
         group_reduction_tiled_levels = _group_reduction_tiled_levels_in_group(
             group_ops, levels
         )
+        # Names of all ComputedBuffers in this group — used by the
+        # per-op partial-scratch check below.
+        group_op_names: set[str] = {
+            o.get_name() for o in group_ops if isinstance(o, ComputedBuffer)
+        }
 
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
@@ -279,12 +284,14 @@ def plan_coarse_tile_groups(
 
             if _plan_is_loop_invariant_at_reduction_levels(
                 op, op_tiled_dims, group_reduction_tiled_levels
+            ) and _reads_incomplete_reduction(
+                op, group_op_names, plan, group_reduction_tiled_levels
             ):
-                if _seed_buffer_for_carry(op, group_ops) is not None:
-                    raise Unsupported(
-                        f"reduction-dim tiling requiring carry propagation for "
-                        f"op {op.get_name()}"
-                    )
+                raise Unsupported(
+                    f"partial reduction result consumed before accumulation "
+                    f"is complete (op {op.get_name()} reads a per-tile "
+                    f"partial result from the same loop group)"
+                )
 
             per_level_extents = _planned_tile_extents_per_level(
                 op, op_tiled_dims, op_tiled_reduction_dims, levels
@@ -959,6 +966,30 @@ def _op_hint_dim_positions(op: ComputedBuffer, hint_id: int) -> tuple[bool, bool
     return pos is not None, False
 
 
+def _reads_incomplete_reduction(
+    op: ComputedBuffer,
+    group_op_names: set[str],
+    plan: dict,
+    group_reduction_tiled_levels: set[int],
+) -> bool:
+    """True if op reads a group-sibling whose result is still partial at any
+    reduction-tiled level — i.e. the reduction hasn't accumulated yet when op runs."""
+    for n in _op_reads(op):
+        if n not in group_op_names:
+            continue
+        buf = V.graph.get_buffer(n)
+        if not isinstance(buf, ComputedBuffer):
+            continue
+        entry = plan.get(id(buf))
+        if entry is None:
+            continue
+        if any(
+            entry.loop_tiled_reduction_dims[i] for i in group_reduction_tiled_levels
+        ):
+            return True
+    return False
+
+
 def _plan_is_loop_invariant_at_reduction_levels(
     op: ComputedBuffer,
     op_tiled_dims: list[list[int]],
@@ -973,95 +1004,6 @@ def _plan_is_loop_invariant_at_reduction_levels(
     if not group_reduction_tiled_levels:
         return False
     return all(not op_tiled_dims[i] for i in group_reduction_tiled_levels)
-
-
-def _seed_buffer_for_carry(
-    op: ComputedBuffer,
-    group_ops: list[Operation],
-) -> ComputedBuffer | None:
-    """Return the pre-loop seed buffer op carries state through, or None.
-
-    A Pointwise op that is loop-invariant at the group's reduction-tiled
-    level(s) may be the carry-producing step of an online-softmax-style
-    recurrence (running max, rescale-accumulate) rather than an ordinary
-    broadcast/hoisted computation. Detection is closure-based rather than
-    classifying op in isolation, because the seed's closure (the set of ops
-    that read it, directly or transitively, without leaving the loop group)
-    may have more than one member — see _seed_closure — and no single op's
-    own consumer count or escape-the-loop status reliably identifies "the"
-    carry (that correspondence to the traced Python's recurrence-variable
-    rebinding is not recoverable from any one op in isolation):
-
-      1. op must read exactly one pre-loop seed buffer directly (a constant
-         fill — see _is_constant_fill — whose own reads all resolve to a
-         SpyreConstantFallback scalar; torch.full/torch.zeros/
-         torch.zeros_like lower to such a Pointwise wrapper. The seed may
-         or may not have a stamped in-group loop_group_id, depending on
-         whether its Python-source declaration sits inside or outside the
-         tiled scope — that placement does not affect its seed status).
-      2. op must be a member of that seed's closure (trivially true, since
-         op reads the seed directly).
-      3. op must be the *unique* closure member whose non-seed operands are
-         all external to the closure (_closure_member_has_external_operands_only).
-         If zero or more than one closure member satisfies this, return None
-         rather than guessing — this is a known, accepted limitation for
-         closures with more than one externally-fed member (not hit by any
-         current test).
-
-    Caller (plan_coarse_tile_groups) is responsible for the shape gate
-    (_plan_is_loop_invariant_at_reduction_levels); this function only
-    checks the seed-buffer data-flow shape.
-
-    Uses the pre-stamp closure helper (_seed_closure_pre_stamp) because
-    planning is zero-mutation and runs before _apply_plan stamps
-    loop_info -- the post-stamp _seed_closure would find no matches here.
-    """
-    if not isinstance(op.data, Pointwise):
-        return None
-
-    seed_candidates = []
-    for name in _op_reads(op):
-        buf = V.graph.get_buffer(name)
-        if not isinstance(buf, ComputedBuffer) or not _is_constant_fill(buf):
-            continue
-        # _is_constant_fill already requires every read of buf to come from
-        # a SpyreConstantFallback scalar — an op with real in-group operands
-        # can never satisfy it, so no additional loop_group_id check is
-        # needed to exclude "produced inside the loop" buffers. A seed can
-        # legitimately carry a stamped in-group loop_group_id (e.g. when its
-        # Python-source declaration sits inside the tiled scope).
-        seed_candidates.append(buf)
-
-    if len(seed_candidates) != 1:
-        return None
-    seed_buf = seed_candidates[0]
-    seed_name = seed_buf.get_name()
-
-    closure = _seed_closure_pre_stamp(seed_name, group_ops)
-    if op.get_name() not in closure:
-        return None
-
-    external_candidates = [
-        name
-        for name in closure
-        if _closure_member_has_external_operands_only(
-            name, seed_name, closure, group_ops
-        )
-    ]
-    if len(external_candidates) != 1:
-        logger.warning(
-            "_seed_buffer_for_carry: ambiguous carry detection for seed %s "
-            "(closure=%s) — found %d externally-fed closure members, "
-            "expected exactly 1; treating %s as not a carry step. See "
-            "_seed_buffer_for_carry's docstring, point 3.",
-            seed_name,
-            sorted(closure),
-            len(external_candidates),
-            op.get_name(),
-        )
-        return None
-
-    return seed_buf if external_candidates[0] == op.get_name() else None
 
 
 def _seed_closure(
@@ -1094,29 +1036,6 @@ def _seed_closure(
         if seed_name in _op_reads(o):
             closure.add(o.get_name())
     return closure
-
-
-def _closure_member_has_external_operands_only(
-    op_name: str,
-    seed_name: str,
-    closure: set[str],
-    operations: list[Operation],
-) -> bool:
-    """True if op_name's non-seed read operands are all outside closure.
-
-    This is the carry-producing member test: a true recurrence-update step
-    combines the previous carry value (the seed) with fresh, externally
-    derived per-iteration data. A step that combines the seed with an
-    already-computed sibling closure member is downstream of the actual
-    update, not the update itself (e.g. `correction = exp(M - max_running)`
-    reads `max_running`, a closure member, so it is excluded even though it
-    also reads the seed `M` directly).
-    """
-    op = V.graph.name_to_buffer.get(op_name)
-    if op is None:
-        return False
-    non_seed_reads = _op_reads(op) - {seed_name}
-    return not (non_seed_reads & closure)
 
 
 def _op_reads(op: ComputedBuffer) -> set[str]:
@@ -1432,45 +1351,6 @@ def _apply_plan(
         )
 
     return retiled_infos
-
-
-def _seed_closure_pre_stamp(seed_name: str, group_ops: list[Operation]) -> set[str]:
-    """Pre-stamp equivalent of _seed_closure, over a plain group_ops list.
-
-    Not transitive — see _seed_closure's docstring for why. Used during
-    planning, before _apply_plan stamps loop_info (so the outer-loop-group
-    filtering _seed_closure does via stamped loop_info is unnecessary —
-    group_ops is already scoped to the group).
-    """
-    return {
-        o.get_name()
-        for o in group_ops
-        if isinstance(o, ComputedBuffer) and seed_name in _op_reads(o)
-    }
-
-
-def _is_constant_fill(op: ComputedBuffer) -> bool:
-    """True if op is a Pointwise whose only reads come from SpyreConstantFallback.
-
-    full.default / zeros_like / zeros lower to a SpyreConstantFallback scalar
-    broadcast through a thin Pointwise wrapper.  These ops are position-
-    independent, so shrinking their per-tile range to match the tiled group
-    is semantically equivalent to slicing a full-sized fill.
-    """
-    if not isinstance(op.data, Pointwise):
-        return False
-    try:
-        rw = op.get_read_writes()
-    except Exception:
-        return False
-    from torch._inductor.dependencies import MemoryDep
-
-    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
-    if not reads:
-        return False
-    return all(
-        isinstance(V.graph.get_buffer(d.name), SpyreConstantFallback) for d in reads
-    )
 
 
 def coarse_tile_pre_stickify(
@@ -3437,7 +3317,6 @@ def _propagate_tiled_reduction_op(
     # redundant but harmless.
     dtype = op.get_dtype()
     device = op.get_device()
-    from ..ir import SpyreConstantFallback  # deferred: avoids circular import
 
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
