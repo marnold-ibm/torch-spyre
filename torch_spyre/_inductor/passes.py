@@ -425,24 +425,27 @@ def log_index_functions(graph: GraphLowering) -> None:
         key = f"{_RUN_ID}:{name}"
         for dep in rw.reads:
             print(
-                f"SPYRE_INDEX_FN {key} read"
+                f"\nSPYRE_INDEX_FN {key} read"
                 f" {sympy_str(dep.index)}"
                 f" | {var_ranges}"
-                f" | {sympy.srepr(dep.index)}"
+                f" | {sympy.srepr(dep.index)}",
+                flush=True,
             )
         for dep in rw.writes:
             print(
-                f"SPYRE_INDEX_FN {key} write"
+                f"\nSPYRE_INDEX_FN {key} write"
                 f" {sympy_str(dep.index)}"
                 f" | {var_ranges}"
-                f" | {sympy.srepr(dep.index)}"
+                f" | {sympy.srepr(dep.index)}",
+                flush=True,
             )
         # Emit stack trace line for source attribution
         origin = getattr(op, "origin_node", None)
         if origin is not None:
             stack = getattr(origin, "stack_trace", None) or ""
             escaped = stack.replace("\n", "\\n")
-            print(f"SPYRE_INDEX_STACK {key} | {escaped}")
+            test_name = os.environ.get("PYTEST_CURRENT_TEST", "")
+            print(f"\nSPYRE_INDEX_STACK {key} | {test_name} | {escaped}", flush=True)
 
 
 class CustomPreSchedulingPasses:

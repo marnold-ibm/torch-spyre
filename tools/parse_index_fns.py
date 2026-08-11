@@ -45,7 +45,12 @@ def _coeffs(expr: sympy.Expr) -> list[int] | None:
 
 
 def _is_linear(expr: sympy.Expr) -> bool:
-    return not expr.has(sympy.Mod) and not expr.has(sympy.floor)
+    if expr.has(sympy.Mod) or expr.has(sympy.floor):
+        return False
+    return not any(
+        type(a).__name__ == "ModularIndexing"
+        for a in expr.atoms(sympy.Function)
+    )
 
 
 def _has_tmp(expr: sympy.Expr) -> bool:
@@ -93,7 +98,7 @@ def _classify(expr: sympy.Expr, var_ranges: dict[str, int]) -> str:
         return "scalar"
 
     if not _is_linear(expr):
-        return "non-linear"
+        return "modular"
 
     if _has_tmp(expr):
         return "indirect"
@@ -154,9 +159,10 @@ def parse_fn_line(line: str) -> tuple[str, str, sympy.Expr, dict[str, int]] | No
     Returns (key, direction, expr, var_ranges) or None if unparseable.
     """
     line = line.strip()
-    if not line.startswith("SPYRE_INDEX_FN "):
+    idx = line.find("SPYRE_INDEX_FN ")
+    if idx == -1:
         return None
-    rest = line[len("SPYRE_INDEX_FN "):]
+    rest = line[idx + len("SPYRE_INDEX_FN "):]
     parts = rest.split(None, 2)  # key, direction, remainder
     if len(parts) < 3:
         return None
@@ -184,13 +190,17 @@ def parse_stack_line(line: str) -> tuple[str, str] | None:
     Returns (key, stack) or None if unparseable.
     """
     line = line.strip()
-    if not line.startswith("SPYRE_INDEX_STACK "):
+    idx = line.find("SPYRE_INDEX_STACK ")
+    if idx == -1:
         return None
-    rest = line[len("SPYRE_INDEX_STACK "):]
+    rest = line[idx + len("SPYRE_INDEX_STACK "):]
     if " | " not in rest:
         return None
-    key, escaped = rest.split(" | ", 1)
-    stack = escaped.replace("\\n", "\n")
+    parts = rest.split(" | ", 2)
+    key = parts[0]
+    test_name = parts[1] if len(parts) > 1 else ""
+    escaped = parts[2] if len(parts) > 2 else ""
+    stack = f"test: {test_name}\n{escaped.replace('\\n', chr(10))}"
     return key, stack
 
 
@@ -235,7 +245,7 @@ def main() -> None:
             examples[pair_key] = buf_key
 
     group_order = [
-        "scalar", "symbolic", "non-linear", "indirect",
+        "scalar", "symbolic", "modular", "indirect",
         "single-dim",
         "row-major", "row-major+missing-dim",
         "col-major", "col-major+missing-dim",
