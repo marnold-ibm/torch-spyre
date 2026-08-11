@@ -58,7 +58,6 @@ from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor import config
 from torch_spyre._inductor import spyre_hint
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-from torch._inductor.exc import InductorError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu, _compile_and_run  # noqa: E402
