@@ -3526,11 +3526,14 @@ def _retile_load_index(
     index: Expr,
     info: _RetiledBufferInfo,
 ) -> Expr:
-    """Rewrite a load index from old (full) strides to new (tile) strides.
+    """Rewrite a load index using compute_tile_index.
 
-    Used by _RetileLoadIndexHandler: consumer holds a pre-divide index whose
-    coefficients encode the full-buffer strides; compute_tile_index converts
-    them to tile strides.
+    Used by both _RetileLoadIndexHandler (full→tile) and _NameAndIndexSwapHandler
+    (tile→full rename). In both cases the index's atom coefficients are the
+    info.old_stride values and the target coefficients are info.new_stride.
+
+    compute_tile_index matches atom coefficients against `stride` (the first stride
+    parameter), so passing old_stride as `stride` works for both directions.
 
     compute_tile_index uses var_ranges only as a key-set to distinguish loop
     variables from shape symbols. We derive it directly from index.free_symbols
@@ -3568,68 +3571,6 @@ def _retile_load_index(
         return index
 
 
-def _redirect_load_index(
-    buf_name: str,
-    index: Expr,
-    info: _RetiledBufferInfo,
-) -> Expr:
-    """Rewrite a tile-local load index to address the full buffer.
-
-    Used by _NameAndIndexSwapHandler: consumer holds an index whose coefficients
-    encode the tile-buffer strides (info.old_stride); replace each coefficient
-    directly with the corresponding full-buffer stride (info.new_stride).
-
-    This is direct per-dimension stride substitution, not a tile decomposition.
-    compute_tile_index is NOT used here because the mapping is not a geometric
-    full→tile decomposition — it is simply old_stride[d] → new_stride[d] for
-    each dimension.
-    """
-    old_counts = {}
-    for s in info.old_stride:
-        s = sympy.simplify(s)
-        old_counts[s] = old_counts.get(s, 0) + 1
-
-    rewrites: dict[Expr, Expr] = {}
-    for old, new in zip(info.old_stride, info.new_stride):
-        old_s = sympy.simplify(old)
-        new_s = sympy.simplify(new)
-        if old_counts[old_s] == 1 and sympy.simplify(old_s - new_s) != 0:
-            rewrites[old_s] = new_s
-
-    if not rewrites:
-        return index
-
-    loop_vars = index.free_symbols
-    if not loop_vars:
-        return index
-
-    replacements = {var: sympy.S.Zero for var in loop_vars}
-    offset = index.xreplace(replacements)
-    adjusted_index = offset
-    changed = False
-    for var in sorted(loop_vars, key=str):
-        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
-        term = sympy.expand(index.xreplace(other_vars) - offset)
-        coeff = term.coeff(var)
-        coeff_s = sympy.simplify(coeff)
-        if coeff_s in rewrites:
-            adjusted_index += rewrites[coeff_s] * var
-            changed = True
-        else:
-            adjusted_index += term
-
-    if changed:
-        result = sympy.simplify(adjusted_index)
-        logger.debug(
-            "coarse_tile: redirected load index for %s: %s -> %s",
-            buf_name,
-            index,
-            result,
-        )
-        return result
-    return index
-
-
 class _RetileLoadIndexHandler(WrapperHandler):
     """Ops handler that retiles loads from buffers whose host strides changed."""
 
@@ -3647,10 +3588,8 @@ class _NameAndIndexSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) to a new name and rewrite its index.
 
     Rewrites the index while `name` is still the old name (its coefficients
-    are in the old buffer's strides), then swaps the name. Uses direct
-    stride-coefficient substitution (old_stride[d] → new_stride[d]) rather
-    than compute_tile_index, because this is a tile→full redirection, not a
-    full→tile decomposition.
+    are in the tile-buffer strides), then swaps the name to the full buffer.
+    Uses compute_tile_index in reverse (tile→full) via _retile_load_index.
     """
 
     def __init__(
@@ -3665,9 +3604,7 @@ class _NameAndIndexSwapHandler(WrapperHandler):
 
     def load(self, name, index):
         if name in self._infos_by_old_name:
-            index = _redirect_load_index(
-                name, index, self._infos_by_old_name[name]
-            )
+            index = _retile_load_index(name, index, self._infos_by_old_name[name])
         return super().load(self._name_map.get(name, name), index)
 
 
