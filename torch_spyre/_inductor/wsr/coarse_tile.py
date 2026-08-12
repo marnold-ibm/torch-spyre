@@ -2375,19 +2375,78 @@ def _insert_one_read_copy(
         full_buf = full_buf.data
 
     tile_ranges = list(dep.size)
-    # Fresh contiguous row-major strides for the copy buffer's own
-    # tile-sized shape.  The copy buffer is a NEW physically smaller
-    # allocation — NOT a view into full_buf — so its strides must match
-    # its own tile_ranges, not full_buf's layout.  The correct addressing
-    # of full_buf is already encoded in dep.index (via _copy_inner_fn),
-    # independent of the copy buffer's own layout.  This mirrors S3
-    # (_copy_inner_fn is correct as-is): the logic applies symmetrically
-    # to the copy buffer's write-side strides.
-    tile_strides: list[Expr] = []
-    stride: Expr = sympy.Integer(1)
-    for s in reversed(tile_ranges):
-        tile_strides.insert(0, stride)
-        stride = stride * s
+    # Derive copy buffer strides from full_buf's layout, preserving dim order.
+    # dep.size is the full loop iteration space (output + reduction dims) and
+    # may have higher rank than full_buf's layout (e.g. for a Reduction reading
+    # a[M,K], dep.size=[M,N,K_tile] while full_buf.layout.size=[M,K]).
+    # Use dep.index.coeff(v) to identify which dep.var_names positions
+    # correspond to actual tensor dims (non-zero coeff = present in full_buf)
+    # vs broadcast/absent dims (zero coeff).  Call compute_tile_stride only on
+    # the active dims; set stride 0 at broadcast positions.
+    full_coeff = [dep.index.coeff(v) for v in dep.var_names]
+    # Positions with non-zero coeff, sorted by their full-buffer stride value
+    # (ascending) to match compute_tile_stride's internal ordering assumption.
+    active_idx = sorted(
+        [i for i, c in enumerate(full_coeff) if c != 0],
+        key=lambda i: full_coeff[i],
+    )
+    tile_strides: list[Expr]
+    if not active_idx:
+        tile_strides = [sympy.Integer(0)] * len(tile_ranges)
+    else:
+        active_full_strides = [full_coeff[i] for i in active_idx]
+        active_tile_ranges = [tile_ranges[i] for i in active_idx]
+        # Reconstruct the full-buffer sizes for active dims from the stride
+        # ratios between adjacent dims.  Sort strides ascending to get inner
+        # (smallest stride) first; the size of each inner dim is
+        # next_stride / this_stride.  The outermost dim size comes from the
+        # full_buf layout directly.
+        full_layout = full_buf.layout
+        full_layout_size = list(full_layout.size)
+        full_layout_stride = list(full_layout.stride)
+        # Map active full strides → full_buf layout dim sizes via stride match.
+        active_full_sizes: list[Expr] = []
+        for fs in active_full_strides:
+            matched = next(
+                (full_layout_size[d] for d, ls in enumerate(full_layout_stride) if ls == fs),
+                None,
+            )
+            if matched is None:
+                # Fallback: can't match — give up and use row-major.
+                active_full_sizes = None  # type: ignore[assignment]
+                break
+            active_full_sizes.append(matched)
+        if active_full_sizes is None:
+            logger.warning(
+                "_insert_one_read_copy: could not match dep strides to layout for %r "
+                "(full_layout=%s dep.index=%s); using row-major fallback",
+                dep.name, full_layout, dep.index,
+            )
+            tile_strides = []
+            s: Expr = sympy.Integer(1)
+            for r in reversed(tile_ranges):
+                tile_strides.insert(0, s)
+                s = s * r
+        else:
+            try:
+                active_tile_strides = compute_tile_stride(
+                    active_full_sizes, active_full_strides, active_tile_ranges
+                )
+                tile_strides = [sympy.Integer(0)] * len(tile_ranges)
+                for pos, ts in zip(active_idx, active_tile_strides):
+                    tile_strides[pos] = ts
+            except Unsupported:
+                logger.warning(
+                    "_insert_one_read_copy: compute_tile_stride failed for %r "
+                    "(active_full_sizes=%s active_full_strides=%s active_tile_ranges=%s); "
+                    "using row-major fallback",
+                    dep.name, active_full_sizes, active_full_strides, active_tile_ranges,
+                )
+                tile_strides = []
+                s = sympy.Integer(1)
+                for r in reversed(tile_ranges):
+                    tile_strides.insert(0, s)
+                    s = s * r
 
     def _copy_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
         subs = dict(zip(_dep.var_names, idx))
