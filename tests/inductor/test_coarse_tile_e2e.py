@@ -1237,6 +1237,10 @@ def test_softmax_2d_512x256_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+# Two bugs blocked this before PR #3622: (1) sibling-op A-reduction vs A-output
+# tiling collision (colsum diagnostic: every output column summed to ~4.0 instead
+# of ~1.0); (2) squeeze-position bug in _insert_reduction_copy_op (issue #3613).
+# Post-#3622 compilation succeeds but results are still numerically wrong.
 @pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim0_A4_B4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""

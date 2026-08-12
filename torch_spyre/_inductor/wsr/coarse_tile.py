@@ -2402,6 +2402,9 @@ def _insert_one_read_copy(
         active_tile_strides = compute_tile_stride(
             active_full_sizes, active_full_strides, active_tile_ranges
         )
+        # active_tile_strides[i] corresponds to active_idx[i]: both are indexed
+        # by position in the compressed active-dims space, so zip pairs each
+        # full dep.var_names position with its computed tile stride correctly.
         tile_strides = [sympy.Integer(0)] * len(tile_ranges)
         for pos, ts in zip(active_idx, active_tile_strides):
             tile_strides[pos] = ts
@@ -3509,11 +3512,12 @@ def _retile_load_index(
       new_stride are the larger full strides).
 
     compute_tile_index is valid for both directions.  Its core,
-    compute_tile_offset, does divmod(coeff, s) for each paired stride s.
-    Each atom's coefficient IS one of the old strides, so the divmod is always
-    exact.  The direction of the ratio (÷ big × small vs ÷ small × big) doesn't
-    matter — the result is correct either way as long as coefficients are exact
-    multiples of s, which they are by construction.
+    compute_tile_offset, does divmod(coeff, s) for each paired stride s in
+    decreasing order.  Each atom's coefficient IS one of the old strides, so
+    each divmod is exact (remainder zero).  Potential ambiguity from duplicate
+    stride values is prevented by compute_tile_index's irregular-dimension
+    filter: size==1 and stride==0 dimensions are excluded before pairing, and
+    those are the only source of duplicate strides in a valid tensor layout.
 
     compute_tile_index uses var_ranges only as a key-set to distinguish loop
     variables from shape symbols.  We derive it from index.free_symbols so the
