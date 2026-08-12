@@ -65,6 +65,7 @@ from utils_inductor import compare_with_cpu, _compile_and_run  # noqa: E402
 
 _declare_tensor_dim = _pnd.declare_tensor_dim
 _name_tensor_dims = _pnd.name_tensor_dims
+copy_f = torch.ops.spyre.copy_f
 
 # Paths to mock for disabling actual device kernel execution.
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -193,7 +194,11 @@ def run_coarse_tile_test(
         if rtol is not None:
             kwargs["rtol"] = rtol
         compare_with_cpu(
-            fn, *cpu_tensors, target=spyre_result, run_eager=False, **kwargs
+            fn,
+            *cpu_tensors,
+            target=spyre_result,
+            run_eager=False,
+            **kwargs,
         )
 
 
@@ -705,6 +710,7 @@ def test_min_2d_512x256_reduce_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+# qqq
 def test_min_2d_512x256_reduce_dim0_A4_B4():
     """amin over dim=0 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -756,7 +762,9 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                 ):
                     return x.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(
+        fn, inputs, correctness=True
+    )  # nested tiling + reduction correctness bug
 
 
 def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
@@ -812,7 +820,9 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     ):
                         return x.amin(dim=2)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(
+        fn, inputs, correctness=True
+    )  # nested tiling + reduction correctness bug
 
 
 # ---------------------------------------------------------------------------
@@ -1219,7 +1229,9 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+@pytest.mark.skip(
+    reason="correctness bug: B÷4 tiled softmax produces numerical errors (0.3% mismatch)"
+)
 def test_softmax_2d_512x256_dim1_B4():
     """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1231,7 +1243,9 @@ def test_softmax_2d_512x256_dim1_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+@pytest.mark.skip(
+    reason="correctness bug: A÷4 B÷4 tiled softmax produces inf values (0.0% but inf diff)"
+)
 def test_softmax_2d_512x256_dim1_A4_B4():
     """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1244,7 +1258,9 @@ def test_softmax_2d_512x256_dim1_A4_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+@pytest.mark.skip(
+    reason="correctness bug: A÷4 tiled softmax over dim=0 produces numerical errors (0.0% but 0.24 diff)"
+)
 def test_softmax_2d_512x256_dim0_A4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1651,7 +1667,9 @@ def test_copy_into_preallocated_512x256_A4():
         c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c.copy_(a + b)
+                # copy_f is fused with the add (c is never read before write),
+                # but fn is still tiled correctly.
+                c = copy_f(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -1668,7 +1686,9 @@ def test_copy_into_preallocated_512x256_B4():
         c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c.copy_(a + b)
+                # copy_f is fused with the add (c is never read before write),
+                # but fn is still tiled correctly.
+                c = copy_f(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -1686,7 +1706,9 @@ def test_copy_into_preallocated_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    c.copy_(a + b)
+                    # copy_f is fused with the add (c is never read before write),
+                    # but fn is still tiled correctly.
+                    c = copy_f(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -1705,7 +1727,7 @@ def test_copy_inplace_accum_512x256_A4():
     def fn(acc, x):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc.copy_(acc + x)
+                acc = copy_f(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1721,7 +1743,7 @@ def test_copy_inplace_accum_512x256_B4():
     def fn(acc, x):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc.copy_(acc + x)
+                acc = copy_f(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1738,7 +1760,7 @@ def test_copy_inplace_accum_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    acc.copy_(acc + x)
+                    acc = copy_f(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1759,7 +1781,7 @@ def test_copy_rmw_correction_512x256_A4():
     def fn(acc, scale, y):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc.copy_(acc * scale + y)
+                acc = copy_f(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1776,7 +1798,7 @@ def test_copy_rmw_correction_512x256_B4():
     def fn(acc, scale, y):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc.copy_(acc * scale + y)
+                acc = copy_f(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1794,7 +1816,7 @@ def test_copy_rmw_correction_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    acc.copy_(acc * scale + y)
+                    acc = copy_f(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1805,12 +1827,12 @@ def test_copy_rmw_correction_512x256_A4_B4():
 
 
 def test_copy_not_deleted():
-    """Regression: copy_ must not be eliminated by noop_registry removal.
+    """Regression: copy_f must not be eliminated before hint validation.
 
-    If copy_ is deleted before lowering, the expected_reduction_dims hint on
+    If the copy is deleted before lowering, the expected_reduction_dims hint on
     the copy op is never checked (no op to check), and the test passes
-    vacuously.  If copy_ is present, validate_named_dims fires and raises
-    because copy_ has no reduction dim -- that AssertionError is the expected
+    vacuously.  If copy_f is present, validate_named_dims fires and raises
+    because copy_f has no reduction dim -- that InductorError is the expected
     outcome, proving the copy survived.
     """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1819,7 +1841,7 @@ def test_copy_not_deleted():
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
-                out.copy_(x.amin(dim=0))
+                out = copy_f(x.amin(dim=0), out)
         return out
 
     with pytest.raises(InductorError, match="expected_reduction_dims"):
@@ -1836,7 +1858,7 @@ def test_copy_after_reduction_512x256_A4():
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 temp = x.amin(dim=0)
             with spyre_hint(expected_named_dims=["B"]):
-                out.copy_(temp)
+                out = copy_f(temp, out)
         return out
 
     with pytest.raises(
@@ -1859,7 +1881,7 @@ def test_copy_after_reduction_512x256_B4():
                 out.copy_(temp)
         return out
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=True)
 
 
 def test_copy_after_reduction_512x256_A4_B4():
@@ -1875,7 +1897,7 @@ def test_copy_after_reduction_512x256_A4_B4():
                 ):
                     temp = x.amin(dim=0)
                 with spyre_hint(expected_named_dims=["B"]):
-                    out.copy_(temp)
+                    out = copy_f(temp, out)
         return out
 
     with pytest.raises(
@@ -1885,7 +1907,9 @@ def test_copy_after_reduction_512x256_A4_B4():
         run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+@pytest.mark.skip(
+    reason="correctness bug: H÷4 Lq÷4 tiled flash-style running max produces wrong results (39% mismatch)"
+)
 def test_copy_running_max_4d_H4_Lq4():
     """running_max.copy_(maximum(real_max, amax(scores,dim=-2))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
@@ -1934,7 +1958,7 @@ def test_copy_restickify_512x256_A4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None)
+    run_coarse_tile_test(fn, inputs, correctness=True)
 
 
 def test_copy_restickify_512x256_B4():
@@ -1951,7 +1975,7 @@ def test_copy_restickify_512x256_B4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None)
+    run_coarse_tile_test(fn, inputs, correctness=True)
 
 
 def test_copy_restickify_512x256_A4_B4():
@@ -1969,7 +1993,7 @@ def test_copy_restickify_512x256_A4_B4():
                     c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None)
+    run_coarse_tile_test(fn, inputs, correctness=True)
 
 
 # --- nested copy + reduction: acc.copy_(acc * scale + x.amin(dim=1, keepdim=True)) ---
@@ -2261,7 +2285,7 @@ def test_outside_consumer_two_accum_512x256_A4():
 
 
 def test_outside_consumer_two_accum_512x256_B4():
-    """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — B÷4 must be rejected."""
+    """Flash-style: out=zeros, denom=zeros; tiled copy_f; return out/denom — B÷4 must be rejected."""
     inputs = [
         tensor("x", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 256), dims=["A", "B"]),
@@ -2272,9 +2296,9 @@ def test_outside_consumer_two_accum_512x256_B4():
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                out.copy_(out * scale + x)
+                out = copy_f(out * scale + x, out)
             with spyre_hint(expected_named_dims=["A"]):
-                denom.copy_(denom + x.sum(dim=1))
+                denom = copy_f(denom + x.sum(dim=1), denom)
         return out / denom.unsqueeze(1)
 
     with pytest.raises(
@@ -2345,7 +2369,9 @@ def test_outside_consumer_reduction_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+@pytest.mark.skip(
+    reason="correctness bug: A÷4 B÷4 tiled reduction with outside consumer produces inf (84.8% mismatch)"
+)
 def test_outside_consumer_reduction_512x256_A4_B4():
     """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4 B÷4."""
     inputs = [
@@ -2758,6 +2784,7 @@ def test_flash_tile_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
+        correctness=True,
     )
 
 
@@ -2805,6 +2832,7 @@ def test_flash_tile_H_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
+        correctness=True,
     )
 
 
@@ -3209,6 +3237,7 @@ def test_flash_v3_tile_H():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
+        correctness=True,
     )
 
 
@@ -3241,6 +3270,7 @@ def test_flash_v3_tile_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
+        correctness=True,
     )
 
 
@@ -3287,6 +3317,7 @@ def test_flash_v3_tile_H_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
+        correctness=True,
     )
 
 
@@ -3512,7 +3543,7 @@ def test_validate_named_dims_raises_on_mismatch():
             return torch.abs(x)
 
     with pytest.raises(Exception, match="expected_named_dims"):
-        run_coarse_tile_test(fn, inputs, loopspec=None)
+        run_coarse_tile_test(fn, inputs, correctness=True)
 
 
 def test_validate_reduction_dims_raises_on_mismatch():
@@ -3524,7 +3555,7 @@ def test_validate_reduction_dims_raises_on_mismatch():
             return x.amin(dim=0)
 
     with pytest.raises(Exception, match="expected_reduction_dims"):
-        run_coarse_tile_test(fn, inputs, loopspec=None)
+        run_coarse_tile_test(fn, inputs, correctness=True)
 
 
 # ===========================================================================
