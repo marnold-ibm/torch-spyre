@@ -896,7 +896,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
         info = _RetiledBufferInfo(
             old_stride=(Integer(4096), Integer(1)),
             new_stride=(Integer(512), Integer(1)),
-            size=(Integer(4), Integer(512)),
+            old_size=(Integer(4), Integer(512)),
         )
         result = _retile_load_index("buf", 4096 * c0 + c1, info)
 
@@ -909,12 +909,28 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
         info = _RetiledBufferInfo(
             old_stride=(Integer(128), Integer(1)),
             new_stride=(Integer(64), Integer(1)),
-            size=(Integer(2), Integer(128)),
+            old_size=(Integer(2), Integer(128)),
         )
         from torch_spyre._inductor.errors import Unsupported
 
         with self.assertRaises(Unsupported):
             _retile_load_index("buf", index, info)
+
+    def test_dim_that_becomes_size1_after_tiling_is_still_rewritten(self):
+        # A dim with old_size=2 tiled to new_size=1 must still have its stride
+        # coefficient rewritten. compute_tile_index excludes dims where size==1
+        # from matching, so passing new_size (1) instead of old_size (2) would
+        # cause the stride 2 coefficient to go unmatched — wrong result.
+        # This test verifies the fix: _RetiledBufferInfo.size holds old_size.
+        c0, c1 = sympy.symbols("c0 c1")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(2), Integer(1)),
+            new_stride=(Integer(1), Integer(1)),
+            old_size=(Integer(2), Integer(2)),
+        )
+        result = _retile_load_index("buf", 2 * c0 + c1, info)
+
+        self.assertEqual(simplify(result - (c0 + c1)), 0)
 
     def test_distinct_old_strides_are_each_rewritten_correctly(self):
         # Two dims with distinct old strides: compute_tile_index maps each via
@@ -923,7 +939,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
         info = _RetiledBufferInfo(
             old_stride=(Integer(256), Integer(128)),
             new_stride=(Integer(64), Integer(32)),
-            size=(Integer(2), Integer(4)),
+            old_size=(Integer(2), Integer(4)),
         )
         result_c0 = _retile_load_index("buf", 256 * c0, info)
         result_c1 = _retile_load_index("buf", 128 * c1, info)

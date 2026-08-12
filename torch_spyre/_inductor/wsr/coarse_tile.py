@@ -110,11 +110,11 @@ logger = get_inductor_logger("coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):
-    """Host strides/size before and after a buffer is resized for a coarse tile."""
+    """Host strides before and after a buffer is resized for a coarse tile."""
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
-    size: tuple[Expr, ...]
+    old_size: tuple[Expr, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1273,7 @@ def _apply_plan(
                 prior = retiled_infos.get(name)
                 retiled_infos[name] = (
                     _RetiledBufferInfo(
-                        prior.old_stride, retiled_info.new_stride, retiled_info.size
+                        prior.old_stride, retiled_info.new_stride, prior.old_size
                     )
                     if prior is not None
                     else retiled_info
@@ -3502,6 +3502,19 @@ def _retile_load_index(
     codegen.  In both cases the incoming index has coefficients equal to
     info.old_stride and the call rewrites them to info.new_stride.
 
+    The two handlers run in opposite directions:
+    - _RetileLoadIndexHandler: full→tile (old_stride are the full strides,
+      new_stride are the smaller tile strides).
+    - _NameAndIndexSwapHandler: tile→full (old_stride are the tile strides,
+      new_stride are the larger full strides).
+
+    compute_tile_index is valid for both directions.  Its core,
+    compute_tile_offset, does divmod(coeff, s) for each paired stride s.
+    Each atom's coefficient IS one of the old strides, so the divmod is always
+    exact.  The direction of the ratio (÷ big × small vs ÷ small × big) doesn't
+    matter — the result is correct either way as long as coefficients are exact
+    multiples of s, which they are by construction.
+
     compute_tile_index uses var_ranges only as a key-set to distinguish loop
     variables from shape symbols.  We derive it from index.free_symbols so the
     call site never needs to know which prefix convention the calling inner_fn
@@ -3515,7 +3528,7 @@ def _retile_load_index(
     new_index = compute_tile_index(
         index,
         {sym: 1 for sym in loop_syms},
-        info.size,
+        info.old_size,
         info.old_stride,
         info.new_stride,
     )
