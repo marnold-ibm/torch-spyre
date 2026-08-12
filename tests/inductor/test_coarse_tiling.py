@@ -81,9 +81,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _full_buffer_read_deps,
     _replace_group_op,
     _rescale_index,
-    _retile_load_index_from_strides,
+    _retile_load_index,
     _should_patch_retiled_load_indexes,
-    _stride_rewrite_map,
     coarse_tile_post_stickify,
     coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
@@ -892,44 +891,44 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
     """Unit tests for converting stale full-buffer load indexes to tile indexes."""
 
     def test_rewrites_stale_full_stride_to_tile_stride(self):
+        # Row-major [8, 4096]: old stride (4096, 1), divided to tile [4, 512].
         c0, c1 = sympy.symbols("c0 c1")
-        rewrites = _stride_rewrite_map(
-            _RetiledBufferInfo(
-                old_stride=(Integer(8192), Integer(2048), Integer(1)),
-                new_stride=(Integer(2048), Integer(512), Integer(1)),
-            )
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(4096), Integer(1)),
+            new_stride=(Integer(512), Integer(1)),
+            size=(Integer(4), Integer(512)),
         )
-
-        result = _retile_load_index_from_strides("buf", 2048 * c0 + c1, rewrites)
+        result = _retile_load_index("buf", 4096 * c0 + c1, info)
 
         self.assertEqual(simplify(result - (512 * c0 + c1)), 0)
 
     def test_mixed_loop_variable_terms_are_not_rewritten(self):
+        # Index with a product of two loop vars is not decomposable; fallback.
         c0, c1, c2 = sympy.symbols("c0 c1 c2")
         index = c0 * c1 + 128 * c0 + c2
-        rewrites = _stride_rewrite_map(
-            _RetiledBufferInfo(
-                old_stride=(Integer(256), Integer(128), Integer(1)),
-                new_stride=(Integer(128), Integer(64), Integer(1)),
-            )
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(128), Integer(1)),
+            new_stride=(Integer(64), Integer(1)),
+            size=(Integer(2), Integer(128)),
         )
-
-        result = _retile_load_index_from_strides("buf", index, rewrites)
+        result = _retile_load_index("buf", index, info)
 
         self.assertEqual(simplify(result - index), 0)
 
-    def test_ambiguous_old_strides_are_not_rewritten(self):
-        c0 = sympy.symbols("c0")
-        rewrites = _stride_rewrite_map(
-            _RetiledBufferInfo(
-                old_stride=(Integer(128), Integer(128), Integer(1)),
-                new_stride=(Integer(64), Integer(32), Integer(1)),
-            )
+    def test_distinct_old_strides_are_each_rewritten_correctly(self):
+        # Two dims with distinct old strides: compute_tile_index maps each via
+        # paired-stride resolution, producing independent correct rewrites.
+        c0, c1 = sympy.symbols("c0 c1")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(256), Integer(128)),
+            new_stride=(Integer(64), Integer(32)),
+            size=(Integer(2), Integer(4)),
         )
+        result_c0 = _retile_load_index("buf", 256 * c0, info)
+        result_c1 = _retile_load_index("buf", 128 * c1, info)
 
-        result = _retile_load_index_from_strides("buf", 128 * c0, rewrites)
-
-        self.assertEqual(simplify(result - 128 * c0), 0)
+        self.assertEqual(simplify(result_c0 - 64 * c0), 0)
+        self.assertEqual(simplify(result_c1 - 32 * c1), 0)
 
 
 class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):

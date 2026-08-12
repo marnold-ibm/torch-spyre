@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections import Counter
 from typing import NamedTuple
 
 import sympy
@@ -105,16 +104,17 @@ from ..loop_info import (
 )
 from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
-from .tile import compute_tile_stride
+from .tile import compute_tile_index, compute_tile_stride
 
 logger = get_inductor_logger("coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):
-    """Host strides before and after a buffer is resized for a coarse tile."""
+    """Host strides/size before and after a buffer is resized for a coarse tile."""
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
+    size: tuple[Expr, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1143,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride))
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), tuple(layout.size))
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -1260,7 +1260,9 @@ def _apply_plan(
                 name = op.get_name()
                 prior = retiled_infos.get(name)
                 retiled_infos[name] = (
-                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                    _RetiledBufferInfo(
+                        prior.old_stride, retiled_info.new_stride, retiled_info.size
+                    )
                     if prior is not None
                     else retiled_info
                 )
@@ -1776,7 +1778,9 @@ def _propagate_tiled_op(
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
-    retile_info = _RetiledBufferInfo(old_stride, tuple(full_buf.layout.stride))
+    retile_info = _RetiledBufferInfo(
+        old_stride, tuple(full_buf.layout.stride), tuple(full_buf.layout.size)
+    )
     _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
@@ -3356,7 +3360,9 @@ def _propagate_tiled_reduction_op(
     all_consumers = outside_consumers + inside_consumers
     accum_name = accum_full.get_name()
     retile_info = _RetiledBufferInfo(
-        tuple(op.layout.stride), tuple(accum_full.layout.stride)
+        tuple(op.layout.stride),
+        tuple(accum_full.layout.stride),
+        tuple(accum_full.layout.size),
     )
     _patch_consumers(all_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
@@ -3405,7 +3411,9 @@ def _patch_consumers(
     from ..pass_utils import replace_computed_buffer_body
 
     name_map = {old_name: new_name}
-    rewrites = _stride_rewrite_map(retile_info) if retile_info is not None else {}
+    has_retile = (
+        retile_info is not None and retile_info.old_stride != retile_info.new_stride
+    )
 
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
@@ -3413,11 +3421,13 @@ def _patch_consumers(
         def new_inner_fn(
             *args,
             _map=name_map,
-            _rewrites_by_old_name={old_name: rewrites} if rewrites else {},
+            _info=retile_info if has_retile else None,
             _orig=orig_inner,
         ):
-            if _rewrites_by_old_name:
-                handler = _NameAndIndexSwapHandler(V.ops, _map, _rewrites_by_old_name)
+            if _info is not None:
+                handler = _NameAndIndexSwapHandler(
+                    V.ops, _map, {old_name: _info}
+                )
             else:
                 handler = NameSwapHandler(V.ops, _map)
             with V.set_ops_handler(handler):
@@ -3441,25 +3451,80 @@ def _patch_consumers(
         ]
 
 
-def _stride_rewrite_map(info: _RetiledBufferInfo) -> dict[Expr, Expr]:
-    """Map unique stale stride coefficients to their retiled coefficients."""
-
-    old_counts = Counter(sympy.simplify(s) for s in info.old_stride)
-    rewrites: dict[Expr, Expr] = {}
-    for old, new in zip(info.old_stride, info.new_stride):
-        old = sympy.simplify(old)
-        new = sympy.simplify(new)
-        if old_counts[old] == 1 and sympy.simplify(old - new) != 0:
-            rewrites[old] = new
-    return rewrites
-
-
-def _retile_load_index_from_strides(
+def _retile_load_index(
     buf_name: str,
     index: Expr,
-    rewrites: dict[Expr, Expr],
+    info: _RetiledBufferInfo,
 ) -> Expr:
-    """Rewrite separable affine load-index terms from full strides to tile strides."""
+    """Rewrite a load index from old (full) strides to new (tile) strides.
+
+    Used by _RetileLoadIndexHandler: consumer holds a pre-divide index whose
+    coefficients encode the full-buffer strides; compute_tile_index converts
+    them to tile strides.
+
+    compute_tile_index uses var_ranges only as a key-set to distinguish loop
+    variables from shape symbols. We derive it directly from index.free_symbols
+    so the call site never needs to know which prefix convention the calling
+    inner_fn uses for its loop variables.
+    """
+    from ..errors import Unsupported
+
+    loop_syms = index.free_symbols
+    if not loop_syms:
+        return index
+
+    try:
+        new_index = compute_tile_index(
+            index,
+            {sym: 1 for sym in loop_syms},
+            info.size,
+            info.old_stride,
+            info.new_stride,
+        )
+        logger.debug(
+            "coarse_tile: retiled load index for %s: %s -> %s",
+            buf_name,
+            index,
+            new_index,
+        )
+        return new_index
+    except Unsupported:
+        logger.warning(
+            "coarse_tile: could not retile load index for %s: index=%s "
+            "(falling back to original index)",
+            buf_name,
+            index,
+        )
+        return index
+
+
+def _redirect_load_index(
+    buf_name: str,
+    index: Expr,
+    info: _RetiledBufferInfo,
+) -> Expr:
+    """Rewrite a tile-local load index to address the full buffer.
+
+    Used by _NameAndIndexSwapHandler: consumer holds an index whose coefficients
+    encode the tile-buffer strides (info.old_stride); replace each coefficient
+    directly with the corresponding full-buffer stride (info.new_stride).
+
+    This is direct per-dimension stride substitution, not a tile decomposition.
+    compute_tile_index is NOT used here because the mapping is not a geometric
+    full→tile decomposition — it is simply old_stride[d] → new_stride[d] for
+    each dimension.
+    """
+    old_counts = {}
+    for s in info.old_stride:
+        s = sympy.simplify(s)
+        old_counts[s] = old_counts.get(s, 0) + 1
+
+    rewrites: dict[Expr, Expr] = {}
+    for old, new in zip(info.old_stride, info.new_stride):
+        old_s = sympy.simplify(old)
+        new_s = sympy.simplify(new)
+        if old_counts[old_s] == 1 and sympy.simplify(old_s - new_s) != 0:
+            rewrites[old_s] = new_s
 
     if not rewrites:
         return index
@@ -3470,98 +3535,68 @@ def _retile_load_index_from_strides(
 
     replacements = {var: sympy.S.Zero for var in loop_vars}
     offset = index.xreplace(replacements)
-    projection_terms: dict[sympy.Symbol, Expr] = {}
-    for var in sorted(loop_vars, key=str):
-        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
-        projection_terms[var] = sympy.expand(index.xreplace(other_vars) - offset)
-
-    residual = sympy.simplify(index - offset - sum(projection_terms.values()))
-    if residual != 0:
-        logger.warning(
-            "coarse_tile: refusing to retile load index for %s: index=%s has "
-            "mixed loop-variable residual %s",
-            buf_name,
-            index,
-            residual,
-        )
-        return index
-
     adjusted_index = offset
     changed = False
     for var in sorted(loop_vars, key=str):
-        term = projection_terms[var]
+        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
+        term = sympy.expand(index.xreplace(other_vars) - offset)
         coeff = term.coeff(var)
-        remainder = sympy.simplify(term - coeff * var)
-        if remainder != 0:
-            logger.warning(
-                "coarse_tile: refusing to retile load index for %s: projection "
-                "for %s is non-affine in index=%s: %s",
-                buf_name,
-                var,
-                index,
-                term,
-            )
-            return index
-
-        matches = [
-            new_coeff
-            for old_coeff, new_coeff in rewrites.items()
-            if sympy.simplify(coeff - old_coeff) == 0
-        ]
-        if len(matches) == 1:
-            adjusted_index += matches[0] * var
+        coeff_s = sympy.simplify(coeff)
+        if coeff_s in rewrites:
+            adjusted_index += rewrites[coeff_s] * var
             changed = True
         else:
             adjusted_index += term
 
     if changed:
+        result = sympy.simplify(adjusted_index)
         logger.debug(
-            "coarse_tile: retiled load index for %s: %s -> %s",
+            "coarse_tile: redirected load index for %s: %s -> %s",
             buf_name,
             index,
-            adjusted_index,
+            result,
         )
-        return sympy.simplify(adjusted_index)
+        return result
     return index
 
 
 class _RetileLoadIndexHandler(WrapperHandler):
     """Ops handler that retiles loads from buffers whose host strides changed."""
 
-    def __init__(self, inner, rewrites_by_name: dict[str, dict[Expr, Expr]]):
+    def __init__(self, inner, infos_by_name: dict[str, _RetiledBufferInfo]):
         super().__init__(inner)
-        self._rewrites_by_name = rewrites_by_name
+        self._infos_by_name = infos_by_name
 
     def load(self, name, index):
-        if name in self._rewrites_by_name:
-            index = _retile_load_index_from_strides(
-                name, index, self._rewrites_by_name[name]
-            )
+        if name in self._infos_by_name:
+            index = _retile_load_index(name, index, self._infos_by_name[name])
         return super().load(name, index)
 
 
 class _NameAndIndexSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) to a new name and rewrite its index.
 
-    Rewrites index while `name` is still the old name (its coefficients are
-    in the old buffer's strides), then swaps the name. Reuses
-    _retile_load_index_from_strides.
+    Rewrites the index while `name` is still the old name (its coefficients
+    are in the old buffer's strides), then swaps the name. Uses direct
+    stride-coefficient substitution (old_stride[d] → new_stride[d]) rather
+    than compute_tile_index, because this is a tile→full redirection, not a
+    full→tile decomposition.
     """
 
     def __init__(
         self,
         inner,
         name_map: dict[str, str],
-        rewrites_by_old_name: dict[str, dict[Expr, Expr]],
+        infos_by_old_name: dict[str, _RetiledBufferInfo],
     ):
         super().__init__(inner)
         self._name_map = name_map
-        self._rewrites_by_old_name = rewrites_by_old_name
+        self._infos_by_old_name = infos_by_old_name
 
     def load(self, name, index):
-        if name in self._rewrites_by_old_name:
-            index = _retile_load_index_from_strides(
-                name, index, self._rewrites_by_old_name[name]
+        if name in self._infos_by_old_name:
+            index = _redirect_load_index(
+                name, index, self._infos_by_old_name[name]
             )
         return super().load(self._name_map.get(name, name), index)
 
@@ -3600,12 +3635,12 @@ def _patch_retiled_load_indexes(
     operations: list[Operation],
 ) -> None:
     """Rewrite stale load indexes for consumers of buffers retiled by coarse tiling."""
-    rewrites_by_name = {
-        name: rewrites
+    infos_by_name = {
+        name: info
         for name, info in retiled_infos.items()
-        if (rewrites := _stride_rewrite_map(info))
+        if info.old_stride != info.new_stride
     }
-    if not rewrites_by_name:
+    if not infos_by_name:
         return
 
     from ..pass_utils import replace_computed_buffer_body
@@ -3616,15 +3651,19 @@ def _patch_retiled_load_indexes(
     # buffer's already-updated layout directly, so rewriting them here would
     # double-apply the stride correction (see issue found while fixing
     # test_hint_restickify_stays_in_group).
-    retiled_names = set(rewrites_by_name)
+    retiled_names = set(infos_by_name)
     for op in list(group_ops):
         if not _should_patch_retiled_load_indexes(op, group_id, retiled_names):
             continue
 
         orig_inner = op.data.inner_fn
 
-        def new_inner_fn(*args, _rewrites=rewrites_by_name, _orig=orig_inner):
-            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _rewrites)):
+        def new_inner_fn(
+            *args,
+            _infos=infos_by_name,
+            _orig=orig_inner,
+        ):
+            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _infos)):
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
