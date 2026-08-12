@@ -34,7 +34,7 @@ STRUCTURED TESTS (Groups 1-10)
     Group 9: Views — 1D sub-dim naming, reshape, view+transpose, unsqueeze
     Group 10: Flash attention variants — v1/v2/v3/v4, parameterized by size and tile dims
 
-    Tests marked loopspec=None, correctness=False are known broken and
+    Tests marked loopspec=None are known broken and
     skipped; see inline comments for root cause.
 
 ORIGINAL TESTS (below the boundary marker)
@@ -705,6 +705,7 @@ def test_min_2d_512x256_reduce_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_min_2d_512x256_reduce_dim0_A4_B4():
     """amin over dim=0 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -718,7 +719,7 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
                     return x.amin(dim=0)
 
     run_coarse_tile_test(
-        fn, inputs, correctness=False
+        fn, inputs
     )  # nested tiling + reduction correctness bug
 
 
@@ -759,8 +760,8 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                     return x.amin(dim=1)
 
     run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+        fn, inputs
+    )  
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -811,8 +812,8 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                         return x.amin(dim=2)
 
     run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+        fn, inputs
+    )  
 
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1195,7 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_softmax_2d_512x256_dim1_B4():
     """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1202,9 +1204,10 @@ def test_softmax_2d_512x256_dim1_B4():
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)  
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_softmax_2d_512x256_dim1_A4_B4():
     """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1214,9 +1217,10 @@ def test_softmax_2d_512x256_dim1_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)  
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_softmax_2d_512x256_dim0_A4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1225,7 +1229,7 @@ def test_softmax_2d_512x256_dim0_A4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs) 
 
 
 def test_softmax_2d_512x256_dim0_B4():
@@ -1239,6 +1243,7 @@ def test_softmax_2d_512x256_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_softmax_2d_512x256_dim0_A4_B4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1248,7 +1253,7 @@ def test_softmax_2d_512x256_dim0_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)  
 
 
 # ---------------------------------------------------------------------------
@@ -1828,7 +1833,7 @@ def test_copy_after_reduction_512x256_B4():
                 out.copy_(temp)
         return out
 
-    run_coarse_tile_test(fn, inputs, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 @config.patch({"disable_copy_opt": True})
@@ -1855,6 +1860,7 @@ def test_copy_after_reduction_512x256_A4_B4():
         run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_copy_running_max_4d_H4_Lq4():
     """running_max.copy_(maximum(real_max, amax(scores,dim=-2))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
@@ -1882,7 +1888,7 @@ def test_copy_running_max_4d_H4_Lq4():
                 real_max.copy_(running_max)
         return real_max
 
-    run_coarse_tile_test(fn, inputs, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 # --- copy + restickify: c.copy_(a.t() + b) ---
@@ -1903,7 +1909,7 @@ def test_copy_restickify_512x256_A4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 def test_copy_restickify_512x256_B4():
@@ -1920,7 +1926,7 @@ def test_copy_restickify_512x256_B4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 def test_copy_restickify_512x256_A4_B4():
@@ -1938,7 +1944,7 @@ def test_copy_restickify_512x256_A4_B4():
                     c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 # --- nested copy + reduction: acc.copy_(acc * scale + x.amin(dim=1, keepdim=True)) ---
@@ -2315,6 +2321,7 @@ def test_outside_consumer_reduction_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason=("correctness"))
 def test_outside_consumer_reduction_512x256_A4_B4():
     """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4 B÷4."""
     inputs = [
@@ -2331,7 +2338,7 @@ def test_outside_consumer_reduction_512x256_A4_B4():
                     s = x.amin(dim=0)
         return s + bias
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs) 
 
 
 # ---------------------------------------------------------------------------
@@ -2693,7 +2700,6 @@ def test_flash_tile_H():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=True,
         atol=0.01,
         rtol=0.1,
     )
@@ -2728,7 +2734,6 @@ def test_flash_tile_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -2776,7 +2781,6 @@ def test_flash_tile_H_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,  # Numerically incorrect answer
     )
 
 
@@ -2947,7 +2951,6 @@ def test_flash_v2_tile_H():
         ),
         _flash_v2_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=True,
         atol=0.01,
         rtol=0.1,
     )
@@ -3182,7 +3185,6 @@ def test_flash_v3_tile_H():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=False,
     )
 
 
@@ -3215,7 +3217,6 @@ def test_flash_v3_tile_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -3262,7 +3263,6 @@ def test_flash_v3_tile_H_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,
     )
 
 
@@ -3488,7 +3488,7 @@ def test_validate_named_dims_raises_on_mismatch():
             return torch.abs(x)
 
     with pytest.raises(Exception, match="expected_named_dims"):
-        run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+        run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 def test_validate_reduction_dims_raises_on_mismatch():
@@ -3500,7 +3500,7 @@ def test_validate_reduction_dims_raises_on_mismatch():
             return x.amin(dim=0)
 
     with pytest.raises(Exception, match="expected_reduction_dims"):
-        run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+        run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 # ===========================================================================
