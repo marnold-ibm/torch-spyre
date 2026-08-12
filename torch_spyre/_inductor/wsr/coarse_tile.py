@@ -1141,6 +1141,7 @@ def _divide_ranges(
         return None
 
     old_stride = tuple(layout.stride)
+    old_size = tuple(layout.size)
     new_size = list(layout.size)
     for i in tiled_dims:
         new_size[i] = ranges[i]
@@ -1154,7 +1155,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride), tuple(layout.size))
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), old_size)
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -1774,6 +1775,7 @@ def _propagate_tiled_op(
 
     # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
+    old_size = tuple(op.layout.size)
 
     # Every cross-loop-group write always takes the copy-op path: the real
     # compute op keeps its own natural, input-derived, tile-sized layout,
@@ -1794,7 +1796,7 @@ def _propagate_tiled_op(
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
     retile_info = _RetiledBufferInfo(
-        old_stride, tuple(full_buf.layout.stride), tuple(full_buf.layout.size)
+        old_stride, tuple(full_buf.layout.stride), old_size
     )
     _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
@@ -3192,6 +3194,7 @@ def _propagate_tiled_reduction_op(
     loop_group_id = loop_info.loop_group_id
     reduction_plan = loop_info.propagation.reduction
     identity = reduction_plan.identity
+    op_size = tuple(op.layout.size)
 
     # Per-outer-tile output shape (ranges after any outer tiling divided them).
     per_tile_ranges = reduction_plan.per_tile_ranges
@@ -3400,7 +3403,7 @@ def _propagate_tiled_reduction_op(
     retile_info = _RetiledBufferInfo(
         tuple(op.layout.stride),
         tuple(accum_full.layout.stride),
-        tuple(accum_full.layout.size),
+        op_size,
     )
     _patch_consumers(all_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
