@@ -3492,51 +3492,45 @@ def _retile_load_index(
     index: Expr,
     info: _RetiledBufferInfo,
 ) -> Expr:
-    """Rewrite a load index using compute_tile_index.
+    """Rewrite a load index using compute_tile_index.  Raises Unsupported if
+    the index cannot be decomposed (non-affine, or stride not in info.old_stride).
 
-    Used by both _RetileLoadIndexHandler and _NameAndIndexSwapHandler. In both
-    cases the incoming index has coefficients equal to info.old_stride and we
-    want to produce an index with coefficients equal to info.new_stride — the
-    same direction, just different stride values at each call site.
+    Used by _RetileLoadIndexHandler and _NameAndIndexSwapHandler during real
+    codegen.  In both cases the incoming index has coefficients equal to
+    info.old_stride and the call rewrites them to info.new_stride.
 
     compute_tile_index uses var_ranges only as a key-set to distinguish loop
-    variables from shape symbols. We derive it directly from index.free_symbols
-    so the call site never needs to know which prefix convention the calling
-    inner_fn uses for its loop variables.
+    variables from shape symbols.  We derive it from index.free_symbols so the
+    call site never needs to know which prefix convention the calling inner_fn
+    uses for its loop variables.
     """
-    from ..errors import Unsupported
 
     loop_syms = index.free_symbols
     if not loop_syms:
         return index
 
-    try:
-        new_index = compute_tile_index(
-            index,
-            {sym: 1 for sym in loop_syms},
-            info.size,
-            info.old_stride,
-            info.new_stride,
-        )
-        logger.debug(
-            "coarse_tile: retiled load index for %s: %s -> %s",
-            buf_name,
-            index,
-            new_index,
-        )
-        return new_index
-    except Unsupported:
-        logger.warning(
-            "coarse_tile: could not retile load index for %s: index=%s "
-            "(falling back to original index)",
-            buf_name,
-            index,
-        )
-        return index
+    new_index = compute_tile_index(
+        index,
+        {sym: 1 for sym in loop_syms},
+        info.size,
+        info.old_stride,
+        info.new_stride,
+    )
+    logger.debug(
+        "coarse_tile: retiled load index for %s: %s -> %s",
+        buf_name,
+        index,
+        new_index,
+    )
+    return new_index
 
 
 class _RetileLoadIndexHandler(WrapperHandler):
-    """Ops handler that retiles loads from buffers whose host strides changed."""
+    """Ops handler that retiles loads from buffers whose host strides changed.
+
+    Used during real codegen — calls _retile_load_index, which raises
+    Unsupported if an index cannot be retiled.
+    """
 
     def __init__(self, inner, infos_by_name: dict[str, _RetiledBufferInfo]):
         super().__init__(inner)
@@ -3552,8 +3546,8 @@ class _NameAndIndexSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) to a new name and rewrite its index.
 
     Rewrites the index while `name` is still the old name (its coefficients
-    are info.old_stride), then swaps the name. Reuses _retile_load_index,
-    which rewrites old_stride coefficients to new_stride coefficients.
+    are info.old_stride), then swaps the name.  Calls _retile_load_index,
+    which raises Unsupported if the index cannot be retiled.
     """
 
     def __init__(

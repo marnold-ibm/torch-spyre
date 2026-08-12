@@ -902,8 +902,8 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
 
         self.assertEqual(simplify(result - (512 * c0 + c1)), 0)
 
-    def test_mixed_loop_variable_terms_are_not_rewritten(self):
-        # Index with a product of two loop vars is not decomposable; fallback.
+    def test_mixed_loop_variable_terms_raises(self):
+        # Index with a product of two loop vars is not decomposable; raises.
         c0, c1, c2 = sympy.symbols("c0 c1 c2")
         index = c0 * c1 + 128 * c0 + c2
         info = _RetiledBufferInfo(
@@ -911,9 +911,10 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             new_stride=(Integer(64), Integer(1)),
             size=(Integer(2), Integer(128)),
         )
-        result = _retile_load_index("buf", index, info)
+        from torch_spyre._inductor.errors import Unsupported
 
-        self.assertEqual(simplify(result - index), 0)
+        with self.assertRaises(Unsupported):
+            _retile_load_index("buf", index, info)
 
     def test_distinct_old_strides_are_each_rewritten_correctly(self):
         # Two dims with distinct old strides: compute_tile_index maps each via

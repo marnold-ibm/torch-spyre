@@ -705,7 +705,7 @@ def test_min_2d_512x256_reduce_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_min_2d_512x256_reduce_dim0_A4_B4():
     """amin over dim=0 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1189,7 +1189,7 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim1_B4():
     """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1201,7 +1201,7 @@ def test_softmax_2d_512x256_dim1_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim1_A4_B4():
     """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1214,7 +1214,7 @@ def test_softmax_2d_512x256_dim1_A4_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim0_A4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1237,7 +1237,7 @@ def test_softmax_2d_512x256_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim0_A4_B4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1854,7 +1854,7 @@ def test_copy_after_reduction_512x256_A4_B4():
         run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_copy_running_max_4d_H4_Lq4():
     """running_max.copy_(maximum(real_max, amax(scores,dim=-2))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
@@ -2315,7 +2315,7 @@ def test_outside_consumer_reduction_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason=("correctness"))
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_outside_consumer_reduction_512x256_A4_B4():
     """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4 B÷4."""
     inputs = [
