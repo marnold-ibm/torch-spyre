@@ -68,6 +68,12 @@ class ReductionPlan:
         Its ``loop_group_id`` is planning-time, pre-offset numbering --
         transformation must re-slice it from the op's own real, stamped
         ``loop_group_id`` before use (see ``_propagate_tiled_reduction_op``).
+    full_output_strides:
+        Host strides of the full-sized accumulation buffer, captured from
+        ``op.layout.stride`` at planning time (before ``_divide_ranges`` runs).
+    per_tile_strides:
+        Host strides of the per-outer-tile accumulation buffer, derived from
+        ``full_output_strides`` via ``compute_tile_stride`` at planning time.
     """
 
     reduction_type: str
@@ -76,6 +82,8 @@ class ReductionPlan:
     full_output_ranges: list[sympy.Expr]
     per_tile_ranges: list[sympy.Expr]
     outer_fill_loop_info: "CoarseTileInfo | None"
+    full_output_strides: tuple[sympy.Expr, ...]
+    per_tile_strides: tuple[sympy.Expr, ...]
 
 
 @dataclass(frozen=True)

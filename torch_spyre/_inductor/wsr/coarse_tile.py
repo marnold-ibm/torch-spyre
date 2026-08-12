@@ -562,6 +562,14 @@ def _plan_tiling_propagation(
                 per_tile_ranges = _compute_per_tile_ranges_planned(op, info)
                 full_output_ranges = _compute_full_ranges_planned(op, info)
                 outer_fill_loop_info = _compute_fill_loop_info_planned(info)
+                full_output_strides = tuple(op.layout.stride)
+                per_tile_strides = tuple(
+                    compute_tile_stride(
+                        list(full_output_ranges),
+                        list(full_output_strides),
+                        list(per_tile_ranges),
+                    )
+                )
                 reduction_plan = ReductionPlan(
                     reduction_type=reduction_type,
                     identity=identity,
@@ -569,6 +577,8 @@ def _plan_tiling_propagation(
                     full_output_ranges=full_output_ranges,
                     per_tile_ranges=per_tile_ranges,
                     outer_fill_loop_info=outer_fill_loop_info,
+                    full_output_strides=full_output_strides,
+                    per_tile_strides=per_tile_strides,
                 )
                 buf_name = op.get_name()
                 consumer_names, is_graph_output = _find_outside_consumers_planned(
@@ -1745,6 +1755,7 @@ def _propagate_tiled_op(
     full_ranges = propagation.full_ranges
     assert full_ranges is not None, "full_ranges must be planned for copy_out ops"
     full_strides = propagation.full_strides
+    assert full_strides is not None, "full_strides must be planned for copy_out ops"
 
     # Insert the full buffer before the first op in the same outermost
     # loop group so it doesn't split the group's contiguous run in the
@@ -1926,7 +1937,7 @@ def _graph_output_names() -> set[str]:
 def _allocate_full_buffer(
     tiled_op: ComputedBuffer,
     full_ranges: list[Expr],
-    full_strides: tuple[Expr, ...] | None,
+    full_strides: tuple[Expr, ...],
     operations: list[Operation],
     insert_at_idx: int,
 ) -> ComputedBuffer:
@@ -1969,16 +1980,7 @@ def _allocate_full_buffer(
     # FixedLayout (stickification assigns the device layout later); post-stickify
     # we must build a FixedTiledLayout because stickification has already run.
     orig_layout = tiled_op.layout
-    # Use the original pre-division strides when available (preserves non-contiguous
-    # layouts such as column-major).  Fall back to row-major only when not supplied.
-    if full_strides is not None:
-        strides: list[Expr] = list(full_strides)
-    else:
-        strides = []
-        stride: Expr = sympy.Integer(1)
-        for s in reversed(full_ranges):
-            strides.insert(0, stride)
-            stride = stride * s
+    strides: list[Expr] = list(full_strides)
 
     if isinstance(orig_layout, FixedTiledLayout):
         # Post-stickify path (span-overflow groups): stickification has already
@@ -2375,78 +2377,32 @@ def _insert_one_read_copy(
         full_buf = full_buf.data
 
     tile_ranges = list(dep.size)
-    # Derive copy buffer strides from full_buf's layout, preserving dim order.
+    # Derive copy buffer strides using compute_tile_stride.
     # dep.size is the full loop iteration space (output + reduction dims) and
-    # may have higher rank than full_buf's layout (e.g. for a Reduction reading
-    # a[M,K], dep.size=[M,N,K_tile] while full_buf.layout.size=[M,K]).
-    # Use dep.index.coeff(v) to identify which dep.var_names positions
-    # correspond to actual tensor dims (non-zero coeff = present in full_buf)
-    # vs broadcast/absent dims (zero coeff).  Call compute_tile_stride only on
-    # the active dims; set stride 0 at broadcast positions.
+    # may have higher rank than the tensor (e.g. for a Reduction reading
+    # a[M,K], dep.size=[M,N,K_tile] while the tensor has rank 2).
+    # Use dep.index.coeff(v) to identify active dims (non-zero coeff) vs
+    # broadcast/absent dims (zero coeff, e.g. N above).  dep.size[i] is the
+    # full range for each active dim — the correct size to pass to
+    # compute_tile_stride without any lookup into full_buf's layout.
     full_coeff = [dep.index.coeff(v) for v in dep.var_names]
-    # Positions with non-zero coeff, sorted by their full-buffer stride value
-    # (ascending) to match compute_tile_stride's internal ordering assumption.
-    active_idx = sorted(
-        [i for i, c in enumerate(full_coeff) if c != 0],
-        key=lambda i: full_coeff[i],
-    )
+    # Positions with non-zero coeff are active tensor dims; zero coeff means
+    # broadcast/absent (e.g. the N dim in a Reduction reading a[M,K]).
+    active_idx = [i for i, c in enumerate(full_coeff) if c != 0]
+
     tile_strides: list[Expr]
     if not active_idx:
         tile_strides = [sympy.Integer(0)] * len(tile_ranges)
     else:
+        active_full_sizes = [dep.size[i] for i in active_idx]
         active_full_strides = [full_coeff[i] for i in active_idx]
         active_tile_ranges = [tile_ranges[i] for i in active_idx]
-        # Reconstruct the full-buffer sizes for active dims from the stride
-        # ratios between adjacent dims.  Sort strides ascending to get inner
-        # (smallest stride) first; the size of each inner dim is
-        # next_stride / this_stride.  The outermost dim size comes from the
-        # full_buf layout directly.
-        full_layout = full_buf.layout
-        full_layout_size = list(full_layout.size)
-        full_layout_stride = list(full_layout.stride)
-        # Map active full strides → full_buf layout dim sizes via stride match.
-        active_full_sizes: list[Expr] = []
-        for fs in active_full_strides:
-            matched = next(
-                (full_layout_size[d] for d, ls in enumerate(full_layout_stride) if ls == fs),
-                None,
-            )
-            if matched is None:
-                # Fallback: can't match — give up and use row-major.
-                active_full_sizes = None  # type: ignore[assignment]
-                break
-            active_full_sizes.append(matched)
-        if active_full_sizes is None:
-            logger.warning(
-                "_insert_one_read_copy: could not match dep strides to layout for %r "
-                "(full_layout=%s dep.index=%s); using row-major fallback",
-                dep.name, full_layout, dep.index,
-            )
-            tile_strides = []
-            s: Expr = sympy.Integer(1)
-            for r in reversed(tile_ranges):
-                tile_strides.insert(0, s)
-                s = s * r
-        else:
-            try:
-                active_tile_strides = compute_tile_stride(
-                    active_full_sizes, active_full_strides, active_tile_ranges
-                )
-                tile_strides = [sympy.Integer(0)] * len(tile_ranges)
-                for pos, ts in zip(active_idx, active_tile_strides):
-                    tile_strides[pos] = ts
-            except Unsupported:
-                logger.warning(
-                    "_insert_one_read_copy: compute_tile_stride failed for %r "
-                    "(active_full_sizes=%s active_full_strides=%s active_tile_ranges=%s); "
-                    "using row-major fallback",
-                    dep.name, active_full_sizes, active_full_strides, active_tile_ranges,
-                )
-                tile_strides = []
-                s = sympy.Integer(1)
-                for r in reversed(tile_ranges):
-                    tile_strides.insert(0, s)
-                    s = s * r
+        active_tile_strides = compute_tile_stride(
+            active_full_sizes, active_full_strides, active_tile_ranges
+        )
+        tile_strides = [sympy.Integer(0)] * len(tile_ranges)
+        for pos, ts in zip(active_idx, active_tile_strides):
+            tile_strides[pos] = ts
 
     def _copy_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
         subs = dict(zip(_dep.var_names, idx))
@@ -3282,18 +3238,30 @@ def _propagate_tiled_reduction_op(
         # from their own loop_info, so accum_tile itself needs no flag);
         # accum_full accumulates across outer B-tiles via a copy op.
         accum_full = _allocate_full_buffer(
-            op, full_output_ranges, None, operations, group_start_idx
+            op,
+            full_output_ranges,
+            reduction_plan.full_output_strides,
+            operations,
+            group_start_idx,
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
-            op, per_tile_ranges, None, operations, group_start_idx_after_full
+            op,
+            per_tile_ranges,
+            reduction_plan.per_tile_strides,
+            operations,
+            group_start_idx_after_full,
         )
         fill_target = accum_tile
         combine_target = accum_tile
     else:
-        # Flat case: single full-sized buffer (unchanged behaviour).
+        # Flat case: single full-sized buffer.
         accum_full = _allocate_full_buffer(
-            op, full_output_ranges, None, operations, group_start_idx
+            op,
+            full_output_ranges,
+            reduction_plan.full_output_strides,
+            operations,
+            group_start_idx,
         )
         fill_target = accum_full
         combine_target = accum_full
@@ -3495,9 +3463,7 @@ def _patch_consumers(
             _orig=orig_inner,
         ):
             if _info is not None:
-                handler = _NameAndIndexSwapHandler(
-                    V.ops, _map, {old_name: _info}
-                )
+                handler = _NameAndIndexSwapHandler(V.ops, _map, {old_name: _info})
             else:
                 handler = NameSwapHandler(V.ops, _map)
             with V.set_ops_handler(handler):
@@ -3528,12 +3494,10 @@ def _retile_load_index(
 ) -> Expr:
     """Rewrite a load index using compute_tile_index.
 
-    Used by both _RetileLoadIndexHandler (full→tile) and _NameAndIndexSwapHandler
-    (tile→full rename). In both cases the index's atom coefficients are the
-    info.old_stride values and the target coefficients are info.new_stride.
-
-    compute_tile_index matches atom coefficients against `stride` (the first stride
-    parameter), so passing old_stride as `stride` works for both directions.
+    Used by both _RetileLoadIndexHandler and _NameAndIndexSwapHandler. In both
+    cases the incoming index has coefficients equal to info.old_stride and we
+    want to produce an index with coefficients equal to info.new_stride — the
+    same direction, just different stride values at each call site.
 
     compute_tile_index uses var_ranges only as a key-set to distinguish loop
     variables from shape symbols. We derive it directly from index.free_symbols
@@ -3588,8 +3552,8 @@ class _NameAndIndexSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) to a new name and rewrite its index.
 
     Rewrites the index while `name` is still the old name (its coefficients
-    are in the tile-buffer strides), then swaps the name to the full buffer.
-    Uses compute_tile_index in reverse (tile→full) via _retile_load_index.
+    are info.old_stride), then swaps the name. Reuses _retile_load_index,
+    which rewrites old_stride coefficients to new_stride coefficients.
     """
 
     def __init__(
