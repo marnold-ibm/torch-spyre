@@ -598,6 +598,7 @@ def _plan_tiling_propagation(
             info.propagation = PropagationPlan(
                 kind="copy_out",
                 full_ranges=full_ranges,
+                full_strides=tuple(op.layout.stride),
                 outside_consumer_names=tuple(consumer_names),
                 is_graph_output=is_graph_output,
             )
@@ -1743,6 +1744,7 @@ def _propagate_tiled_op(
 
     full_ranges = propagation.full_ranges
     assert full_ranges is not None, "full_ranges must be planned for copy_out ops"
+    full_strides = propagation.full_strides
 
     # Insert the full buffer before the first op in the same outermost
     # loop group so it doesn't split the group's contiguous run in the
@@ -1755,7 +1757,9 @@ def _propagate_tiled_op(
         and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
         == outer_key
     )
-    full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
+    full_buf = _allocate_full_buffer(
+        op, full_ranges, full_strides, operations, group_start_idx
+    )
 
     # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
@@ -1922,6 +1926,7 @@ def _graph_output_names() -> set[str]:
 def _allocate_full_buffer(
     tiled_op: ComputedBuffer,
     full_ranges: list[Expr],
+    full_strides: tuple[Expr, ...] | None,
     operations: list[Operation],
     insert_at_idx: int,
 ) -> ComputedBuffer:
@@ -1964,12 +1969,16 @@ def _allocate_full_buffer(
     # FixedLayout (stickification assigns the device layout later); post-stickify
     # we must build a FixedTiledLayout because stickification has already run.
     orig_layout = tiled_op.layout
-    # Recompute strides for the full size (contiguous row-major).
-    strides: list[Expr] = []
-    stride: Expr = sympy.Integer(1)
-    for s in reversed(full_ranges):
-        strides.insert(0, stride)
-        stride = stride * s
+    # Use the original pre-division strides when available (preserves non-contiguous
+    # layouts such as column-major).  Fall back to row-major only when not supplied.
+    if full_strides is not None:
+        strides: list[Expr] = list(full_strides)
+    else:
+        strides = []
+        stride: Expr = sympy.Integer(1)
+        for s in reversed(full_ranges):
+            strides.insert(0, stride)
+            stride = stride * s
 
     if isinstance(orig_layout, FixedTiledLayout):
         # Post-stickify path (span-overflow groups): stickification has already
@@ -2367,11 +2376,13 @@ def _insert_one_read_copy(
 
     tile_ranges = list(dep.size)
     # Fresh contiguous row-major strides for the copy buffer's own
-    # tile-sized shape (mirrors _allocate_full_buffer's strides loop) --
-    # NOT dep.index's own coefficients, which are strides into full_buf's
-    # full-sized layout (e.g. a row stride of the full row width) and
-    # would describe the freshly allocated, tile-sized copy buffer as if
-    # it shared the full buffer's physical layout.
+    # tile-sized shape.  The copy buffer is a NEW physically smaller
+    # allocation — NOT a view into full_buf — so its strides must match
+    # its own tile_ranges, not full_buf's layout.  The correct addressing
+    # of full_buf is already encoded in dep.index (via _copy_inner_fn),
+    # independent of the copy buffer's own layout.  This mirrors S3
+    # (_copy_inner_fn is correct as-is): the logic applies symmetrically
+    # to the copy buffer's write-side strides.
     tile_strides: list[Expr] = []
     stride: Expr = sympy.Integer(1)
     for s in reversed(tile_ranges):
@@ -3212,18 +3223,18 @@ def _propagate_tiled_reduction_op(
         # from their own loop_info, so accum_tile itself needs no flag);
         # accum_full accumulates across outer B-tiles via a copy op.
         accum_full = _allocate_full_buffer(
-            op, full_output_ranges, operations, group_start_idx
+            op, full_output_ranges, None, operations, group_start_idx
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
-            op, per_tile_ranges, operations, group_start_idx_after_full
+            op, per_tile_ranges, None, operations, group_start_idx_after_full
         )
         fill_target = accum_tile
         combine_target = accum_tile
     else:
         # Flat case: single full-sized buffer (unchanged behaviour).
         accum_full = _allocate_full_buffer(
-            op, full_output_ranges, operations, group_start_idx
+            op, full_output_ranges, None, operations, group_start_idx
         )
         fill_target = accum_full
         combine_target = accum_full

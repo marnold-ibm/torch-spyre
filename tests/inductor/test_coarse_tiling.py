@@ -4096,13 +4096,23 @@ def _make_rw_with_reads(*names):
 
 def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
     """Return a ComputedBuffer mock that looks like a stamped tiled Pointwise op."""
-    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
     data = MagicMock(spec=Pointwise)
     data.ranges = list(ranges)
 
+    # Build row-major strides for the default layout.
+    strides: list[sympy.Expr] = []
+    stride: sympy.Expr = sympy.Integer(1)
+    for s in reversed(ranges):
+        strides.insert(0, stride)
+        stride = stride * s
+    layout = MagicMock(spec=FixedLayout)
+    layout.stride = strides
+
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
+    op.layout = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(

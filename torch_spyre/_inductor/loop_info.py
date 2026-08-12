@@ -98,6 +98,10 @@ class PropagationPlan:
     full_ranges:
         Full (pre-division) iteration ranges for the copy-out's full buffer.
         Only set when ``kind == "copy_out"``.
+    full_strides:
+        Original (pre-division) strides of the tiled op's layout, captured at
+        planning time before ``_divide_ranges`` mutates the op.  Only set when
+        ``kind == "copy_out"``.
     reduction:
         Shape/identity/nesting decisions for the reduction machinery. Only
         set when ``kind == "reduction"``.
@@ -111,6 +115,7 @@ class PropagationPlan:
 
     kind: Literal["loop_internal", "copy_out", "reduction"]
     full_ranges: list[sympy.Expr] | None = None
+    full_strides: tuple[sympy.Expr, ...] | None = None
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
