@@ -718,7 +718,7 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
                 ):
                     return x.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs)  
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_2d_512x256_reduce_dim1_A4():
