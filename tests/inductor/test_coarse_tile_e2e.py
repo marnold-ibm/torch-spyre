@@ -1239,25 +1239,6 @@ def test_softmax_2d_512x256_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason=(
-        "validate_writer_tile_advance now catches this at compile time: two "
-        "distinct bugs. (1) coarse_tile's grouping assigns the same physical "
-        "loop level to buf0/buf3's A-reduction and buf1/buf2/buf4's A-output "
-        "tiling based purely on spyre_hint scope nesting order, with no check "
-        "that a sibling op's output-tiled use of a dim collides with another "
-        "op's reduction-tiled use of that same dim at the same level -- "
-        "confirmed via colsum diagnostic (every output column summed to ~4.0 "
-        "instead of ~1.0, i.e. buf4's division reads buf3's accumulator after "
-        "only 1 of 4 A-tile combines). (2) reordering the hint scopes so the "
-        "reduction dim nests inside the output dim (as correctness requires) "
-        "avoids bug 1 but then hits the same squeeze-position bug as issue "
-        "#3613: _insert_reduction_copy_op's write-side _tiled_dims_for_dep "
-        "breaks when the reduction dim's range-1 index gets squeezed out, "
-        "same root cause as test_flash_tile_Lq et al. above. Deferred until "
-        "PR #3622's tile.py helpers land."
-    )
-)
 def test_softmax_2d_512x256_dim0_A4_B4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1330,7 +1311,6 @@ def test_restickify_add_256x128_A2_B4():
 # A÷2=64/tile (1 stick), B÷4=64/tile (1 stick)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_A2():
     """a.t()+b.t()+x on [128,256] result, tiled A÷2."""
     inputs = [
@@ -1347,7 +1327,6 @@ def test_restickify_2t_add_256x128_A2():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_B4():
     """a.t()+b.t()+x on [128,256] result, tiled B÷4."""
     inputs = [
@@ -1364,7 +1343,6 @@ def test_restickify_2t_add_256x128_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_A2_B4():
     """a.t()+b.t()+x on [128,256] result, tiled A÷2 B÷4."""
     inputs = [
@@ -2827,7 +2805,6 @@ def test_flash_tile_H_Lq_Lk():
         )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
 def test_flash_tile_all():
     """Flash v1: tile all dims. B=2, H÷4, Lq÷2, Lk÷2 — rejected at compile time (carry propagation)."""
     with pytest.raises(
