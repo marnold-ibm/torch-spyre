@@ -762,9 +762,7 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                 ):
                     return x.amin(dim=1)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=True
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
@@ -820,9 +818,7 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     ):
                         return x.amin(dim=2)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=True
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -1881,7 +1877,7 @@ def test_copy_after_reduction_512x256_B4():
                 out.copy_(temp)
         return out
 
-    run_coarse_tile_test(fn, inputs, correctness=True)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_copy_after_reduction_512x256_A4_B4():
@@ -1958,7 +1954,7 @@ def test_copy_restickify_512x256_A4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, correctness=True)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_copy_restickify_512x256_B4():
@@ -1975,7 +1971,7 @@ def test_copy_restickify_512x256_B4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, correctness=True)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_copy_restickify_512x256_A4_B4():
@@ -1993,7 +1989,7 @@ def test_copy_restickify_512x256_A4_B4():
                     c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, correctness=True)
+    run_coarse_tile_test(fn, inputs)
 
 
 # --- nested copy + reduction: acc.copy_(acc * scale + x.amin(dim=1, keepdim=True)) ---
@@ -2784,7 +2780,6 @@ def test_flash_tile_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=True,
     )
 
 
@@ -2832,7 +2827,6 @@ def test_flash_tile_H_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=True,
     )
 
 
@@ -3237,7 +3231,6 @@ def test_flash_v3_tile_H():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=True,
     )
 
 
@@ -3270,7 +3263,6 @@ def test_flash_v3_tile_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=True,
     )
 
 
@@ -3317,7 +3309,6 @@ def test_flash_v3_tile_H_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=True,
     )
 
 
@@ -3543,7 +3534,7 @@ def test_validate_named_dims_raises_on_mismatch():
             return torch.abs(x)
 
     with pytest.raises(Exception, match="expected_named_dims"):
-        run_coarse_tile_test(fn, inputs, correctness=True)
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_validate_reduction_dims_raises_on_mismatch():
@@ -3555,7 +3546,7 @@ def test_validate_reduction_dims_raises_on_mismatch():
             return x.amin(dim=0)
 
     with pytest.raises(Exception, match="expected_reduction_dims"):
-        run_coarse_tile_test(fn, inputs, correctness=True)
+        run_coarse_tile_test(fn, inputs)
 
 
 # ===========================================================================

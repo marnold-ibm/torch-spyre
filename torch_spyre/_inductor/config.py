@@ -139,12 +139,6 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# Strided conv spatial splits produce incorrect per-core DSM addressing.
-# Set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to permit them.
-disable_conv2d_spatial_split: bool = (
-    os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
-)
-
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.
