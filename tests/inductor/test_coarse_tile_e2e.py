@@ -1661,9 +1661,6 @@ def test_restickify_pointwise_unsqueeze_mul_Lq2():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
-)
 def test_copy_into_preallocated_512x256_A4():
     """copy_f(a+b, c) on [512,256] tiled A÷4 — result written into zeros buffer."""
     inputs = [
@@ -1681,9 +1678,6 @@ def test_copy_into_preallocated_512x256_A4():
     run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
-@pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
-)
 def test_copy_into_preallocated_512x256_B4():
     """copy_f(a+b, c) on [512,256] tiled B÷4."""
     inputs = [
@@ -1702,9 +1696,6 @@ def test_copy_into_preallocated_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
-)
 def test_copy_into_preallocated_512x256_A4_B4():
     """copy_f(a+b, c) on [512,256] tiled A÷4 B÷4."""
     inputs = [
@@ -1728,7 +1719,7 @@ def test_copy_into_preallocated_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_inplace_accum_512x256_A4():
     """copy_f(acc + x, acc) on [512,256] tiled A÷4 — acc read and written inside loop."""
@@ -1747,7 +1738,7 @@ def test_copy_inplace_accum_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_inplace_accum_512x256_B4():
     """copy_f(acc + x, acc) on [512,256] tiled B÷4."""
@@ -1766,7 +1757,7 @@ def test_copy_inplace_accum_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_inplace_accum_512x256_A4_B4():
     """copy_f(acc + x, acc) on [512,256] tiled A÷4 B÷4."""
@@ -1790,7 +1781,7 @@ def test_copy_inplace_accum_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_rmw_correction_512x256_A4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled A÷4."""
@@ -1810,7 +1801,7 @@ def test_copy_rmw_correction_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_rmw_correction_512x256_B4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled B÷4."""
@@ -1830,7 +1821,7 @@ def test_copy_rmw_correction_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_rmw_correction_512x256_A4_B4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled A÷4 B÷4."""
@@ -1908,7 +1899,7 @@ def test_copy_after_reduction_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_after_reduction_512x256_B4():
     """copy_f(x.amin(dim=0, out)) on [512,256] tiled B÷4."""
@@ -1949,7 +1940,7 @@ def test_copy_after_reduction_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_running_max_4d_H4_Lq4():
     """copy_f(maximum(real_max, amax(scores,dim=-2, running_max))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
@@ -1985,9 +1976,9 @@ def test_copy_running_max_4d_H4_Lq4():
 # copy target receives a restickified input — tests copy layout after restickify
 
 
-@pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
-)
+# @pytest.mark.skip(
+#     reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+# )
 def test_copy_restickify_512x256_A4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled A÷4 — copy of restickified add."""
     inputs = [
@@ -2006,7 +1997,7 @@ def test_copy_restickify_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_restickify_512x256_B4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled B÷4."""
@@ -2026,7 +2017,7 @@ def test_copy_restickify_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_restickify_512x256_A4_B4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled A÷4 B÷4."""
@@ -2051,7 +2042,7 @@ def test_copy_restickify_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_accum_with_reduction_512x256_A4():
     """copy_f(acc * scale + x.amin(dim=1,keepdim=True, acc)) tiled A÷4."""
@@ -2129,7 +2120,7 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_two_copies_same_scope_512x256_A4():
     """Two copy_ ops in same hint scope tiled A÷4."""
@@ -2152,7 +2143,7 @@ def test_copy_two_copies_same_scope_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_two_copies_same_scope_512x256_B4():
     """Two copy_ ops in same hint scope tiled B÷4."""
@@ -2175,7 +2166,7 @@ def test_copy_two_copies_same_scope_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_copy_two_copies_same_scope_512x256_A4_B4():
     """Two copy_ ops in same hint scope tiled A÷4 B÷4."""
@@ -2264,7 +2255,7 @@ def test_outside_consumer_pointwise_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_outside_consumer_copy_then_read_512x256_A4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled A÷4."""
@@ -2284,7 +2275,7 @@ def test_outside_consumer_copy_then_read_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_outside_consumer_copy_then_read_512x256_B4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled B÷4."""
@@ -2304,7 +2295,7 @@ def test_outside_consumer_copy_then_read_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_outside_consumer_copy_then_read_512x256_A4_B4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled A÷4 B÷4."""
@@ -3282,7 +3273,7 @@ def _flash_v3_fn(
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_flash_v3_tile_H():
     """Flash v3: tile H÷4 only."""
@@ -4500,7 +4491,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     @pytest.mark.skip(
-        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
     )
     def test_hint_flash_attention_v2_divide_in_scope(self):
         """test_hint_flash_attention_v2 with the final divide INSIDE the scope.
@@ -4617,9 +4608,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     # Consider deleting — superseded by Group 10 structured tests (_flash_v3_fn)
-    @pytest.mark.skip(
-        reason="Numerically incorrect result.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
-    )
+    @pytest.mark.skip(reason="dxp_standalone timeout")
     def test_hint_flash_attention_v3(self):
         from torch_spyre._inductor import spyre_hint
 
@@ -5681,7 +5670,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
     @pytest.mark.skip(
-        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
     )
     def test_hint_nested_tiling_copy_mutation_correct(self):
         """Nested Lq/D tiling into a direct copy_f() mutation (Case 3 rewire)."""
@@ -5706,7 +5695,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
     @pytest.mark.skip(
-        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
     )
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
         """Case 3 nested coarse-tiling where `a`'s device layout genuinely
@@ -5763,7 +5752,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
 
     @pytest.mark.skip(
-        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
     )
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
@@ -6724,7 +6713,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
 
 @pytest.mark.skip(
-    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
+    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
 )
 def test_tiled_in_place_accumulator():
     """Regression test for the SpyreEmptyFallback / ct_fill STL bug.
