@@ -5537,9 +5537,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         This is the production shape -- vLLM-style chunked prefill -- not a
         scaled-down proxy.  Both H and Lq are WSR-tiled; Lk is not hinted.
 
-        kv_block is 2048 (4 chunks) rather than 512 (16) because layout solving
-        fails past ~6 unrolled chunks; see the docstring on
-        test_hint_flash_attention_kv_chunked_chunk_ceiling.  Lq stays at the
+        kv_block is 2048 (4 chunks) rather than 512 (16) because the 16-chunk
+        graph at Lq=512 takes significantly longer to compile.  Lq stays at the
         query-block size deliberately: the same 4-chunk graph at Lq=8192
         compiled for over two hours without finishing, while at Lq=512 it takes
         well under a minute, so compile cost is driven by Lq extent rather than
@@ -5576,25 +5575,24 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """h_tiles == H (one head per tile) crashes in read-copy insertion."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Layout solving fails past ~6 unrolled K/V chunks: 4 and 6 chunks "
-            "compile and are exact, 8/10/12/16 all fail _no_feasible_layout_error "
-            "with the failing buffer at a fixed ~81% of the graph, i.e. always "
-            "around the 6th-7th chunk. NOT a graph-size limit -- dropping the "
-            "running-max carry yields MORE buffers (128 vs the failing 112) and "
-            "compiles. Every single ablation (either matmul, any one of the three "
-            "carries, the reductions) restores feasibility, so it is the "
-            "conjunction of constraints that becomes infeasible. Invariant to Lq "
-            "(256/512/8192), Lq tiling, D, and kv_block. This is what forces "
-            "kv_block=2048 for 8k instead of the 512 a memory budget would pick."
-        ),
-    )
-    def test_hint_flash_attention_kv_chunked_chunk_ceiling(self):
-        """8 unrolled K/V chunks exceed what layout solving can satisfy."""
+    def test_hint_flash_attention_kv_chunked_8_chunks(self):
+        """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
         self._run_kv_chunked_flash(
             h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=512
+        )
+
+    @pytest.mark.skip(reason="Long test - takes ~6 mins to complete")
+    def test_hint_flash_attention_kv_chunked_16_chunks(self):
+        """16 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=256
+        )
+
+    @pytest.mark.skip(reason="Long test - takes ~40 mins to complete")
+    def test_hint_flash_attention_kv_chunked_32_chunks(self):
+        """32 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=128
         )
 
     def test_hint_h_tiling_elementwise(self):
