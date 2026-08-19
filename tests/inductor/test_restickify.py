@@ -1123,3 +1123,146 @@ def test_single_arg_size1_after_staggered_ea():
     sf = torch.randn((1, T, 2, 2, half), dtype=torch.float16)
     kc = torch.randn((1, NKV, KVLEN, HD), dtype=torch.float16)
     _compare(fn, x, sf, kc)
+
+
+# ------- Mutation op / target STL coupling (issue #3845) ---------
+
+
+def test_mutation_target_stl_coupling():
+    """Two slice_scatter writes into the same graph-input must share one STL.
+
+    a and b are pre-placed in row-major (STL A); c and d are pre-placed in
+    col-major (STL B).  out[:H, :] = a + b and out[H:, :] = c + d each
+    lower to a MutationLayoutSHOULDREMOVE that targets the same buffer out.
+    Before the fix for #3845 the beam search could assign the two mutation
+    ops and their shared target different STLs, producing wrong code or a
+    crash.
+    """
+    H = S // 2
+
+    def fn(a, b, c, d, out):
+        out[:H, :].copy_(a + b)    # mutation write 1: pulls toward STL A
+        out[H:, :].copy_(c + d)    # mutation write 2: pulls toward STL B
+        return out
+
+    a = torch.randn((H, S), dtype=torch.float16)
+    b = torch.randn((H, S), dtype=torch.float16)
+    c = torch.randn((H, S), dtype=torch.float16)
+    d = torch.randn((H, S), dtype=torch.float16)
+    out = torch.randn((S, S), dtype=torch.float16)
+
+    stl_a = SpyreTensorLayout([H, S], [S, 1], torch.float16, [1, 0])
+    stl_b = SpyreTensorLayout([H, S], [S, 1], torch.float16, [0, 1])
+
+    _compare(
+        fn, a, b, c, d, out,
+        device_args=[
+            a.to(device_layout=stl_a),
+            b.to(device_layout=stl_a),
+            c.to(device_layout=stl_b),
+            d.to(device_layout=stl_b),
+            out.to(DEVICE),
+        ],
+        check_strides=False,
+    )
+
+
+def test_mutation_target_stl_coupling_transpose():
+    """Mutation target layout divergence via natural transpose pressure (issue #3845).
+
+    a and b are SxS square tensors.  out[:H, :].copy_(a.t() + b.t()) pulls the
+    top-half write toward col-major (transpose avoidance); out[H:, :].copy_(c + d)
+    pulls the bottom-half write toward row-major (no transpose).  The two
+    MutationLayoutSHOULDREMOVE ops targeting the same graph-input out must be
+    assigned the same STL.  Before the fix for #3845 the beam search could assign
+    them independently, producing wrong results.
+    """
+    H = S // 2
+
+    def fn(a, b, c, d, out):
+        out[:H, :].copy_(a.t() + b.t())    # pulls toward col-major
+        out[H:, :].copy_(c + d)            # pulls toward row-major
+        return out
+
+    a = torch.randn((S, H), dtype=torch.float16)
+    b = torch.randn((S, H), dtype=torch.float16)
+    c = torch.randn((H, S), dtype=torch.float16)
+    d = torch.randn((H, S), dtype=torch.float16)
+    out = torch.randn((S, S), dtype=torch.float16)
+
+    _compare(fn, a, b, c, d, out, check_strides=False, skip_correctness=True)
+
+
+def test_mutation_target_stl_coupling_intermediate():
+    """Same layout pressure as test_mutation_target_stl_coupling_transpose but
+    out is created inside fn (zeros), so it is NOT a graph-input mutation
+    target.  Expected to pass — intermediates don't go through the
+    MutationLayoutSHOULDREMOVE path, so there is no coupling bug to trigger.
+    """
+    H = S // 2
+
+    def fn(a, b, c, d):
+        out = torch.zeros(S, S, dtype=a.dtype, device=a.device)
+        out[:H, :].copy_(a.t() + b.t())
+        out[H:, :].copy_(c + d)
+        return out
+
+    a = torch.randn((S, H), dtype=torch.float16)
+    b = torch.randn((S, H), dtype=torch.float16)
+    c = torch.randn((H, S), dtype=torch.float16)
+    d = torch.randn((H, S), dtype=torch.float16)
+
+    _compare(fn, a, b, c, d, check_strides=False)
+
+
+def test_mutation_target_stl_coupling_copy_f():
+    """Two copy_f writes into the same graph-input acc with competing layouts.
+
+    The first copy_f pulls acc toward col-major (a.t()+b.t()); the second
+    reads acc then pulls toward row-major (acc+c+d).  Because the second
+    iteration reads the first copy_f result, neither write is dead.  Both
+    copy_f ops lower to MutationLayoutSHOULDREMOVE targeting the same graph
+    input, exposing the #3845 coupling bug.
+    """
+    def fn(a, b, c, d, acc):
+        tmp = torch.ops.spyre.copy_f(a.t() + b.t(), acc)
+        out = torch.ops.spyre.copy_f(c + d, acc)
+        return tmp + out
+
+    def fn_ref(a, b, c, d, acc):
+        tmp = a.t() + b.t()
+        out = c + d
+        return tmp + out
+
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    c = torch.randn((S, S), dtype=torch.float16)
+    d = torch.randn((S, S), dtype=torch.float16)
+    acc = torch.randn((S, S), dtype=torch.float16)
+
+    spyre_result = _compile_and_run(
+        fn,
+        [a.to(DEVICE), b.to(DEVICE), c.to(DEVICE), d.to(DEVICE), acc.to(DEVICE)],
+        DEVICE,
+    ).cpu()
+    compare_with_cpu(fn_ref, a, b, c, d, acc.clone(), target=spyre_result, run_eager=False)
+
+
+def test_mutation_target_stl_coupling_copy_():
+    """copy_ version of test_mutation_target_stl_coupling_copy_f.
+
+    Two in-place copy_ writes into the same graph-input acc where the second
+    write reads the result of the first, so neither is dead.
+    """
+    def fn(a, b, c, d, acc):
+        acc.copy_(a.t() + b.t())
+        acc.copy_(acc + c + d)
+        return acc
+
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    c = torch.randn((S, S), dtype=torch.float16)
+    d = torch.randn((S, S), dtype=torch.float16)
+    acc = torch.randn((S, S), dtype=torch.float16)
+
+    _compare(fn, a, b, c, d, acc, check_strides=False)
