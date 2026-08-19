@@ -1448,6 +1448,9 @@ def _target_device_layout(target, name: str):
 
     if not layouts:
         return None
+    assert len(layouts) == 1, (
+        f"expected exactly one candidate layout, got {len(layouts)}: {layouts}"
+    )
     return next(iter(layouts))
 
 
