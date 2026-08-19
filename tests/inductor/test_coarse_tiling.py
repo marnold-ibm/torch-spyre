@@ -4351,7 +4351,7 @@ def _make_consumer_op(name, reads_buf):
 
 def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     """Return a ComputedBuffer mock inside the same loop group that reads reads_buf."""
-    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
     data = MagicMock(spec=Pointwise)
     data.ranges = [Integer(16)]
@@ -4359,6 +4359,12 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
+    # Ordinary (non-mutation) layout, so _plan_tiling_propagation's
+    # isinstance(op.layout, MutationLayoutSHOULDREMOVE) check on this op
+    # resolves to False instead of raising AttributeError -- layout is an
+    # instance attribute ComputedBuffer sets in __init__, not a class
+    # attribute, so spec=ComputedBuffer alone doesn't expose it.
+    op.layout = MagicMock(spec=FixedLayout)
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(
@@ -6020,7 +6026,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _bundle(self, specs, fake_compile=None):
+    def _bundle(self, specs, fake_compile=None, pool_size=0):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
         with patch(
@@ -6031,6 +6037,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
+                pool_size=pool_size,
             )
         return _read_mlir(self.tmpdir)
 
@@ -6163,13 +6170,14 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
-        mlir = self._bundle([op_a, op_b], fake_compile=fake)
+        mlir = self._bundle([op_a, op_b], fake_compile=fake, pool_size=1024)
 
         # First sym → parameter (kernel tensor arg)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("arith.constant 17179869184", mlir)
         # Second sym → pool: arith.addi %pool, <offset>
-        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%pool_base_addr", mlir)
+        self.assertIn("sdscbundle.device_mem_allocate", mlir)
         self.assertIn("%pool_addr_0 = arith.addi %pool", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
@@ -6319,7 +6327,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.pool()],
             )
 
-        mlir = self._bundle([a, b, c], fake_compile=fake)
+        mlir = self._bundle([a, b, c], fake_compile=fake, pool_size=4096)
 
         # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
         self.assertEqual(mlir.count("arith.constant 0 : index"), 1)

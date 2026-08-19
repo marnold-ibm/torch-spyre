@@ -776,7 +776,7 @@ def insert_run(client, run_id: str, run: dict, args):
             "errors",
             "xpass",
             "duration_s",
-            "trigger_type",
+            "test_type",
         ],
     )
 
