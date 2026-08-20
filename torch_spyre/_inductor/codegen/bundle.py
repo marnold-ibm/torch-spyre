@@ -514,10 +514,6 @@ def _compile_specs(
                     cached_json,
                 )
             )
-            file_name = f"sdsc_{idx}.json"
-            with open(os.path.join(output_dir, file_name), "w") as f:
-                logger.info(f"Generating {f.name}")
-                json.dump(sdsc_json, f, indent=2)
             if sdsc_log.isEnabledFor(logging.INFO):
                 sdsc_log.info(
                     "SDSC JSON [%s]\n%s",
