@@ -150,7 +150,7 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # Cache and reuse sdsc.json files during codegen when two OpSpecs produce
 # identical SuperDSC content, reducing bundle size for programs with loops.
 # Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
-sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
+sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "0") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
