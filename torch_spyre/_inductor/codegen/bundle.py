@@ -122,6 +122,9 @@ def generate_bundle(
     sdsc_counter = [0]
     symbol_id_offset_counter = [0]
 
+    sdsc_cache_counts: list[int] | None = None
+    if _spyre_config.sdsc_cache:
+        sdsc_cache_counts = [0, 0]  # [hits, misses]
     _compile_specs(
         specs_list,
         symbols,
@@ -130,7 +133,16 @@ def generate_bundle(
         symbol_id_offset_counter,
         output_dir,
         sdsc_cache={} if _spyre_config.sdsc_cache else None,
+        _sdsc_cache_counts=sdsc_cache_counts,
     )
+    if sdsc_cache_counts is not None:
+        hits, misses = sdsc_cache_counts
+        logger.info(
+            "sdsc_cache: %d/%d ops reused an existing sdsc file (%d unique)",
+            hits,
+            hits + misses,
+            misses,
+        )
 
     # -----------------------------------------------------------------------
     # Pass 2: emit bundle.mlir.
@@ -447,6 +459,7 @@ def _compile_specs(
     symbol_id_offset_counter: list,
     output_dir: str,
     sdsc_cache: dict | None = None,
+    _sdsc_cache_counts: list | None = None,
 ) -> None:
     """Recursively compile all OpSpecs in specs depth-first.
 
@@ -464,6 +477,7 @@ def _compile_specs(
                 symbol_id_offset_counter,
                 output_dir,
                 sdsc_cache,
+                _sdsc_cache_counts,
             )
         elif isinstance(entry, OpSpec):
             cached = None
@@ -486,8 +500,12 @@ def _compile_specs(
             if cached is None:
                 idx = sdsc_counter[0]
                 sdsc_counter[0] += 1
+                if _sdsc_cache_counts is not None:
+                    _sdsc_cache_counts[1] += 1
             else:
                 idx, cached_json = cached
+                if _sdsc_cache_counts is not None:
+                    _sdsc_cache_counts[0] += 1
             sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
                 compile_op_spec(
                     idx,
@@ -497,11 +515,11 @@ def _compile_specs(
                 )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
+            file_name = f"sdsc_{idx}.json"
             if cached is None:
                 cached_json = sdsc_json
                 if sdsc_cache is not None:
                     sdsc_cache[cache_key] = (idx, cached_json)
-                file_name = f"sdsc_{idx}.json"
                 with open(os.path.join(output_dir, file_name), "w") as f:
                     logger.info(f"Generating {f.name}")
                     json.dump(sdsc_json, f, indent=2)
