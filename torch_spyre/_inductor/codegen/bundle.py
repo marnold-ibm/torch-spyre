@@ -125,6 +125,7 @@ def generate_bundle(
         sdsc_counter,
         symbol_id_offset_counter,
         output_dir,
+        sdsc_cache={} if _spyre_config.sdsc_cache else None,
     )
 
     # -----------------------------------------------------------------------
@@ -442,9 +443,8 @@ def _compile_specs(
 
     Identical op specs (same canonical SDSC at counter 0) reuse the previously
     compiled entry — same sdsc file and same symbol registrations.
+    Pass sdsc_cache={} to enable caching; None disables it.
     """
-    if sdsc_cache is None:
-        sdsc_cache = {}
     for entry in specs:
         if isinstance(entry, LoopSpec):
             _compile_specs(
@@ -457,14 +457,23 @@ def _compile_specs(
                 sdsc_cache,
             )
         elif isinstance(entry, OpSpec):
-            # Generate a canonical (counter-0) version as cache key,
-            # ignoring debug_handle_ which varies per op but is irrelevant
-            # to structural identity.
-            canonical_json, _, _, _ = compile_op_spec(0, entry, [], 0)
-            top_val = next(iter(canonical_json.values()))
-            top_val.pop("debug_handle_", None)
-            cache_key = json.dumps(canonical_json, sort_keys=True)
-            cached = sdsc_cache.get(cache_key)
+            cached = None
+            if sdsc_cache is not None:
+                # Generate a canonical (counter-0) version as cache key,
+                # ignoring debug_handle_ which varies per op but is irrelevant
+                # to structural identity.
+                canonical_json, _, _, _ = compile_op_spec(0, entry, [], 0)
+                top_val = next(iter(canonical_json.values()))
+                top_val.pop("debug_handle_", None)
+                # arg_indices must be part of the key: the canonical json only
+                # records sequential placeholder IDs (-1,-2,-3), not which
+                # kernel tensor argument each slot belongs to. Two structurally
+                # identical ops on different tensors would otherwise collide.
+                arg_indices = tuple(a.arg_index for a in entry.args)
+                cache_key = json.dumps(canonical_json, sort_keys=True) + str(
+                    arg_indices
+                )
+                cached = sdsc_cache.get(cache_key)
             if cached is None:
                 idx = sdsc_counter[0]
                 sdsc_counter[0] += 1
@@ -481,7 +490,8 @@ def _compile_specs(
             symbol_id_offset_counter[0] += len(local_sym_values)
             if cached is None:
                 cached_json = sdsc_json
-                sdsc_cache[cache_key] = (idx, cached_json)
+                if sdsc_cache is not None:
+                    sdsc_cache[cache_key] = (idx, cached_json)
                 file_name = f"sdsc_{idx}.json"
                 with open(os.path.join(output_dir, file_name), "w") as f:
                     logger.info(f"Generating {f.name}")
