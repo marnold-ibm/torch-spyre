@@ -62,9 +62,9 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
-    TOPK_OPS,
 )
 from .ir import (
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
@@ -83,6 +83,7 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
+    is_topk,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -1337,7 +1338,7 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
+    if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
@@ -1991,6 +1992,9 @@ def propagate_spyre_tensor_layouts(
             input_name = op.inputs[0].get_name()
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, AllGatherAsyncFallback):
+            op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
