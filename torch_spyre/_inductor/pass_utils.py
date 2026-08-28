@@ -1908,6 +1908,7 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
+    exact_target: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -1955,9 +1956,10 @@ def compute_restickify_needed(
         if reduction_vars:
             red_var = next(iter(reduction_vars))
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
-    return True, compute_restickify_target_layout(
-        in_stl, in_host, target_stick, ic, idc
-    )
+    tgt = compute_restickify_target_layout(in_stl, in_host, target_stick, ic, idc)
+    if tgt is None and exact_target:
+        return True, out_stl
+    return True, tgt
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

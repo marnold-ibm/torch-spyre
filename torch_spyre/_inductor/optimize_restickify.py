@@ -60,12 +60,14 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        exact_target: bool = False,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+        self._exact_target = exact_target
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
 
@@ -96,7 +98,13 @@ class EdgeCostMap:
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep,
+            self._op,
+            exact_target=self._exact_target,
         )
         if not needed:
             cost = 0.0
@@ -280,11 +288,18 @@ class FixedInOutNode(RestickNodeCost):
         )
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, exact_target_layouts=None):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
-            for arg, req in zip(args, req_stls)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                exact_target=exact_target_layouts[i] if exact_target_layouts else False,
+            )
+            for i, (arg, req) in enumerate(zip(args, req_stls))
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
 
