@@ -712,16 +712,35 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     other input. Returns early if the two inputs cannot be distinguished
     (symmetric arg symbols — degenerate case).
 
+    When N=1, the generated_sym is constant-folded away; y and output have
+    sparse stick layouts and the stick constraint is vacuously satisfied.
+
     Required stick (innermost coord free symbol):
       Input1: reduction_sym  (all dtypes — for FP8/INT8/INT4 multi-dim sticks
                                the innermost element is still reduction_sym)
       Input2: generated_sym  (all dtypes — innermost element is generated_sym)
-      Output: generated_sym  (always DF16)
+                              OR sparse (when N=1)
+      Output: generated_sym  (always DF16) OR sparse (when N=1)
     """
     inputs = [a for a in op_spec.args if a.is_input]
     outputs = [a for a in op_spec.args if not a.is_input]
 
     if len(inputs) < 2 or len(outputs) < 1:
+        return
+
+    # When N=1, the N symbol is constant-folded away. Both y and output have
+    # sparse stick layouts (device_coordinates[-1] is 0). Skip validation.
+    y_stick = (
+        inputs[1].device_coordinates[-1]
+        if len(inputs[1].device_coordinates) > 0
+        else None
+    )
+    out_stick_coord = (
+        outputs[0].device_coordinates[-1]
+        if len(outputs[0].device_coordinates) > 0
+        else None
+    )
+    if y_stick == 0 and out_stick_coord == 0:
         return
 
     out_syms: set[sympy.Symbol] = set()
@@ -741,6 +760,10 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
         x_arg, y_arg = inputs[1], inputs[0]
         generated_sym = next(iter(gen_from_a))
     else:
+        # No generated_sym found by set arithmetic. This happens when N=1
+        # (constant-folded to a scalar), leaving y and output with sparse
+        # stick layouts (dim_order [..., -1]). Stick constraint is satisfied
+        # vacuously for N=1.
         return
 
     reduction_syms = _arg_free_syms(x_arg) - out_syms
@@ -758,12 +781,24 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
             f"Input1 stick must contain reduction_sym={reduction_sym!r}; "
             f"got {_arg_stick_syms(x_arg)!r}"
         )
-    if generated_sym not in _arg_stick_syms(y_arg):
+    # When N=1, y and output have sparse stick layouts (coordinate 0 instead of
+    # a symbol). Allow this case — the stick constraint is satisfied vacuously.
+    y_stick_syms = _arg_stick_syms(y_arg)
+    y_stick_coord = (
+        y_arg.device_coordinates[-1] if len(y_arg.device_coordinates) > 0 else None
+    )
+    if generated_sym not in y_stick_syms and not (y_stick_coord == 0):
         errors.append(
             f"Input2 stick must contain generated_sym={generated_sym!r}; "
-            f"got {_arg_stick_syms(y_arg)!r}"
+            f"got {y_stick_syms!r}"
         )
-    if generated_sym not in out_stick:
+    # Allow output stick to be empty (sparse) when it's coordinate 0.
+    out_stick_coord = (
+        outputs[0].device_coordinates[-1]
+        if len(outputs[0].device_coordinates) > 0
+        else None
+    )
+    if generated_sym not in out_stick and not (out_stick_coord == 0):
         errors.append(
             f"Output stick must contain generated_sym={generated_sym!r}; "
             f"got {out_stick!r}"
