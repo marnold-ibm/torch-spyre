@@ -42,7 +42,6 @@ from . import constants
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
-from .pass_utils import concretize_expr
 
 logger = get_inductor_logger("op_spec_validation")
 
@@ -713,11 +712,15 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     other input. Returns early if the two inputs cannot be distinguished
     (symmetric arg symbols — degenerate case).
 
+    When N=1, the generated_sym is constant-folded away; y and output have
+    sparse stick layouts and the stick constraint is vacuously satisfied.
+
     Required stick (innermost coord free symbol):
       Input1: reduction_sym  (all dtypes — for FP8/INT8/INT4 multi-dim sticks
                                the innermost element is still reduction_sym)
       Input2: generated_sym  (all dtypes — innermost element is generated_sym)
-      Output: generated_sym  (always DF16)
+                              OR sparse (when N=1)
+      Output: generated_sym  (always DF16) OR sparse (when N=1)
     """
     inputs = [a for a in op_spec.args if a.is_input]
     outputs = [a for a in op_spec.args if not a.is_input]
@@ -725,23 +728,27 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     if len(inputs) < 2 or len(outputs) < 1:
         return
 
-    # _batchmatmul_restore_unit_dims injects synthetic symbols (range 1) for
-    # M=1 and N=1 dims into outer device_coordinates slots.  Exclude them from
-    # the set arithmetic so they don't confuse x/y identification or stick checks.
-    it_space = op_spec.iteration_space
-    unit_syms = {
-        sym
-        for sym, (rng, _) in it_space.items()
-        if concretize_expr(rng) == 1
-    }
+    # When N=1, the N symbol is constant-folded away. Both y and output have
+    # sparse stick layouts (device_coordinates[-1] is 0). Skip validation.
+    y_stick_coord = (
+        inputs[1].device_coordinates[-1]
+        if len(inputs[1].device_coordinates) > 0
+        else None
+    )
+    out_stick_coord = (
+        outputs[0].device_coordinates[-1]
+        if len(outputs[0].device_coordinates) > 0
+        else None
+    )
+    if y_stick_coord == 0 and out_stick_coord == 0:
+        return
 
     out_syms: set[sympy.Symbol] = set()
     for arg in outputs:
         out_syms.update(_arg_free_syms(arg))
-    out_syms -= unit_syms
 
-    a_syms = _arg_free_syms(inputs[0]) - unit_syms
-    b_syms = _arg_free_syms(inputs[1]) - unit_syms
+    a_syms = _arg_free_syms(inputs[0])
+    b_syms = _arg_free_syms(inputs[1])
 
     gen_from_b = (b_syms & out_syms) - a_syms
     gen_from_a = (a_syms & out_syms) - b_syms
@@ -750,12 +757,10 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
         x_arg, y_arg = inputs[0], inputs[1]
         generated_sym = next(iter(gen_from_b))
     else:
-        # Either symmetric (N=1 collapsed) or gen_from_a (can't reliably
-        # identify x/y — the apparent "generated" sym is M, not N).  Nothing
-        # to check; a missing N dim can't be in the wrong place.
+        # No generated_sym found — N=1 collapsed or symmetric. Vacuously valid.
         return
 
-    reduction_syms = _arg_free_syms(x_arg) - out_syms - unit_syms
+    reduction_syms = _arg_free_syms(x_arg) - out_syms
     # If reduction sym is missing (K=1 or constant-folded), skip.
     if not reduction_syms:
         return
@@ -769,19 +774,17 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     # wrong slot.  If it's absent entirely (constant-folded unit dim), skip that
     # check — it can't be wrong if it isn't there.
     errors = []
-    x_stick = _arg_stick_syms(x_arg)
-    y_stick = _arg_stick_syms(y_arg)
-    if reduction_sym in (a_syms | b_syms) and reduction_sym not in x_stick:
+    if reduction_sym not in _arg_stick_syms(x_arg):
         errors.append(
             f"Input1 stick must contain reduction_sym={reduction_sym!r}; "
-            f"got {x_stick!r}"
+            f"got {_arg_stick_syms(x_arg)!r}"
         )
-    if generated_sym in (a_syms | b_syms | out_syms) and generated_sym not in y_stick:
+    if generated_sym not in _arg_stick_syms(y_arg):
         errors.append(
             f"Input2 stick must contain generated_sym={generated_sym!r}; "
-            f"got {y_stick!r}"
+            f"got {_arg_stick_syms(y_arg)!r}"
         )
-    if generated_sym in (a_syms | b_syms | out_syms) and generated_sym not in out_stick:
+    if generated_sym not in out_stick:
         errors.append(
             f"Output stick must contain generated_sym={generated_sym!r}; "
             f"got {out_stick!r}"
