@@ -890,15 +890,33 @@ def identify_matmul_inputs(
 
     Uses positional order: lower_bmm always emits x before y, so inputs[0] is
     x and inputs[1] is y.  This is valid even when N=1 (the N symbol is
-    constant-folded out of index expressions).
+    constant-folded out of index expressions) or when both deps are identical
+    (ReadWrites deduplicated a self-alias read).
 
-    Raises ValueError if len(inputs) != 2.
+    For a 1-element input list, the single dep is treated as both x and y
+    (self-matmul where ReadWrites collapsed two identical MemoryDeps to one).
+
+    Raises ValueError for 0 or 3+ inputs.
     """
-    if len(inputs) != 2:
+    if len(inputs) == 0 or len(inputs) > 2:
         raise ValueError(
-            f"identify_matmul_inputs: expected 2 inputs, got {len(inputs)}"
+            f"identify_matmul_inputs: expected 1 or 2 inputs, got {len(inputs)}"
         )
-    return inputs[0], inputs[1]
+    if len(inputs) == 1:
+        return inputs[0], inputs[0]
+
+    a, b = inputs[0], inputs[1]
+    return a, b
+
+
+def get_matmul_n_size(op: "Operation") -> int:
+    """Return the concrete N (output columns) extent of a matmul op.
+
+    Reads from op.data.ranges[-1] rather than inferring from index expressions,
+    so it is correct even when N=1 and the N symbol has been constant-folded
+    out of every MemoryDep.
+    """
+    return concretize_expr(op.data.ranges[-1])
 
 
 def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
@@ -1959,6 +1977,16 @@ def compute_restickify_needed(
         return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
+
+    if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
+        # The output stick is 0 (sparse) and the input is clean-dense.  For
+        # matmul, y may legally arrive sparse when N=1 collapses the N symbol.
+        # Build a sparse target STL directly — dim_order [..., -1] means the
+        # stick dimension is not mapped to any host dim (sparse/broadcast).
+        host_size = [concretize_expr(s) for s in in_host.size]
+        host_stride = [concretize_expr(s) for s in in_host.stride]
+        dim_order = list(range(len(host_size))) + [-1]
+        return True, SpyreTensorLayout(host_size, host_stride, in_host.dtype, dim_order)
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout
