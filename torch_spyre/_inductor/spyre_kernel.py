@@ -900,9 +900,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = _preserve_shared_weight_unit_bmm_dim(
             op, it_space_extended, args, op_info
         )
-        it_space_extended = _batchmatmul_restore_unit_dims(
-            op, it_space_extended, args
-        )
         alignment_inputs = build_operation_alignment_inputs(
             it_space,
             [self._alignment_access_by_tensor_arg[id(arg)] for arg in args],
@@ -1586,64 +1583,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
-
-
-def _batchmatmul_restore_unit_dims(
-    op: str,
-    it_space: dict,
-    args: "Sequence[TensorArg]",
-) -> dict:
-    """Inject synthetic symbols for M=1/N=1 dims in batchmatmul BEFORE align_tensors.
-
-    When M=1 or N=1, Inductor's SqueezeView drops the loop variable and the
-    device coordinates carry the constant 0 in that slot.  The hardware
-    batchmatmul scheduler requires explicit iteration symbols for all four dims
-    (batch, M, N, K); absent symbols cause the native compiler to abort with
-    ``inp0_reuse_dim.size() == 1``.  Inject a fresh symbol with range 1 for
-    each missing dim so align_tensors and the hardware descriptor see the full
-    shape.  Called at op-spec construction time, before build_operation_alignment_inputs.
-    """
-    if op not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
-        return it_space
-    # args: [x_input, y_input, output]
-    if len(args) < 3:
-        return it_space
-
-    x_arg, y_arg, out_arg = args[0], args[1], args[-1]
-    used = set(it_space.keys())
-
-    def _fresh_sym(prefix: str) -> sympy.Symbol:
-        for idx in itertools.count():
-            s = sympy.Symbol(f"{prefix}{idx}")
-            if s not in used:
-                used.add(s)
-                return s
-
-    new_it_space = dict(it_space)
-
-    def _inject(arg, prefix) -> "sympy.Symbol | None":
-        if arg.device_coordinates[0] != sympy.S.Zero:
-            return None  # already has a live symbol
-        sym = _fresh_sym(prefix)
-        arg.device_coordinates[0] = sym
-        new_it_space[sym] = (sympy.S.One, 1)
-        return sym
-
-    m_sym = _inject(x_arg, "bm")  # M dimension of x
-    n_sym = _inject(y_arg, "bn")  # N dimension of y
-
-    # output: coord[0]=N, coord[1]=M — patch constants to match injected syms
-    if n_sym is not None and out_arg.device_coordinates[0] == sympy.S.Zero:
-        out_arg.device_coordinates[0] = n_sym
-    if m_sym is not None and out_arg.device_coordinates[1] == sympy.S.Zero:
-        out_arg.device_coordinates[1] = m_sym
-
-    if m_sym is not None or n_sym is not None:
-        logger.info(
-            "batchmatmul: injected unit dims %s",
-            [s for s in (m_sym, n_sym) if s is not None],
-        )
-    return new_it_space
 
 
 def _restickify_restore_elided_dim(op_spec) -> None:
