@@ -981,7 +981,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_repeat_info_by_spec[id(op_spec)] = {
             symbol: dict(info) for symbol, info in self._alignment_repeat_info.items()
         }
-        if op != RESTICKIFY_OP:
+        if op not in (RESTICKIFY_OP, BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
             self._alignment_inputs_by_spec[id(op_spec)] = alignment_inputs
         return op_spec
 
@@ -1595,7 +1595,12 @@ def _batchmatmul_restore_unit_dims(
     (batch, M, N, K); absent symbols cause the native compiler to abort with
     ``inp0_reuse_dim.size() == 1``.  Inject a fresh symbol with range 1 for
     each missing dim so align_tensors and the hardware descriptor see the full
-    shape.  Called at op-spec construction time, before build_operation_alignment_inputs.
+    shape.  Called in simplify_op_spec, before align_tensors.
+
+    The unit dim for each operand is the non-stick device slot whose size is 1
+    and whose coordinate is the constant 0.  We find it by index rather than
+    assuming it is always coord[0], because layouts with a batch prefix push
+    the M/N slot to a later position.
     """
     if op not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return it_space
@@ -1615,28 +1620,50 @@ def _batchmatmul_restore_unit_dims(
 
     new_it_space = dict(it_space)
 
-    def _inject(arg, prefix) -> "sympy.Symbol | None":
-        if arg.device_coordinates[0] != sympy.S.Zero:
-            return None  # already has a live symbol
-        sym = _fresh_sym(prefix)
-        arg.device_coordinates[0] = sym
-        new_it_space[sym] = (sympy.S.One, 1)
-        return sym
+    def _inject_at(arg, prefix, start=0) -> "tuple[sympy.Symbol, int] | None":
+        """Find the first unit-size coord slot at or after `start` (excl. stick).
 
-    m_sym = _inject(x_arg, "bm")  # M dimension of x
-    n_sym = _inject(y_arg, "bn")  # N dimension of y
+        For Input1 (x), start=1 to skip the batch dim (coord[0] is the 2D→3D
+        batch pad — always 0 — not the semantic M dim).  For Input2 (y), start=0
+        because the N=1 dim occupies coord[0] in the sparse-stick layout.
+        Excludes the stick (last coord) from the search in all cases.
+        """
+        for i, (size, coord) in enumerate(
+            zip(arg.device_size[:-1], arg.device_coordinates[:-1])
+        ):
+            if i < start:
+                continue
+            if concretize_expr(size) == 1 and coord == sympy.S.Zero:
+                sym = _fresh_sym(prefix)
+                arg.device_coordinates[i] = sym
+                new_it_space[sym] = (sympy.S.One, 1)
+                return sym, i
+        return None
 
-    # output: coord[0]=N, coord[1]=M — patch constants to match injected syms
-    if n_sym is not None and out_arg.device_coordinates[0] == sympy.S.Zero:
-        out_arg.device_coordinates[0] = n_sym
-    if m_sym is not None and out_arg.device_coordinates[1] == sympy.S.Zero:
-        out_arg.device_coordinates[1] = m_sym
+    m_result = _inject_at(x_arg, "bm", start=1)  # M: skip batch (coord[0])
+    n_result = _inject_at(y_arg, "bn", start=0)   # N: coord[0] is the N=1 slot
 
-    if m_sym is not None or n_sym is not None:
-        logger.info(
-            "batchmatmul: injected unit dims %s",
-            [s for s in (m_sym, n_sym) if s is not None],
-        )
+    # Patch unit-size coord=0 slots in the output.
+    # The output shares M with x and N with y; fill remaining unit-coord=0
+    # slots by matching against the free symbols that x and y introduced.
+    # Collect the injected syms to assign in order: same positional slot
+    # as in x (M) and y (N) respectively.
+    injected_syms: list[tuple[int, sympy.Symbol]] = []
+    if m_result is not None:
+        injected_syms.append((m_result[1], m_result[0]))
+    if n_result is not None:
+        injected_syms.append((n_result[1], n_result[0]))
+
+    for inject_pos, sym in injected_syms:
+        if inject_pos < len(out_arg.device_size) - 1:
+            size = concretize_expr(out_arg.device_size[inject_pos])
+            coord = out_arg.device_coordinates[inject_pos]
+            if size == 1 and coord == sympy.S.Zero:
+                out_arg.device_coordinates[inject_pos] = sym
+
+    injected = [r[0] for r in (m_result, n_result) if r is not None]
+    if injected:
+        logger.info("batchmatmul: injected unit dims %s", injected)
     return new_it_space
 
 
@@ -1752,6 +1779,13 @@ def simplify_op_spec(
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
+
+    # Inject synthetic symbols for M=1/N=1 batchmatmul dims after create_op_spec
+    # has finalized device_coordinates from the layout — mutating before that point
+    # causes the alignment-input consistency check to fire.
+    op_spec.iteration_space = _batchmatmul_restore_unit_dims(
+        op_spec.op, op_spec.iteration_space, op_spec.args
+    )
 
     it_space = op_spec.iteration_space
     if alignment_inputs is None:

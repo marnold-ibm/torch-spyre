@@ -42,6 +42,7 @@ from . import constants
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from .pass_utils import concretize_expr
 
 logger = get_inductor_logger("op_spec_validation")
 
@@ -724,12 +725,23 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     if len(inputs) < 2 or len(outputs) < 1:
         return
 
+    # _batchmatmul_restore_unit_dims injects synthetic symbols (range 1) for
+    # M=1 and N=1 dims into outer device_coordinates slots.  Exclude them from
+    # the set arithmetic so they don't confuse x/y identification or stick checks.
+    it_space = op_spec.iteration_space
+    unit_syms = {
+        sym
+        for sym, (rng, _) in it_space.items()
+        if concretize_expr(rng) == 1
+    }
+
     out_syms: set[sympy.Symbol] = set()
     for arg in outputs:
         out_syms.update(_arg_free_syms(arg))
+    out_syms -= unit_syms
 
-    a_syms = _arg_free_syms(inputs[0])
-    b_syms = _arg_free_syms(inputs[1])
+    a_syms = _arg_free_syms(inputs[0]) - unit_syms
+    b_syms = _arg_free_syms(inputs[1]) - unit_syms
 
     gen_from_b = (b_syms & out_syms) - a_syms
     gen_from_a = (a_syms & out_syms) - b_syms
@@ -737,13 +749,18 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     if gen_from_b:
         x_arg, y_arg = inputs[0], inputs[1]
         generated_sym = next(iter(gen_from_b))
-    elif gen_from_a:
+    elif gen_from_a and not unit_syms:
+        # gen_from_a with no unit dims: y (inputs[1]) has the generated sym
         x_arg, y_arg = inputs[1], inputs[0]
         generated_sym = next(iter(gen_from_a))
     else:
+        # If gen_from_a fires but unit_syms is non-empty, then the apparent
+        # asymmetry is caused by a collapsed N=1 (or M=1) dim — the "generated"
+        # sym is actually M or batch, not N.  Skip the stick check; the N loop
+        # has no stick to check.
         return
 
-    reduction_syms = _arg_free_syms(x_arg) - out_syms
+    reduction_syms = _arg_free_syms(x_arg) - out_syms - unit_syms
     if not reduction_syms:
         return
     reduction_sym = next(iter(reduction_syms))
