@@ -981,7 +981,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_repeat_info_by_spec[id(op_spec)] = {
             symbol: dict(info) for symbol, info in self._alignment_repeat_info.items()
         }
-        if op not in (RESTICKIFY_OP, BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
+        if op != RESTICKIFY_OP:
             self._alignment_inputs_by_spec[id(op_spec)] = alignment_inputs
         return op_spec
 
@@ -1779,13 +1779,6 @@ def simplify_op_spec(
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
-
-    # Inject synthetic symbols for M=1/N=1 batchmatmul dims after create_op_spec
-    # has finalized device_coordinates from the layout — mutating before that point
-    # causes the alignment-input consistency check to fire.
-    op_spec.iteration_space = _batchmatmul_restore_unit_dims(
-        op_spec.op, op_spec.iteration_space, op_spec.args
-    )
 
     it_space = op_spec.iteration_space
     if alignment_inputs is None:
