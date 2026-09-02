@@ -591,13 +591,13 @@ def test_bmm_unit_n():
 
 
 def test_bmm_unit_self_1():
-    """Same as test_bmm_unit_n but uses the same tensor for both operands."""
+    """Self-matmul where N=1: same tensor for both operands with a sparse y layout."""
     x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
     _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
 
 
 def test_bmm_unit_self_2():
-    """Same as test_bmm_unit_n but uses the same tensor for both operands."""
+    """Self-matmul where M=N=2: exercises restickify occurrence-counter bookkeeping for the self-alias case."""
     x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
     _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
 

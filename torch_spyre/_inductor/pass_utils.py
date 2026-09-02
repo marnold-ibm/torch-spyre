@@ -2011,11 +2011,10 @@ def compute_restickify_needed(
             y_sm[k_chunk_dim] = elem_stride
             y_sm[-1] = -1
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
-        # Fallback: construct from host dims (safe when no size-1 host dims collapse).
-        host_size = [concretize_expr(s) for s in in_host.size]
-        host_stride = [concretize_expr(s) for s in in_host.stride]
-        dim_order = list(range(len(host_size))) + [-1]
-        return True, SpyreTensorLayout(host_size, host_stride, in_host.dtype, dim_order)
+        assert False, (
+            f"k_chunk_dim not found in sparse-N=1 restickify path: "
+            f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
+        )
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout

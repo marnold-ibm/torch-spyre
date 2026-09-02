@@ -1050,6 +1050,7 @@ def _conv_layouts(
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep, None)
 
+    # No len(args)==1 guard needed: conv activation and weight are never aliased.
     identify_matmul_inputs([a.dep for a in args], output_dep)
     x, y = args[0], args[1]
 
