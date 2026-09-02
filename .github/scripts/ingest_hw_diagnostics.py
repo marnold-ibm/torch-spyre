@@ -10,7 +10,8 @@ Usage (called by the GHA workflow):
         --workflow  "tests" \
         --branch    "main" \
         --sha       "abc123..." \
-        --run-id    "74526099734"
+        --run-id    "74526099734" \
+        --run-link  "https://github.com/org/repo/actions/runs/74526099734"
 """
 
 import argparse
@@ -94,9 +95,11 @@ def build_row(rec: dict, args) -> list:
         _str(args.workflow),
         _str(args.branch),
         _str(args.sha)[:40].ljust(40)[:40],  # normalise to ≤40 chars
+        _str(args.run_link),
         _str(rec.get("suite_name")),
         _int(rec.get("attempt"), 1),
         _int(rec.get("total_attempts"), 1),
+        _int(rec.get("pod_level_retry"), 0),
         _parse_ts(rec.get("ingested_at"))
         or datetime.now(timezone.utc).replace(tzinfo=None),
         # ── Outcome ───────────────────────────────────────────────────────
@@ -147,9 +150,11 @@ COLUMN_NAMES = [
     "workflow",
     "branch",
     "commit_sha",
+    "run_link",
     "suite_name",
     "attempt",
     "total_attempts",
+    "pod_level_retry",
     "ingested_at",
     # Outcome
     "outcome",
@@ -224,11 +229,14 @@ def ensure_extra_columns(client) -> None:
         ("workflow", "LowCardinality(String) DEFAULT ''"),
         ("branch", "LowCardinality(String) DEFAULT ''"),
         ("commit_sha", "String DEFAULT ''"),
+        ("run_link", "String DEFAULT ''"),
         ("failure_reason_detail", "String DEFAULT '{}'"),
         ("ras_category", "LowCardinality(String) DEFAULT ''"),
         ("ras_severity", "LowCardinality(String) DEFAULT ''"),
         ("ras_message", "String DEFAULT ''"),
         ("ras_events_json", "String DEFAULT '[]'"),
+        # True when this row came from a _test_matrix.yaml pod-level-retry job (a fresh-pod re-run), not the original job.
+        ("pod_level_retry", "Bool DEFAULT false"),
     ]
     for col_name, col_type in extras:
         try:
@@ -266,6 +274,11 @@ def main() -> None:
         "--run-id",
         default="",
         help="GHA run ID — used as run_id if JSON records lack one",
+    )
+    parser.add_argument(
+        "--run-link",
+        default="",
+        help="URL to the triggering GHA run (e.g. '<server>/<repo>/actions/runs/<id>')",
     )
     parser.add_argument(
         "--table",

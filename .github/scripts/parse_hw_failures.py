@@ -68,6 +68,11 @@ RE_HW_RETRY_BANNER = re.compile(r"Hardware RAS timeout detected", re.IGNORECASE)
 RE_STALL_LINE = re.compile(r"\[stall-watcher\] No new output for (?P<secs>\d+)s")
 RE_SIGNAL_EXIT = re.compile(r"SIGNAL EXIT", re.IGNORECASE)
 
+# Matches the "(pod-level retry)" job-name suffix _test_matrix.yaml's test_retry / test_multi_spyre_retry jobs stamp on a suite re-run on a fresh pod; tolerates the parens already being stripped by the upstream sanitizer.
+RE_POD_LEVEL_RETRY_SUFFIX = re.compile(
+    r"\(?\s*pod-level retry\s*\)?\s*$", re.IGNORECASE
+)
+
 # Process crash / signal patterns
 # Matches: "Signal Received: 6 (Aborted)" or "Signal Received: 11 (Segmentation fault)"
 RE_SIGNAL_RECEIVED = re.compile(
@@ -109,17 +114,66 @@ _SIGNAL_NAMES = {
     "15": "SIGTERM",
 }
 
-# Hardware environment variables (appear only in final attempt's DTLOG dump)
-RE_NODE_NAME = re.compile(r"GHA_RUNNER_POD_NODE_NAME\s*->\s*(?P<v>\S+)")
-RE_PCI_DEVICE = re.compile(r"PCIDEVICE_IBM_COM_AIU_PF\s*->\s*(?P<v>[0-9a-f:.]+)")
-RE_AIU_RANK0 = re.compile(r"AIU_WORLD_RANK_0\s*->\s*(?P<v>[0-9a-f:.]+)")
+# Hardware environment variables.
+# Two independent sources feed these fields:
+#   1. The "Gather runner info" composite action
+#      (.github/actions/gather-runner-info) echoes
+#      "GHA_RUNNER_POD_NODE_NAME <value>" / "GHA_RUNNER_POD_NAME <value>" /
+#      "PCIDEVICE_IBM_COM_AIU_PF <value>" on every attempt, and its verbose
+#      env dump additionally prints "PCIDEVICE_IBM_COM_AIU_PF=<value>" style
+#      lines. This is the reliable source: it fires on every attempt.
+#   2. The Spyre runtime's own DTLOG_LEVEL=Info dump, which only fires on the
+#      FINAL attempt and uses a "KEY -> value" format.
+# These patterns accept a plain space, "=", or "->" separator so either
+# source matches. `(?!\w)` after the var name stops "GHA_RUNNER_POD_NAME"
+# from matching as a prefix of "GHA_RUNNER_POD_NAMESPACE". Separators use
+# `[ \t]*`, not `\s*` — `\s*` also matches newlines, which lets an empty
+# value (var echoed with nothing after it) swallow the following line's key
+# as its own value.
+# The value character class is restricted (not `\S+`) to keep two things out:
+#   - `$` and `"`: GHA prints a "script preview" line before a step runs,
+#     containing the step's literal source text -- e.g.
+#     `echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"` -- which
+#     appears BEFORE the real output in the log and would otherwise be the
+#     first (wrong) match `_first_env` finds, capturing garbage like
+#     `$GHA_RUNNER_POD_NODE_NAME"` off the `$`-prefixed variable reference.
+#   - ANSI escape bytes from that same preview line's syntax highlighting.
+# `*` IS included: GHA's own secret redaction can replace a substring
+# in-place with a literal "***" (e.g. a pod name containing a token that
+# happens to match a registered secret), so real values can legitimately
+# contain it -- excluding it would truncate the value at the mask.
+RE_NODE_NAME = re.compile(
+    r"GHA_RUNNER_POD_NODE_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
+)
+RE_POD_NAME = re.compile(
+    r"GHA_RUNNER_POD_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
+)
+# gather-runner-info's own script preview -- `echo "PCIDEVICE_IBM_COM_AIU_PF
+# ${PCIDEVICE_IBM_COM_AIU_PF:-}"` -- references the var name TWICE on one
+# line. The first occurrence is followed by `$` (rejected, not in the value
+# class), but the SECOND occurrence, inside `${...:-}`, is followed by `:`,
+# which the old `[0-9a-fA-F:.,]+` class allowed -- capturing a bare ':' as
+# the "value" before ever reaching the real output line. Real PCI addresses
+# always start with a hex digit (e.g. "0000:..."), so requiring the first
+# captured character to be one rejects that bare-colon false match.
+RE_PCI_DEVICE = re.compile(
+    r"PCIDEVICE_IBM_COM_AIU_PF(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F][0-9a-fA-F:.,]*)"
+)
+RE_AIU_RANK0 = re.compile(
+    r"AIU_WORLD_RANK_0(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F][0-9a-fA-F:.,]*)"
+)
 RE_PCI_DEV_ID = re.compile(
     r"pcidevid\.cpp.*?Device id \(for card idx \d+\):\s*(?P<v>[0-9a-f:.]+)"
 )
 RE_OPENED = re.compile(r"Opened:\s*SEN:VFIO:TYPE1:(?P<v>[0-9a-f:.]+)")
 
 # Chip identifiers (also final-attempt only)
-RE_RAW_ECID = re.compile(r"Raw ECID\s*=\s*(?P<v>0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+)")
+# vfio_hal_mnt.cpp prints the first ECID word with a doubled prefix
+# ("Raw ECID = 0x0x0000000002038000 0x03e3..."), so `0x` must be repeatable —
+# a single-`0x` pattern matches nothing at all.
+RE_RAW_ECID = re.compile(
+    r"Raw ECID\s*=\s*(?P<v>(?:0x)+[0-9a-fA-F]+\s+(?:0x)+[0-9a-fA-F]+)"
+)
 RE_CHIP_COORDS = re.compile(
     r"CHIPY=(?P<chipy>0x[0-9a-fA-F]+)\s+CHIPX=(?P<chipx>0x[0-9a-fA-F]+)"
 )
@@ -127,7 +181,14 @@ RE_WAFER_ID = re.compile(r"Mfg WaferID\s*=\s*(?P<v>\S+)")
 RE_MFG_XY = re.compile(r"Mfg \(X,Y\)\s*=\s*\((?P<x>\d+),(?P<y>\d+)\)")
 RE_CARD_SERIAL = re.compile(r"Card 11S S/N\s*=\s*(?P<v>\S+)")
 
-# Log-line timestamps
+# Log-line timestamps.
+#
+# GHA prefixes virtually every log line with its own ISO-8601 stamp, so that is
+# the reliable source. RE_LOG_TS matches the runtime's DTLOG format instead,
+# which only appears once the device layer starts talking (~line 1600 of a
+# typical job log) — it is kept as a fallback for logs captured without the
+# GHA prefix.
+RE_GHA_TS = re.compile(r"^\ufeff?(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s")
 RE_LOG_TS = re.compile(
     r"(?:ERRR|WARN|INFO|DBUG)\s+"
     r"(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})\s+"
@@ -171,6 +232,16 @@ def _ras_name_to_reason(name: str) -> str:
 
 
 def _parse_log_ts(line: str) -> str | None:
+    """Timestamp for a log line: GHA's ISO-8601 prefix, else the DTLOG stamp."""
+    m = RE_GHA_TS.match(line)
+    if m:
+        # GHA stamps are always UTC; drop the trailing Z so the value stays
+        # naive-UTC like the DTLOG branch below and the ClickHouse column.
+        try:
+            return datetime.fromisoformat(m["iso"].removesuffix("Z")).isoformat()
+        except ValueError:
+            pass
+
     m = RE_LOG_TS.search(line)
     if not m:
         return None
@@ -326,10 +397,23 @@ def _extract_all_ras_events(chunk_lines: list[str]) -> list[dict]:
 # --------------------------------
 
 
-def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, Any]]:
+def parse_log(
+    text: str,
+    run_id: str,
+    suite_hint: str = "",
+    is_pod_level_retry: bool = False,
+) -> list[dict[str, Any]]:
     """
     Parse a (potentially multi-attempt) log blob.
     Returns one record per (suite, attempt).
+
+    is_pod_level_retry identifies the whole log as coming from a
+    _test_matrix.yaml test_retry / test_multi_spyre_retry job (a suite
+    re-run on a fresh pod after exhausting its in-job attempts) -- distinct
+    from the in-log "=== Attempt N/M ===" banners, which track same-pod
+    retries within a single job and know nothing about pod-level retry. It
+    is stamped onto every record from this log, not derived from log
+    content.
     """
     lines = text.splitlines()
     records: list[dict[str, Any]] = []
@@ -369,6 +453,7 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
             "suite_name": suite_name,
             "attempt": attempt_num,
             "total_attempts": total_attempts,
+            "pod_level_retry": is_pod_level_retry,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
             # Outcome
             "outcome": "unknown",
@@ -421,7 +506,9 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
         }
 
         # -------------------- Attempt start timestamp ----------------------------------------
-        for line in chunk_lines[:20]:
+        # Scan the whole chunk, not a leading window: a chunk opens with GHA
+        # setup output and the first parseable stamp can be far in.
+        for line in chunk_lines:
             ts = _parse_log_ts(line)
             if ts:
                 rec["attempt_start_ts"] = ts
@@ -510,23 +597,42 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
             rec["failure_phase"] = "execution"
 
         # ---------------- Hardware identifiers ------------------------
-        rec["node_name"] = _first_env(RE_NODE_NAME, chunk)
+        # node_name/pod_name/pci_device/aiu_rank0 come from the "Gather
+        # runner info" action, which runs ONCE per job as its own step,
+        # BEFORE the "=== Attempt N/M ===" banners emitted by the test-runner
+        # step. That output sits outside every per-attempt `chunk` (chunks
+        # start at each banner line), so these fields are searched against
+        # the full per-job log `text`, not `chunk` — they're job-wide
+        # constants (same runner pod for every attempt) anyway, and `text`
+        # is a superset of `chunk` so the old DTLOG-based match still works.
+        #
+        # Prefer the k8s node name; fall back to the runner pod name when the
+        # node name env var isn't populated (e.g. some clusters only expose
+        # GHA_RUNNER_POD_NAME via the downward API, not the node name).
+        rec["node_name"] = _first_env(RE_NODE_NAME, text) or _first_env(
+            RE_POD_NAME, text
+        )
         rec["pci_device"] = (
-            _first_env(RE_PCI_DEVICE, chunk)
+            _first_env(RE_PCI_DEVICE, text)
             or _first_env(RE_PCI_DEV_ID, chunk)
             or _first_env(RE_OPENED, chunk)
         )
-        rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, chunk)
-        rec["card_serial"] = _first_env(RE_CARD_SERIAL, chunk)
-        rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, chunk)
-        rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, chunk)
+        rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, text)
 
-        m_xy = RE_MFG_XY.search(chunk)
+        # Same job-wide-constant reasoning as node_name/pci_device above: the
+        # card and chip identity block is printed once by the device-setup step,
+        # usually outside any attempt window, so it must be read from `text`.
+        # Scoping these to `chunk` populated them in only ~1% of rows.
+        rec["card_serial"] = _first_env(RE_CARD_SERIAL, text)
+        rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, text)
+        rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, text)
+
+        m_xy = RE_MFG_XY.search(text)
         if m_xy:
             rec["chip_mfg_x"] = m_xy["x"]
             rec["chip_mfg_y"] = m_xy["y"]
 
-        m_coords = RE_CHIP_COORDS.search(chunk)
+        m_coords = RE_CHIP_COORDS.search(text)
         if m_coords:
             rec["chip_chipy"] = m_coords["chipy"]
             rec["chip_chipx"] = m_coords["chipx"]
@@ -594,24 +700,32 @@ _SKIP_JOB_NAMES = re.compile(
 )
 
 
-def _suite_from_filename(filename: str) -> str | None:
+def _suite_from_filename(filename: str) -> tuple[str, bool] | None:
     """
     Extract a clean suite name from a GHA log filename.
 
-    Returns None if the file should be skipped (meta/gate job or unrecognised).
+    Returns (suite_name, is_pod_level_retry), or None if the file should be
+    skipped (meta/gate job or unrecognised).
 
     Examples
     --------
-    "24_run-tests _ Inductor Ops Reductions Scalar.txt"  → "Inductor Ops Reductions Scalar"
-    "run-tests _ Tensor Layout"                          → "Tensor Layout"
+    "24_run-tests _ Inductor Ops Reductions Scalar.txt"  → ("Inductor Ops Reductions Scalar", False)
+    "run-tests _ Tensor Layout"                          → ("Tensor Layout", False)
     "53_Detect changed files.txt"                        → None  (skipped)
     "0_Run Spyre unit tests.txt"                         → None  (skipped)
+    "12_run-tests _ Inductor Ops Misc Shape C pod-level retry.txt"
+                                                          → ("Inductor Ops Misc Shape C", True)
     """
     # Strip .txt extension (case-insensitive)
     stem = re.sub(r"\.txt$", "", filename, flags=re.IGNORECASE)
     # Strip leading numeric prefix  e.g. "24_"
     stem = re.sub(r"^\d+_", "", stem)
     stem = stem.strip()
+
+    # Detect + strip the pod-level-retry suffix first, before the prefix cleanup below.
+    is_pod_level_retry = bool(RE_POD_LEVEL_RETRY_SUFFIX.search(stem))
+    if is_pod_level_retry:
+        stem = RE_POD_LEVEL_RETRY_SUFFIX.sub("", stem).strip()
 
     # Skip meta/gate jobs
     if _SKIP_JOB_NAMES.match(stem):
@@ -620,7 +734,7 @@ def _suite_from_filename(filename: str) -> str | None:
     # Strip "run-tests _ " prefix (the GHA job name format)
     m = re.match(r"^run-tests\s*_\s*(.+)$", stem, re.IGNORECASE)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip(), is_pod_level_retry
 
     # Extension-less files without a "run-tests _ " prefix are almost always
     # the unnumbered GHA duplicate of a .txt file (same content) OR a stray
@@ -628,21 +742,24 @@ def _suite_from_filename(filename: str) -> str | None:
     # and a capital letter, matching the "Suite Name" pattern).
     # This prevents oddities like bare filenames without spaces from slipping in.
     if re.search(r"[A-Z]", stem) and " " in stem:
-        return stem
+        return stem, is_pod_level_retry
     return None
 
 
-def _pick_files_from_dir(log_dir: Path) -> list[tuple[Path, str]]:
+def _pick_files_from_dir(log_dir: Path) -> list[tuple[Path, str, bool]]:
     """
-    Scan log_dir and return (path, suite_name) pairs for every file that
-    represents a test suite.
+    Scan log_dir and return (path, suite_name, is_pod_level_retry) triples
+    for every file that represents a test suite.
 
     Deduplication: GHA downloads often produce both a numbered .txt file
     ("24_run-tests _ Foo.txt") AND an unnumbered no-extension copy
     ("run-tests _ Foo").  We prefer the .txt variant and skip the duplicate.
+    A suite's pod-level-retry log (job "Foo (pod-level retry)") is kept as
+    its own entry, not deduplicated against the original job's log -- they
+    are two distinct job runs and both outcomes matter.
     """
     # Collect all candidates
-    candidates: list[tuple[Path, str]] = []
+    candidates: list[tuple[Path, str, bool]] = []
     for fpath in sorted(log_dir.iterdir()):
         if not fpath.is_file():
             continue
@@ -652,22 +769,27 @@ def _pick_files_from_dir(log_dir: Path) -> list[tuple[Path, str]]:
         # Accept .txt and .log files, plus extension-less files (GHA produces both)
         if fpath.suffix not in (".txt", ".log", ""):
             continue
-        suite = _suite_from_filename(fpath.name)
-        if suite is None:
+        result = _suite_from_filename(fpath.name)
+        if result is None:
             continue
-        candidates.append((fpath, suite))
+        suite, is_pod_level_retry = result
+        candidates.append((fpath, suite, is_pod_level_retry))
 
-    # Deduplicate by suite name — keep the .txt (or .log) over extension-less
-    seen: dict[str, Path] = {}
-    for fpath, suite in candidates:
-        if suite not in seen:
-            seen[suite] = fpath
+    # Deduplicate by (suite name, is_pod_level_retry) — keep the .txt (or .log) over extension-less
+    seen: dict[tuple[str, bool], Path] = {}
+    for fpath, suite, is_pod_level_retry in candidates:
+        key = (suite, is_pod_level_retry)
+        if key not in seen:
+            seen[key] = fpath
         else:
             # Prefer files with an extension over extension-less duplicates
-            if fpath.suffix in (".txt", ".log") and seen[suite].suffix == "":
-                seen[suite] = fpath
+            if fpath.suffix in (".txt", ".log") and seen[key].suffix == "":
+                seen[key] = fpath
 
-    return [(path, suite) for suite, path in sorted(seen.items())]
+    return [
+        (path, suite, is_pod_level_retry)
+        for (suite, is_pod_level_retry), path in sorted(seen.items())
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -746,9 +868,14 @@ def main() -> None:
             file=sys.stderr,
         )
 
-        for fpath, suite_name in file_suite_pairs:
+        for fpath, suite_name, is_pod_level_retry in file_suite_pairs:
             text = fpath.read_text(errors="replace")
-            recs = parse_log(text, run_id=args.run_id, suite_hint=suite_name)
+            recs = parse_log(
+                text,
+                run_id=args.run_id,
+                suite_hint=suite_name,
+                is_pod_level_retry=is_pod_level_retry,
+            )
             all_records.extend(recs)
             outcomes = [r["outcome"] for r in recs]
             reasons = [
@@ -759,7 +886,8 @@ def main() -> None:
                 file=sys.stderr,
             )
             print(
-                f"         suite={suite_name!r}  attempts={len(recs)}"
+                f"         suite={suite_name!r}  pod_level_retry={is_pod_level_retry}"
+                f"  attempts={len(recs)}"
                 f"  outcomes={outcomes}  reasons={reasons or ['(none)']!r}",
                 file=sys.stderr,
             )

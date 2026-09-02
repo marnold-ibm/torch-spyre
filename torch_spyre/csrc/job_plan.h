@@ -25,9 +25,11 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
-#include "util/spyrecode.h"
+#include "spyrecode-host-functions/fast_process_hcm.h"
+#include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
 
@@ -177,6 +179,74 @@ class HostBuffer {
 // function is defined as deeptools::processComputeOnHostCommand
 
 /**
+ * @brief Which stream a JobPlanStep runs on in the two-stream overlap topology.
+ *
+ * Prep = the persistent host-compute stream (S_prep): HostCompute and H2D.
+ * Dev = the default stream (S_dev): Compute and D2H. Compute overlaps HC/H2D by
+ * running on a different stream; every op keeps pipeline_barrier=true.
+ */
+enum class StreamRole { Prep, Dev };
+
+/**
+ * @brief Coarse classification of a JobPlanStep for structural validation.
+ *
+ * Used by the P2-14 step-ordering validator (checkJobPlanStepOrdering) and the
+ * get_step_type binding. Kept separate from the concrete step classes so the
+ * ordering logic is a PURE function over a projected (StepKind, StreamRole)
+ * sequence and can be unit-tested (e.g. a role-misplacement negative test)
+ * without constructing heavyweight steps (a real HostCompute needs a
+ * deeptools::Hcm plus pinned HostBuffers).
+ */
+enum class StepKind {
+  HostCompute,
+  H2D,
+  D2H,
+  Compute,
+  Unknown,
+};
+
+/**
+ * @brief Discriminator for SymbolicArg entries.
+ *
+ * kAddress  – the slot carries the HBM device address of a tensor.
+ *             value is resolved via compositeAddressToDmva() on
+ *             inputs_outputs[tensor_id].
+ * kDimension – the slot carries a runtime tensor dimension size,
+ *             resolved by the frontend and stored in SymbolicArg::value.
+ *             The consumer will TORCH_CHECK-fail on this kind until it
+ *             is implemented.
+ */
+enum class SymbolicArgKind : int32_t {
+  kAddress = 0,
+  kDimension = 1,
+};
+
+/**
+ * @brief One entry in the per-launch symbolic argument payload.
+ *
+ * Consumed positionally by JobPlanStepHostCompute::construct (Case 3):
+ * slot i in the correction vector is resolved from symbolic_args[i].
+ * Wrong count → loud TORCH_CHECK failure.
+ * Wrong order with right count → silent wrong numerics, so callers must
+ * preserve the backend's compile-time symbol order exactly.
+ *
+ * Fields:
+ *   kind       – how to resolve the value.
+ *   tensor_id  – index into LaunchContext::inputs_outputs.
+ *   dim_index  – for kDimension: which dimension of that tensor.
+ *                for kAddress:   unused (set to -1 by convention).
+ *   value      – for kDimension: the front-end-resolved concrete dimension
+ *                size. for kAddress:   unused (set to -1 by convention).
+ *
+ */
+struct SymbolicArg {
+  SymbolicArgKind kind;
+  int64_t tensor_id;
+  int64_t dim_index = -1;
+  int64_t value = -1;
+};
+
+/**
  * @brief Context passed to JobPlanStep::construct() at launch time
  *
  * Carries runtime data available at LaunchKernel time that was not available
@@ -188,6 +258,20 @@ struct LaunchContext {
    *
    */
   const std::vector<at::Tensor>& inputs_outputs;
+
+  /**
+   * @brief Per-argument typed symbolic payload (optional).
+   *
+   * When non-empty, JobPlanStepHostCompute::construct uses this vector to
+   * drive Case 3 resolution instead of the legacy tensor-iteration loop.
+   * Each entry maps one correction-vector slot to a tensor and a resolution
+   * kind.  The vector is consumed positionally: slot i ↔ symbolic_args[i].
+   *
+   * Empty means "use today's behavior" — the legacy loop over all context
+   * tensors, treating each as an address source.  This preserves back-compat
+   * for existing callers that pass no payload.
+   */
+  std::vector<SymbolicArg> symbolic_args;
 };
 
 /**
@@ -253,8 +337,27 @@ class JobPlanStep {
     return pipeline_barrier_;
   }
 
+  /**
+   * @brief Which stream this step runs on (Prep or Dev).
+   *
+   * Resolved at PrepareKernel time and read by SpyreStream::launch() to route
+   * the step to S_prep or S_dev. Defaults to Dev; subclasses that belong on the
+   * prep stream (HostCompute, H2D) set Prep in their ctor.
+   */
+  StreamRole role() const {
+    return role_;
+  }
+
  protected:
-  bool pipeline_barrier_ = false;
+  // true by default: every step is a potential consumer that should wait for
+  // prior ops. With the two-stream topology EVERY step keeps this true (strict
+  // per-stream FIFO); overlap comes from the stream split, never from relaxing
+  // a barrier.
+  bool pipeline_barrier_ = true;
+
+  // Which stream this step runs on. Defaults to Dev (device compute / D2H);
+  // HostCompute and H2D override to Prep in their ctors.
+  StreamRole role_ = StreamRole::Dev;
 };
 
 /**
@@ -291,7 +394,9 @@ class JobPlanStepH2D final : public JobPlanStep {
    */
   JobPlanStepH2D(void* host_address, flex::CompositeAddress device_address)
       : host_address_(host_address),
-        device_address_(std::move(device_address)) {}
+        device_address_(std::move(device_address)) {
+    role_ = StreamRole::Prep;  // H2D runs on the prep stream (S_prep)
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -311,22 +416,44 @@ class JobPlanStepH2D final : public JobPlanStep {
 class JobPlanStepD2H final : public JobPlanStep {
  public:
   /**
+   * @brief Device memory virtual address representation
+   *
+   */
+  struct Dmva {
+    uint64_t value;
+  };
+
+  /**
    * @brief Construct D2H step
    *
    * @param device_address Device memory address
    * @param host_address Host memory address (caller manages lifetime)
+   * @param size Size of data to transfer
    */
-  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address)
+  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address,
+                 size_t size)
       : device_address_(std::move(device_address)),
-        host_address_(host_address) {}
+        host_address_(host_address),
+        size_(size) {}
+
+  /**
+   * @brief Construct D2H step
+   *
+   * @param dmva Device memory virtual address
+   * @param host_address Host memory address (caller manages lifetime)
+   * @param size Size of data to transfer
+   */
+  JobPlanStepD2H(uint64_t dmva, void* host_address, size_t size)
+      : device_address_(Dmva{dmva}), host_address_(host_address), size_(size) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress device_address_;
+  std::variant<flex::CompositeAddress, Dmva> device_address_;
   void* host_address_;
+  size_t size_;
 };
 
 /**
@@ -340,26 +467,41 @@ class JobPlanStepCompute final : public JobPlanStep {
   /**
    * @brief Construct compute step
    *
-   * @param binary_address Address of the program binary on device
-   * @param bind_io_addresses Whether to bind the compute operation
-   * @param bootstrap_addr Bootstrap address for program execution
-   * with inputs and outputs addresses
+   * @param program_address The program's FULL device allocation. flex bounds
+   * the segment-7 translation to its total_size() (the real Allocate
+   * footprint), never SEGMENT_SIZE.
+   * @param bind_io_addresses Whether to bind the compute operation with inputs
+   * and outputs addresses
+   * @param bootstrap_offset Offset within the program allocation where
+   * execution begins (0 = base; the program-correction region size when
+   * correction precedes the binary)
+   * @param name Human-readable kernel name forwarded to flex as
+   * ComputeParams::kernel_name; surfaces in profiler events
+   * (PendingRequest::node_name, aiupti activity name, FLEX JSON CBName).
+   * Empty string ("") preserves the old behavior (no name).
    */
-  explicit JobPlanStepCompute(flex::CompositeAddress binary_address,
+  explicit JobPlanStepCompute(flex::CompositeAddress program_address,
                               bool bind_io_addresses,
-                              uint64_t bootstrap_addr = flex::PROG_OFFSET_BASE)
-      : binary_address_(std::move(binary_address)),
+                              uint64_t bootstrap_offset = 0,
+                              std::string name = "")
+      : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
-        bootstrap_addr_(bootstrap_addr) {}
+        bootstrap_offset_(bootstrap_offset),
+        name_(std::move(name)) {}
+
+  const std::string& getName() const {
+    return name_;
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress binary_address_;
+  flex::CompositeAddress program_address_;
   bool bind_io_addresses_;
-  uint64_t bootstrap_addr_;
+  uint64_t bootstrap_offset_;
+  std::string name_;
 };
 
 /**
@@ -396,17 +538,57 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
-        ishape_(ishape) {}
+        ishape_(std::move(ishape)) {
+    // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
+    // per-stream FIFO like every other op; overlap with device compute comes
+    // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
+    // its barrier. The inline synchronize() it triggers only drains S_prep, so
+    // it never blocks device compute on S_dev.
+    role_ = StreamRole::Prep;
+    // Try to build fast plan at construction time (prepare time)
+    if (hcm_) {
+      fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
+      if (!fast_plan_.valid) {
+        // Mark as permanently invalid so we don't retry
+        fast_plan_.output_size = UINT32_MAX;
+      }
+    }
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
+
+  /**
+   * @brief Resolve a symbolic_args payload to a vector of int64 values.
+   *
+   * Each entry is resolved according to its kind: kAddress entries yield the
+   * HBM device address of the corresponding tensor; kDimension entries yield
+   * the pre-resolved dimension size stored in SymbolicArg::value.
+   *
+   * Extracted from the typed-payload resolution path in construct() so that
+   * the resolution logic has a single definition shared by both the hot path
+   * and the _C._resolve_symbolic_args test seam. Keeping it as a static
+   * member of this class makes the ownership clear without exposing it as a
+   * top-level public symbol.
+   *
+   * Preconditions (enforced via TORCH_CHECK):
+   *   - Every symbolic_args[i].tensor_id is a valid index into tensors.
+   *   - Every symbolic_args[i].kind is kAddress (kDimension not yet
+   *     implemented).
+   */
+  static std::vector<int64_t> resolveSymbolicArgs(
+      const std::vector<at::Tensor>& tensors,
+      const std::vector<SymbolicArg>& symbolic_args);
 
  private:
   std::unique_ptr<Hcm> hcm_;
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+
+  // Pre-compiled patch plan for fast execution
+  mutable deeptools::FastHcmPatchPlan fast_plan_;
 };
 
 /**
@@ -502,5 +684,51 @@ struct JobPlan {
  * @return Reference to the output stream
  */
 std::ostream& operator<<(std::ostream& os, const JobPlan& plan);
+
+/**
+ * @brief Classify a JobPlanStep into a StepKind (dynamic_cast dispatch).
+ *
+ * Single source of truth for step-type identification, shared by the
+ * get_step_type binding and the P2-14 ordering validator.
+ */
+StepKind classifyStep(const JobPlanStep& step);
+
+/// Human-readable name for a StepKind (used by get_step_type and validator
+/// error messages). Never returns nullptr.
+const char* stepKindName(StepKind kind);
+
+/// Parse a StepKind from its stepKindName() spelling. Throws on an unknown
+/// name. Used by the check_job_plan_step_ordering Python binding.
+StepKind stepKindFromName(const std::string& name);
+
+/// Parse a StreamRole from "Prep"/"Dev". Throws on an unknown name. Used by the
+/// check_job_plan_step_ordering Python binding.
+StreamRole streamRoleFromName(const std::string& name);
+
+/**
+ * @brief Validate the two-stream step ordering over a PROJECTED sequence.
+ *
+ * Pure function over parallel (kinds, roles) vectors — one entry per step, in
+ * plan order. Returns an empty string when the ordering is valid, otherwise a
+ * human-readable error message. This is the core of the P2-14 validator:
+ * JobPlanBuilder::validate() classifies the real plan and calls this, and the
+ * check_job_plan_step_ordering binding calls it directly so a role-misplacement
+ * rejection can be tested without building real steps.
+ *
+ * Since the STATIC correction-overlap path was retired, torch-spyre emits NO
+ * cross-stream event steps: the correction plan is the plain role-tagged triple
+ * [HostCompute(Prep), H2D(Prep), Compute(Dev)] and flex's per-region hazard
+ * tracker inserts the RAW/WAR edges dynamically at enqueue. The validator
+ * therefore checks ROLE ordering only:
+ *  - Applied only when the plan has a HostCompute; a plan without one (pure
+ *    ComputeOnDevice, standalone D2H, tensor .to() moves) is legacy
+ *    single-stream and stays valid unconditionally (backward-compat).
+ *  - S_prep (role Prep) must be exactly  HostCompute -> H2D  (no Compute on
+ *    Prep).
+ *  - S_dev (role Dev) must be exactly  Compute  (no HostCompute/H2D on Dev),
+ *    preserving the leading-producer guarantee.
+ */
+std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
+                                     const std::vector<StreamRole>& roles);
 
 }  // namespace spyre

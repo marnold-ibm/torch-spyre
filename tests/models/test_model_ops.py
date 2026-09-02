@@ -73,7 +73,11 @@ def add_model_ops_db(loadedCases: List[LoadedCase]):
     for loadedCase in loadedCases:
         test_name = loadedCase.case["name"]
         op_name = loadedCase.case["op"]
-        adapter = OP_REGISTRY[op_name]
+        try:
+            adapter = OP_REGISTRY[op_name]
+        except KeyError as e:
+            print("Missing op:", op_name)
+            raise e
         basename = os.path.basename(loadedCase.source_path)
         test_name = f"{test_name}__{basename}_"
         assert test_name not in seen_test_names
@@ -108,13 +112,14 @@ def _init_model_ops_db():
 
 _init_model_ops_db()
 
-seen_case_keys = set()
+seen_case_keys: set[tuple[Any, Any, Any, Any, Any, Any]] = set()
 
 
 class TestSpyreModelOps(TestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        torch._dynamo.config.accumulated_recompile_limit = 4096
 
     @ops(model_ops_db)
     def test_model_ops_db(

@@ -46,7 +46,8 @@ and dispatched from `CustomPreSchedulingPasses` in
 [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
 
 The planner only sees ops whose IR data is `Pointwise` or `Reduction`
-(and excluding TopK reductions, which return early). `FallbackKernel`,
+(TopK reductions use dedicated constraints; see [TopK work
+division](#topk-work-division)). `FallbackKernel`,
 `ExternKernel`, `SpyreConstantFallback`, and `SpyreEmptyFallback`
 allocation kernels are filtered out earlier and never reach the passes.
 
@@ -205,9 +206,9 @@ toward the limit). Previously committed splits are
 carried forward as lower bounds and narrow the search for subsequent
 tensors.
 
-The resulting minimum splits are written to `op.op_it_space_splits` via
-`apply_splits`. If no span violation exists, `op_it_space_splits` is
-left unset.
+The resulting minimum splits are committed as symbol-keyed
+`op.iteration_space_ownership` via `apply_splits`. If no span violation
+exists, no ownership is recorded.
 
 Splitting the outermost dim halves each core's footprint:
 
@@ -274,76 +275,94 @@ Pass 3 consults to skip already-divided ops.
 ### The cost equation
 
 The cost is an estimated runtime in microseconds for a matmul running
-with a given `(b, m, n, k)` split:
+with a given `(b, m, n, k)` split. Every term is additive, with no
+multiplicative penalty:
 
 ```text
-cost(b, m, n, k) = (compute + hbm + psum + tie_break) × b^1.4
+cost(b, m, n, k) = compute + hbm + psum + shape_penalties + batch
 ```
 
-The four time terms are added together to estimate the kernel runtime.
-The batch penalty `b^1.4` multiplies the sum to penalise splitting
-batch across cores: batch items are independent and gain nothing from
-parallel execution across cores.
+`compute`, `hbm`, and `psum` model real kernel time. `shape_penalties`
+and `batch` are small additive terms that break ties between
+otherwise-equivalent splits. A split that uses zero cores or more than
+`max_cores` scores `inf`. Lower is better.
 
 :::{admonition} Advanced: cost-term details
 :class: note dropdown
 
-Each of the four time terms and the batch penalty in detail.
-
 **Compute time** is per-core work divided by per-core peak rate:
 
 ```text
-compute = (B·M·N·K / b·m·n·k) / (peak_MACs_per_core × pt_eff)
+compute = (B·M·N·K / (b·m·n·k)) / (peak_MACs_per_core × pt_eff)
 ```
 
 `pt_eff` drops below 1 when the per-core M slice is short. The PT array
-streams M in passes of 8 rows. Below the 8-pass target, pipeline
-startup and drain dominate, and effective throughput falls off as
-`sqrt(passes / 8)`.
+streams M in passes of `_PT_ROWS = 8` rows, and `pt_passes = (M/m) / 8`.
+Below the `_TARGET_PT_PASSES = 5` target, startup and drain overhead is
+amortised over too little work, so effective throughput falls off as
+`(pt_passes / 5) ** 0.25`.
 
 **HBM time** is bytes moved divided by aggregate LPDDR5 bandwidth,
 scaled by a cohort penalty:
 
 ```text
-hbm = (B·M·K + B·K·N + B·M·N) × 2 bytes / 204.8 GB/s × max(1, max(m, n) / 8)
+hbm = (B·M·K + W·K·N + B·M·N) × 2 bytes / 204.8 GB/s × cohort_penalty
 ```
 
-Each input is broadcast to the cores that split the orthogonal dim. Up
-to 8 cores share a broadcast for free. Past 8 cores, contention makes
-effective bandwidth fall off linearly with cohort size.
+`W` is `1` for a shared 2D weight and `B` for a true bmm (the weight is
+not replicated across batch). Each operand is broadcast to the cores
+that split the orthogonal dim; up to `_COHORT_LIMIT = 8` cores share a
+broadcast for free. Past that, contention makes effective bandwidth
+fall off as `cohort_penalty = (fanout / 8) ** 0.75`, where `fanout` is
+`n` for a true bmm and `max(m, n)` for a shared weight.
 
 **PSUM time** is the cost of a K-split reduction:
 
 ```text
-psum = (k − 1) × B·M·N × 1.4e-4 µs
+psum = max(0, k − 1) × (B·M·N / (b·m·n)) × psum_coeff
 ```
 
-A K-split requires `k − 1` ring hops, and every hop touches every
-output element. The term is zero when `k = 1`, which is why non-K
-splits are usually cheaper for matmuls that are not bandwidth-bound.
+A K-split spreads the reduction over `k` cores at the cost of `k − 1`
+partial-sum hops, charged per per-core output tile rather than the
+whole output. `psum_coeff` is `1.0e-3 µs` for a shared weight and
+`1.0e-4 µs` for a true bmm. The term is zero when `k = 1`, which is why
+non-K splits are usually cheaper for matmuls that are not
+bandwidth-bound.
 
-**Tie-break** weights the selection toward an m-split that matches
-the PT pipeline depth:
+**Shape and tie-break penalties** are several small additive terms that
+separate compute-equivalent splits and bias the planner away from kernel
+shapes the codegen handles poorly:
+
+- The M-lane underuse term adds `10 µs` per log2 step when the M split
+  exposes fewer M lanes than the target.
+- The M-tile underfill term adds `30 µs` per log2 step when per-core rows
+  fall below `_M_TILE_UNDERFILL_TARGET = 16`.
+- The wide-N term adds `25 µs` per log2 step when the per-core N tile
+  exceeds `_TARGET_N_TILE_ELEMS = 512` elements.
+- The value-matmul and shared-projection shape terms penalize splitting a
+  small output dim against a much larger reduction dim, using size ratios
+  rather than op names.
+- The core-underuse term adds a soft `150 µs` per log2 step below the full
+  core budget, so a lower-core split with good measured performance can
+  still win.
+
+The batch term adds a small overhead for a true-bmm batch split, because
+batch items are independent and gain nothing from being split across
+cores:
 
 ```text
-tie_break = |log2(m / m_target)| × 50 µs
+batch = log2(max(1, b)) × 10 µs        # 0 for a shared weight
 ```
 
-`m_target` is derived from `_TARGET_PT_PASSES` and the M dimension
-size. The tie-break term is small relative to the other three terms
-and only changes the choice when several splits are otherwise
-compute-equivalent.
+A shared-weight projection has no batch dim to split, so the term is
+zero.
 
-**Batch penalty.** The factor is `b^1.4`. It is multiplicative because
-batch items are independent and gain nothing from being split across
-cores. The exponent 1.4 is fit to bmm sweeps.
-
-**The constants.** Peak MAC rate per core, HBM bandwidth, cohort
-limit, PSUM cost per element, tie-break weight, and batch exponent
-are all defined at
-[`work_division.py:638–650`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py#L638).
-They are tuning knobs, not user configuration. The values are fit to
-measured Spyre behaviour and re-tuned across hardware revisions.
+The constants are defined in
+[`work_division.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py):
+the peak MAC rate per core, HBM bandwidth, cohort limit and exponent,
+PSUM coefficients, the tie-break weights, and the batch penalty. They are
+internal tuning constants and are not user-configurable. The values are
+fit to measured Spyre behaviour and re-tuned across hardware revisions.
 :::
 
 ## Pass 3 — Work Distribution (`work_distribution`)
@@ -353,40 +372,56 @@ after Pass 2 has finished across all operations.
 
 For each remaining op, `work_distribution_pass` does three things:
 
-1. It recovers the splits committed by Pass 1 by reading
-   `op.op_it_space_splits` via `apply_splits_from_index_coeff`. The
-   coeff-keyed encoding is the same one codegen uses, so it remains
-   stable across compiler passes even as sympy symbols are renamed.
+1. It reads the symbol-keyed splits committed by Pass 1 from
+   `op.iteration_space_ownership.work_slices`. The ownership remains in
+   operation-symbol space through LX planning.
 2. It ranks the remaining dimensions (those not already committed by
    Pass 1) for additional core assignment via `prioritize_dimensions`:
    output dimensions first by decreasing stick-adjusted size, reduction
    dimensions last. At most one reduction dimension is eligible for
-   splitting, the one that maximises
-   `core_split(size, remaining_cores)` after output dimensions have
-   absorbed their share of cores. If Pass 1 already committed a
-   reduction split, no further reduction dimensions are eligible.
+   splitting, selecting largest reachable legal factor within remaining core
+   budget after output dimensions have absorbed their share of cores. If Pass 1
+   already committed a reduction split, no further reduction dimensions are
+   eligible.
 3. It distributes all `max_cores` across committed and priority
    dimensions with `multi_dim_iteration_space_split`. The function
    first applies the committed splits as minimum requirements, then
    greedily assigns the largest valid divisor of each remaining
    dimension to the leftover core budget.
 
-The final splits overwrite `op.op_it_space_splits`.
+The final splits overwrite `op.iteration_space_ownership`.
 
-:::{admonition} What gets written to `op.op_it_space_splits`
+### Hard split domains
+
+Operation constraints may provide `allowed_splits`, the exact legal factors for
+an iteration dimension. Domains are intersected when multiple constraints apply.
+A domain containing `1` permits leaving that dimension unsplit. A domain that
+excludes `1`, such as `{2, 4, 8}`, also establishes a mandatory baseline: the
+planner reserves its smallest factor (`2`) before greedy distribution, then may
+grow it to any larger legal factor (`4` or `8`) if core budget remains. Thus an
+explicit legal-factor domain can encode a minimum split without a separate
+constraint field. `{2}` instead pins the dimension to exactly `2`.
+
+Span reduction's `min_splits` are separate hardware-span floors. They are
+applied first, must themselves be members of any applicable `allowed_splits`
+domain, and remain in force for later planning, hints, and LX candidates. The
+floors are retained with the operation's work-division metadata when an IR pass
+reconstructs it. A later split may use any legal factor at least as large as the
+floor; it need not be a multiple of the original span factor.
+
+:::{admonition} What gets written to `iteration_space_ownership`
 :class: note
 
-The attribute is a `dict` keyed by the index coefficients of the
-buffer's read and write index expressions (computed by
-`splits_by_index_coeff` in
-[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)),
-with each coefficient mapping to its slice count. The coefficient
-encoding is internal. Downstream passes recover an iteration-variable
-view by calling
-`apply_splits_from_index_coeff(splits, write_index, read_index, it_space)`.
+The pre-scheduler carrier is a `TensorWorkDivision`: `work_slices` maps
+operation iteration symbols to slice counts, and `core_id_to_work_slice`
+records the selected symbol-keyed core assignment. LX planning consumes this
+ownership directly. Cost-model reporting also reads this ownership before the
+final Scheduler boundary. `finalize_work_division_for_scheduler()` then converts
+the splits to legacy coefficient-keyed `op_it_space_splits` transport so
+Scheduler/codegen can survive iteration-symbol renaming.
 
-For the worked example below, the user-facing view is
-`{M: 16, N: 1, K: 2}` and codegen sees the equivalent
+For the worked example below, the pre-scheduler ownership is
+`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy
 coefficient-keyed encoding.
 :::
 
@@ -396,6 +431,41 @@ considers only output dimensions. For reductions, span-required splits
 may include at most one reduction variable. If more than one reduction
 variable would have to be split to satisfy the 256 MB span limit, the
 compiler raises an error.
+
+(topk-work-division)=
+
+## TopK work division
+
+TopK reductions use constraint-based work division:
+
+1. **k is split, capped at 4 rows per core.** The legal splits are divisors
+   `d` of `k` with `k / d <= 4`. The planner uses the smallest legal divisor:
+   larger factors are not supported because they can produce incorrect output
+   mapping for 4D TopK results. If no valid divisor exists within max_cores, the compiler
+   raises `Unsupported`.
+2. **The search-space dimension is never split.** The dimension being
+   searched (the `dim` argument to `torch.topk`) must stay whole on one core.
+
+Other output/batch dimensions are distributed across the remaining core budget
+under the constraint that total cores used is `k_cores * product(other_dims) <= max_cores`.
+
+## Keep-by-index work division
+
+`keep_by_index` applies an index-selected mask while preserving the values
+shape. Its index tensor adds a K axis that is absent from the output. One output
+coordinate absent from the semantic indices operand is selected as the full
+search axis; other absent coordinates can be broadcast batch/output axes.
+
+1. **Index-only K uses the minimum supported split.** Its legal factor is the
+   smallest divisor `d` of K that satisfies `K / d <= 4` and `d <= SENCORES`.
+   The hardware supports at most four selected indices per core.
+2. **The selected search axis remains whole.** Every core must search the full
+   masked values dimension, so its legal split is `1`.
+3. **Other output and batch axes remain eligible.** The default planner uses
+   them with the remaining core budget.
+
+The Scheduler transport uses the indices read as the reduction-split reference
+for this operation because it carries K; the values read does not.
 
 ## Worked example: large matmul on 32 cores
 
@@ -408,7 +478,7 @@ dim `K`.
 
 | Tensor | Unsplit per-core span | Violating dim | Pass 1 commit | After Pass 3 | Cores reading it |
 |---|---|---|---|---|---|
-| A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K split = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
+| A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K minimum = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
 | W `[32768, 4096]` fp16 | 256 MB | none (at limit) | — | M = 16, K = 2 | each core reads (16384 K) × (4096 N) = 128 MB |
 | O `[8192, 4096]` fp16 | 64 MB | none | — | M = 16, K = 2 | each core writes (512 rows) × 4096 = 4 MB |
 
@@ -418,9 +488,10 @@ and Pass 3 distributes the remaining cores. Without the Pass-1 commit,
 the planner would enumerate divisors of `(B, M, N, K)` and price each
 feasible combination with the cost equation.
 
-Pass 3 inherits the 2-way K split from Pass 1. With 16 cores remaining
-per K-slice, it ranks output dims by size (`M = 8192`, `N = 4096`) and
-assigns all 16 cores to `M`. Final split: `{M: 16, N: 1, K: 2}`.
+Pass 3 retains Pass 1's K=2 lower bound. A later split may use any legal
+factor at or above that floor. With 16 cores remaining per K-slice, it ranks
+output dims by size (`M = 8192`, `N = 4096`) and assigns all 16 cores to `M`.
+Final split: `{M: 16, N: 1, K: 2}`.
 
 | Dim | Size | Split | Per-core |
 |---|---|---|---|
@@ -463,13 +534,24 @@ commits the argmin. Pass 3 skips the op.
 When any planner selects a K-split, the SDSC emitter permutes physical
 core IDs so the cores collaborating on the K reduction occupy adjacent
 ring positions. The permutation is implemented in
-`_k_fast_core_to_slice_mapping` in `codegen/superdsc.py`, gated by
-`_should_use_k_fast_mapping`. It drops PSUM accumulation hops from
+`core_to_slice_mapping` in `core_mapping.py`, invoked from
+`codegen/superdsc.py` with a `contiguous_dim` argument, and gated by the
+`core_id_k_fast_emission` config flag. It drops PSUM accumulation hops from
 `m × n` to 1, which is what makes cross-core K reductions cheap at
 runtime. The flag `SPYRE_CORE_ID_K_FAST_EMISSION` (default on)
 controls this codegen-side permutation. The name is legacy from when
 k-fast was also a planner. The permutation runs whenever any planner
 picks a K-split.
+
+:::{figure} ../_static/images/work-division/core-id-k-mapping.svg
+:alt: Default core order places the two K slices of one output tile four cores apart; contiguous_dim on K places them on adjacent cores.
+:width: 100%
+
+`contiguous_dim` selects which dimension varies fastest across `core_id`.
+Setting it to the K dimension puts the cores that reduce the same output
+tile next to each other, so their partial sums accumulate over one ring
+hop instead of several.
+:::
 
 ### Scratchpad planning
 
@@ -494,9 +576,10 @@ Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)
         ✓ reuse                                   ✗ DDR reload
 ```
 
-A graph-aware co-optimisation pass is in development. It aligns splits
-across adjacent ops to grow the LX planner's legal-reuse set. The work
-is tracked in the [scratchpad planning](scratchpad_planning.md) doc.
+A graph-aware co-optimisation pass exists and is opt-in via
+`CO_OPTIMIZING_LX_PLANNING=1`. It aligns splits across adjacent ops to
+grow the LX planner's legal-reuse set. See the
+[scratchpad planning](scratchpad_planning.md) doc for details.
 
 ## User Work-Division Hints
 
@@ -506,7 +589,7 @@ to the requested number of core slices for that dimension:
 
 ```python
 from torch_spyre._inductor import spyre_hint
-from torch_spyre._inductor.propagate_named_dims import (
+from torch_spyre._inductor.wsr.propagate_named_dims import (
     declare_tensor_dim,
     name_tensor_dims,
 )
@@ -516,6 +599,7 @@ declare_tensor_dim("K", K)
 declare_tensor_dim("N", N)
 name_tensor_dims(x, ["M", "K"])
 name_tensor_dims(y, ["K", "N"])
+
 
 def fn(x, y):
     with spyre_hint(work_div={"M": 2, "K": 4}):
@@ -528,20 +612,22 @@ separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
 coexist in the same scope.
 
 When the work-division planner sees a resolved user hint, it validates the
-request and commits it directly instead of running the automatic priority-based
-distribution. For matmul reductions, a user hint also bypasses the analytic
-cost-model split selection; the hint takes ownership of the split decision.
-Validation checks that:
+request and commits the accepted splits directly instead of running the
+automatic priority-based distribution. Hinted dimensions are considered in user
+priority order. If adding a later split would exceed `SENCORES`, the compiler
+logs a warning and skips that split. For matmul reductions, a user hint also
+bypasses the analytic cost-model split selection; the hint takes ownership of
+the accepted split decision. Validation checks that:
 
 - every split value is a positive integer
-- the product of all requested splits does not exceed `SENCORES`
-- every split evenly divides the stick-adjusted dimension size
-- at most one reduction dimension is split
+- accepted splits do not exceed `SENCORES`
+- every accepted split evenly divides the stick-adjusted dimension size
+- at most one accepted reduction dimension is split
 
 User work-division hints are intentionally authoritative. If Pass 1
 (`span_reduction`) already committed minimum splits for the 256 MB span limit,
 and the user hint asks for fewer splits, the compiler logs a warning and applies
-the strict user hint. `warn_if_per_core_overflow` then logs a critical message if
+the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
 the resulting per-core span exceeds the hardware limit.
 
 Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
@@ -559,8 +645,8 @@ annotations and use the automatic work-distribution planner.
   the requested component yet.
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work
   division. `ExternKernel` and `FallbackKernel` nodes are skipped.
-- TOPK reductions currently run single-core, so `work_div` hints on TOPK
-  operations are ignored with a warning.
+- TopK reductions use constraint-based work division, so `work_div` hints
+  are not supported for TopK operations.
 - Each pass plans one op at a time. Adjacent ops can pick incompatible
   per-core splits for a shared tensor, which the LX scratchpad planner
   then treats as a core-division mismatch.
@@ -574,9 +660,6 @@ annotations and use the automatic work-distribution planner.
 
 **Potential future enhancements:**
 
-- Add a graph-aware co-optimisation pass that aligns splits across
-  adjacent ops to grow the LX legal-reuse set (see
-  [Scratchpad planning](#scratchpad-planning)).
 - Extend optimisation across operations to take data reuse and the
   wider memory hierarchy into account.
 - Make the cost model bmm-aware so it can price shared-weight bmms
