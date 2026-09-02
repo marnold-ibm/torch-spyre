@@ -754,6 +754,13 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
 
     if gen_from_b:
         x_arg, y_arg = inputs[0], inputs[1]
+        if len(gen_from_b) > 1:
+            # Broadcast-batch case: x is broadcast over an extra dim, so multiple
+            # candidates appear in gen_from_b.  The true generated sym is the one
+            # on y's stick — layout propagation always puts N there.
+            on_y_stick = gen_from_b & _arg_stick_syms(y_arg)
+            if len(on_y_stick) == 1:
+                gen_from_b = on_y_stick
         generated_sym = next(iter(gen_from_b))
     else:
         # No generated_sym found — N=1 collapsed or symmetric. Vacuously valid.
