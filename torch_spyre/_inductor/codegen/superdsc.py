@@ -243,10 +243,20 @@ class SDSCSpec:
 # masking it to 0. -1e4 is finite (encodes correctly) and still underflows
 # exp() to exactly 0 in fp16 (fp16's smallest positive value is ~6e-8; anything
 # below about -12 already underflows), so it produces the same masking effect
-# without going through the broken infinity path. The max/min reduction
-# identities below have the same encode_constant bug but are left as -inf/inf
-# here -- fixing them is a separate, pre-existing issue, not part of this
-# BANDAGE.
+# without going through the broken infinity path.
+#
+# The max/min reduction identities below have the same encode_constant bug:
+# _get_mask_value("max") fed float("-inf") through the same broken path, so a
+# max-reduction's padded lanes were seeded with NaN instead of -inf. Unlike
+# exp's poisoned-but-locally-contained NaN, max(x, NaN) == NaN -- the identity
+# failure propagates through the whole reduction result, not just the padded
+# lanes, which would poison any block_max = torch.amax(scores, dim=-1) whose
+# padded lanes get reduced over. _FP16_MAX/_FP16_MIN are the most extreme
+# finite fp16 values, so they lose (max)/win (min) against any real fp16 score
+# while still encoding correctly.
+_FP16_MAX = 65504.0
+_FP16_MIN = -65504.0
+
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
     "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
 }
@@ -254,9 +264,9 @@ _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
 
 def _get_mask_value(op: str) -> float:
     if op == "max":
-        return float("-inf")
+        return _FP16_MIN
     if op == "min":
-        return float("inf")
+        return _FP16_MAX
     if op in _POINTWISE_PADDING_MASK_VALUE:
         return _POINTWISE_PADDING_MASK_VALUE[op]
     return 0
