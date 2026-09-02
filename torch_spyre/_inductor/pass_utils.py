@@ -1991,21 +1991,25 @@ def compute_restickify_needed(
     # stick; the backend would see two contraction dimensions and produce wrong output.
     # Such a layout is not truly compatible with any target that has a clean stick,
     # so skip the stick_compatible short-circuit when the layouts differ.
-    stick_syms = idc[-1].free_symbols
-    outer_axes_with_stick_var = [
-        c for c in idc[:-1] if bool(c.free_symbols & stick_syms)
-    ]
-    is_factorized = bool(stick_syms) and len(outer_axes_with_stick_var) > 1
-    if is_factorized and in_stl != out_stl:
-        # The input layout places the contraction variable on outer axes AND the
-        # stick (factorized layout). The backend would see two contraction dims
-        # even though the var is on the stick — stick_compatible would incorrectly
-        # accept it. out_stl is the canonical collapsed target from
-        # find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
-        # always passes [req_stl] as the target list, so the beam search only
-        # queries this function with that canonical result.
-        assert in_stl.element_arrangement == ElementArrangement.STANDARD
-        return True, out_stl
+    if _is_matmul_op(op):
+        stick_syms = idc[-1].free_symbols
+        outer_axes_with_stick_var = [
+            c for c in idc[:-1] if bool(c.free_symbols & stick_syms)
+        ]
+        is_factorized = (
+            in_stl.element_arrangement == ElementArrangement.STANDARD
+            and bool(stick_syms)
+            and len(outer_axes_with_stick_var) > 1
+        )
+        if is_factorized and in_stl != out_stl:
+            # The input layout places the contraction variable on outer axes AND
+            # the stick (factorized layout). The backend would see two contraction
+            # dims even though the var is on the stick — stick_compatible would
+            # incorrectly accept it. out_stl is the canonical collapsed target
+            # from find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
+            # always passes [req_stl] as the target list, so the beam search only
+            # queries this function with that canonical result.
+            return True, out_stl
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
