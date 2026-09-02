@@ -474,7 +474,6 @@ class TestBuildingBlocks(unittest.TestCase):
         "layout-propagation work lands."
     )
 
-    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
     def test_granite_gqa_decode_with_finite_mask(self):
         """Decode SDPA uses all KV chunks through an unnamed broadcast mask."""
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=1)
