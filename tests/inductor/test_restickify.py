@@ -595,6 +595,7 @@ def test_bmm_unit_self_1():
     x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
     _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
 
+
 def test_bmm_unit_self_2():
     """Same as test_bmm_unit_n but uses the same tensor for both operands."""
     x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1

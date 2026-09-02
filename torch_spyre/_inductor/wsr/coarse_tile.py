@@ -93,7 +93,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import SpyreTensorLayout
 
 from .. import config
-from ..constants import BATCH_MATMUL_OP
+from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
 from ..loop_info import (

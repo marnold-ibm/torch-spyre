@@ -751,7 +751,6 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     b_syms = _arg_free_syms(inputs[1])
 
     gen_from_b = (b_syms & out_syms) - a_syms
-    gen_from_a = (a_syms & out_syms) - b_syms
 
     if gen_from_b:
         x_arg, y_arg = inputs[0], inputs[1]

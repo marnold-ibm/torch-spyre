@@ -36,8 +36,6 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
-    BATCH_MATMUL_OP,
-    BATCH_MATMUL_FP8_OP,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,

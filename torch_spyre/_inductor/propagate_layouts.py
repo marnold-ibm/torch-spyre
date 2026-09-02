@@ -976,8 +976,7 @@ def _matmul_layouts(
             y.layout.dtype,
             y_dim_order,
         )
-        # Output stick is on the last host dim (N=1 means it collapses to a scalar
-        # position; the standard row-major dim_order applies).
+        # Output stick is on the last host dim (N=1 collapses N to a scalar position).
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
     else:

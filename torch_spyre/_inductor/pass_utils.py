@@ -1981,8 +1981,27 @@ def compute_restickify_needed(
     if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
         # The output stick is 0 (sparse) and the input is clean-dense.  For
         # matmul, y may legally arrive sparse when N=1 collapses the N symbol.
-        # Build a sparse target STL directly — dim_order [..., -1] means the
-        # stick dimension is not mapped to any host dim (sparse/broadcast).
+        # Build the sparse target from in_stl's device dimensions — not from host
+        # dimensions, which may include size-1 dims (e.g. M=1) that cause
+        # SpyreTensorLayout constructor 2 to produce an extra device dimension.
+        # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
+        # it by stick_size, promote the element stride there, set stick to -1.
+        stick_size = get_elem_in_stick(in_host.dtype)
+        ds = list(in_stl.device_size)
+        sm = list(in_stl.stride_map)
+        elem_stride = sm[-1]
+        k_chunk_dim = next(
+            (i for i in range(len(sm) - 1) if sm[i] == elem_stride * stick_size),
+            None,
+        )
+        if k_chunk_dim is not None:
+            y_ds = list(ds)
+            y_sm = list(sm)
+            y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
+            y_sm[k_chunk_dim] = elem_stride
+            y_sm[-1] = -1
+            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+        # Fallback: construct from host dims (safe when no size-1 host dims collapse).
         host_size = [concretize_expr(s) for s in in_host.size]
         host_stride = [concretize_expr(s) for s in in_host.stride]
         dim_order = list(range(len(host_size))) + [-1]
