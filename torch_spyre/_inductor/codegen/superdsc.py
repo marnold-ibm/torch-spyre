@@ -234,8 +234,21 @@ class SDSCSpec:
 # (set at DMA-in and at buffer allocation), which would let the compiler pick the
 # right neutral value per consumer and elide pad/zero copies — tracked in #3290.
 # Retire this dict once that lands.
+#
+# NOTE: the mask value is a large finite negative, not -inf. encode_constant()
+# (module.cpp -> deeptools::FloatToFp16Bin) mis-encodes IEEE +-inf as a NaN bit
+# pattern instead of the fp16 infinity encoding (confirmed empirically: -inf
+# round-trips to NaN, not 0xFC00), so exp(-inf) never reaches the runtime as
+# exp(-inf) -- it reaches it as exp(NaN), which poisons the output instead of
+# masking it to 0. -1e4 is finite (encodes correctly) and still underflows
+# exp() to exactly 0 in fp16 (fp16's smallest positive value is ~6e-8; anything
+# below about -12 already underflows), so it produces the same masking effect
+# without going through the broken infinity path. The max/min reduction
+# identities below have the same encode_constant bug but are left as -inf/inf
+# here -- fixing them is a separate, pre-existing issue, not part of this
+# BANDAGE.
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
-    "exp": float("-inf"),  # exp(-inf) == 0
+    "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
 }
 
 
