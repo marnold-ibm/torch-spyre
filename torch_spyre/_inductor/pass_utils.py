@@ -1041,6 +1041,26 @@ def find_matmul_generated_var(
     if op is not None and len(generated_vars) > 1:
         generated_vars = generated_vars - broadcast_batch_vars(op, x_dep, out_dep)
         logger.debug("  generated_vars (after broadcast filter) = %s", generated_vars)
+    if len(generated_vars) > 1:
+        # Tie-break: the true N (generated/stick) dim has the smallest absolute
+        # coefficient in y's index expression.  Broadcast-batch dims always have
+        # a larger stride in y (they index into y's outer batch dimension).
+        # sympy.Poly lets us extract per-symbol coefficients safely.
+        try:
+            y_poly = sympy.Poly(y_dep.index, *generated_vars)
+            coeffs = {
+                sym: abs(
+                    int(y_poly.nth(*([1 if s == sym else 0 for s in generated_vars])))
+                )
+                for sym in generated_vars
+            }
+            min_coeff = min(coeffs.values())
+            generated_vars = {sym for sym, c in coeffs.items() if c == min_coeff}
+            logger.debug(
+                "  generated_vars (after y-coeff tie-break) = %s", generated_vars
+            )
+        except Exception:
+            pass
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"
