@@ -2435,9 +2435,13 @@ def lower_pad_sequence(
     # These are host strides, not device strides; SpyreTensorLayout derives
     # the device layout (sticks, rows, …) from the host shape + dim_order.
     original_stride_core = original_stride[n_phantom:]
-    order_fastest_first = sorted(
-        range(len(padded_core)), key=lambda i: original_stride_core[i]
-    )
+    # Preserve zero-stride (broadcast) dims — e.g. a coarse-tile read-copy
+    # where one loop var is absent from the dep's index has stride 0 for that
+    # dim.  Sorting zero-stride dims first and assigning them a running product
+    # would give them a non-zero stride, breaking the broadcast contract.
+    # Keep them at 0 and only rank/assign strides to the live dims.
+    live_dims = [i for i in range(len(padded_core)) if original_stride_core[i] != 0]
+    order_fastest_first = sorted(live_dims, key=lambda i: original_stride_core[i])
     core_stride = [0] * len(padded_core)
     running = 1
     for i in order_fastest_first:
