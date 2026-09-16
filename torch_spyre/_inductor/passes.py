@@ -72,7 +72,16 @@ from .insert_restickify import (
     validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
-from .nonstick_dim_order import reorder_nonstick_dims
+from .nonstick_dim_order import reorder_nonstick_dims as _reorder_nonstick_dims_impl
+import os as _os
+
+
+def reorder_nonstick_dims(graph):  # noqa: F811
+    if not _os.environ.get("SPYRE_ENABLE_NDO"):
+        return
+    _reorder_nonstick_dims_impl(graph)
+
+
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
