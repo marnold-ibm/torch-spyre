@@ -930,18 +930,23 @@ def test_fused_attention_projection_uses_exact_flat_m_layout():
         flat = attention.transpose(1, 2).reshape(M, K)
         return F.linear(flat, weight)
 
-    result, plan = _compile_and_run_plan_capture(fn, q, k, v, weight)
-    target_stls = [
-        entry.target_layout.device_layout
-        for entries in plan.values()
-        for entry in entries
-    ]
+    result, _, nonstick_log = _compile_and_run_nonstick_capture(fn, q, k, v, weight)
 
-    assert any(
-        list(layout.device_size) == [K // 64, M, 64]
-        and list(layout.stride_map) == [64, K, 1]
-        for layout in target_stls
-    ), f"expected an exact flat-M restickify target, got {target_stls}"
+    # NDO must have rewritten the SDPA output buffer to the flat-M layout.
+    # With the decoupled design, propagate_layouts sets x_req_stl=flat_x_stl so
+    # the stick optimizer commits the SDPA output directly to the flat-M layout
+    # (no restickify needed); NDO separately rewrites buf.layouts to log the
+    # flat-M layout for codegen.
+    assert nonstick_log, "expected NDO to rewrite at least one buffer"
+    flat_m_found = any(
+        list(stl.device_size) == [K // 64, M, 64]
+        for stl_list in nonstick_log.values()
+        for stl in stl_list
+    )
+    assert flat_m_found, (
+        f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
+        f"got {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+    )
     compare_with_cpu(
         fn,
         q,

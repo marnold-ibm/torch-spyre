@@ -1325,8 +1325,6 @@ def _matmul_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
-    exact_input_indices: set[int] = set()
-
     if n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
         # generated_var to discover.  Build an explicit sparse-stick layout for y
@@ -1391,7 +1389,6 @@ def _matmul_layouts(
         )
         if flat_x_stl is not None:
             x_req_stl = flat_x_stl
-            exact_input_indices.add(0)
 
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
@@ -1410,7 +1407,6 @@ def _matmul_layouts(
         [x_req_stl, y_req_stl],
         op,
         output_dep,
-        exact_input_indices=exact_input_indices,
     )
     return [out_stl]
 
