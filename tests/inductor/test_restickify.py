@@ -2758,7 +2758,7 @@ def test_nonstick_no_reorder_when_large_dim_already_at_slot():
 
     assert not nonstick_log, (
         "Expected no reorder when large dim is already at slot, "
-        f"but got: {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"but got: {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
     )
 
 
@@ -2793,22 +2793,21 @@ def test_nonstick_reorder_pointwise_into_matmul():
     # x=[2,55,2] → device_size=[55,2,2,64] → outer_stick=1, slot=2 → [2,2,55,64].
     assert nonstick_log, "Expected nonstick_reorder_log to be non-empty"
     reordered_any = False
-    for buf_name, stl_list in nonstick_log.items():
-        for stl in stl_list:
-            device_size = list(stl.device_size)
-            if len(device_size) < 3:
-                continue
-            nonstick = device_size[:-1]
-            # For the 2D-stick shape used here (4 device dims, outer_stick=1,
-            # slot=2), the sandwich slot is device_size[-2].  Only check
-            # buffers where the slot dim is actually the largest — buffers
-            # whose idc couldn't be resolved are left unchanged.
-            if device_size[-2] != max(nonstick):
-                continue
-            reordered_any = True
+    for buf_name, stl in nonstick_log.items():
+        device_size = list(stl.device_size)
+        if len(device_size) < 3:
+            continue
+        nonstick = device_size[:-1]
+        # For the 2D-stick shape used here (4 device dims, outer_stick=1,
+        # slot=2), the sandwich slot is device_size[-2].  Only check
+        # buffers where the slot dim is actually the largest — buffers
+        # whose idc couldn't be resolved are left unchanged.
+        if device_size[-2] != max(nonstick):
+            continue
+        reordered_any = True
     assert reordered_any, (
         f"Expected at least one buffer with largest non-stick dim in slot n-2. "
-        f"nonstick_log={[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"nonstick_log={[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
     )
 
 
@@ -2836,13 +2835,11 @@ def test_nonstick_flat_dense_projection_collapses_outer_dims():
     # After stickification that is device_size=[K//64, M, 64].
     assert nonstick_log, "expected NDO to rewrite at least one buffer"
     flat_m_found = any(
-        list(stl.device_size) == [K // 64, M, 64]
-        for stl_list in nonstick_log.values()
-        for stl in stl_list
+        list(stl.device_size) == [K // 64, M, 64] for stl in nonstick_log.values()
     )
     assert flat_m_found, (
         f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
-        f"got {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"got {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
     )
     compare_with_cpu(
         fn,

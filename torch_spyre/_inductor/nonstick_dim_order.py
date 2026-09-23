@@ -14,14 +14,31 @@
 
 """Reorder non-stick device dimensions for better work division.
 
-Runs between propagate_layouts and optimize_restickify. Walks the graph
-backward visiting ops that have opinions about their inputs' non-stick
-layout. For each such op, computes and writes replacement candidate STL
-sets onto its input buffers so the stick optimizer sees the right shapes.
+Runs after optimize_restickify and before finalize_layouts. Walks the graph
+backward over MATMUL_REDUCTION_OPS and rewrites buf.committed_stl on their
+inputs. optimize_restickify has already committed its stick choices, so these
+rewrites affect only non-stick dim ordering — they do not influence stick
+decisions.
 
-Currently handles MATMUL_REDUCTION_OPS with two transforms:
-  - flat-M projection: collapse higher-rank views to canonical 2-D [M,K]
-  - dim reorder: swap largest outer dim into the sandwich slot for parallelism
+Two transforms, tried in order:
+
+  flat-M projection
+    A fused SDPA output may have a higher-rank host view (e.g. [B, L, H, D])
+    even though the downstream projection matmul reads it as a flat 2-D matrix
+    [B*L, H*D]. Retaining those outer axes causes the backend to treat the op
+    as a BMM rather than a flat MM. This transform collapses committed_stl to
+    the canonical flat-M shape [M, K] when the access pattern is provably a
+    single dense row-major 2-D matrix with a rank-2 weight.
+
+  dim reorder
+    For factorised-stick layouts, the stick variable occupies two dims:
+    floor(d/64) at outer_stick and Mod(d, 64) at the last position. The slot
+    between them (outer_stick+1) is where the work-division loop variable
+    should sit for maximum parallelism. This transform swaps the largest
+    non-constant outer dim into that slot.
+
+Flat-M projection takes priority: if it fires, dim reorder is skipped for
+that buffer, since the collapsed layout already has the right shape.
 """
 
 from typing import TYPE_CHECKING
@@ -35,7 +52,7 @@ from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 if TYPE_CHECKING:
     from torch._inductor.ir import Operation
 
-from .constants import MATMUL_REDUCTION_OPS
+from .constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -50,18 +67,17 @@ from .pass_utils import (
 logger = get_inductor_logger("nonstick_dim_order")
 
 
-def _reorder_stl(
+def _move_largest_dim_between_sticks(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
     name: str = "",
 ) -> SpyreTensorLayout:
-    """Swap the largest non-stick dim into the slot between the two stick dims.
+    """Move the largest non-stick dim into the slot between the two stick dims.
 
-    A factorised stick produces two dims that share the same loop variable:
-    floor(d/64) at position outer_stick and Mod(d/64) at the last position.
-    This function moves the largest remaining dim into outer_stick+1 — the
-    slot between them — so the compiler assigns the most iterations to the
-    widest loop variable.
+    A factorised stick occupies two positions: floor(d/64) at outer_stick and
+    Mod(d, 64) at the last position. Moving the largest non-constant outer dim
+    into outer_stick+1 puts the widest loop variable between the sticks, which
+    maximises the number of iterations assigned to that work-division slot.
     """
     # Non-STANDARD element arrangements have hardware-defined dimension
     # semantics; reordering them corrupts the DDL template matching.
@@ -134,85 +150,121 @@ def _reorder_stl(
     )
 
 
-def _compute_nonstick_layouts(
+def _try_flat_m_projection(
     buf: ComputedBuffer,
     x_dep: MemoryDep,
     op: "Operation",
-) -> "list[SpyreTensorLayout] | None":
-    """Return replacement candidate STLs for buf, or None if no change is needed.
+) -> SpyreTensorLayout | None:
+    """Return a flat-M committed_stl for buf, or None if not applicable.
 
-    Called once per (buf, op) pair. Tries flat-M projection first; if that
-    does not apply, tries the generic dim reorder. Returns None if neither
-    transform changes anything.
+    Requires the full matmul context (both operands and the output dep) to
+    verify the access is a dense 2-D matrix. Returns None if the layout does
+    not qualify or if shape helpers raise Unsupported (e.g. dynamic shapes).
     """
-    if not buf.layouts:
+    if op.data.reduction_type != BATCH_MATMUL_OP:
         return None
-
+    if len(buf.get_layout().size) <= 2:
+        return None
     reads = [r for r in op.get_read_writes().reads if isinstance(r, MemoryDep)]
     y_deps = [r for r in reads if r.name != x_dep.name]
     out_deps = list(op.get_read_writes().writes)
 
-    if len(y_deps) >= 1 and len(out_deps) >= 1:
-        y_dep = y_deps[0]
-        out_dep = out_deps[0]
-        y_buf = V.graph.get_buffer(y_dep.name)
-        out_buf = V.graph.get_buffer(op.get_name())
-        if hasattr(y_buf, "layouts") and y_buf.layouts:
-            x_prop = PropArg(x_dep, buf.get_layout(), list(buf.layouts))
-            y_prop = PropArg(y_dep, y_buf.get_layout(), list(y_buf.layouts))
-            out_host = out_buf.get_layout()
-            try:
-                reduction_var = find_reduction_var((x_dep,), out_dep)
-                m_size = get_matmul_m_size(op)
-                n_size = get_matmul_n_size(op)
-                flat_stl = flat_dense_projection_x_layout(
-                    x_prop, y_prop, out_host, out_dep, reduction_var, m_size, n_size
-                )
-                if flat_stl is not None:
-                    logger.info(
-                        "nonstick_dim_order: flat-M projection on %s"
-                        " — replacing %d candidate(s) with %s",
-                        x_dep.name,
-                        len(buf.layouts),
-                        list(flat_stl.device_size),
-                    )
-                    return [flat_stl]
-            except Unsupported:
-                pass
+    if len(y_deps) < 1 or len(out_deps) < 1:
+        return None
 
+    y_dep = y_deps[0]
+    out_dep = out_deps[0]
+    y_buf = V.graph.get_buffer(y_dep.name)
+    out_buf = V.graph.get_buffer(op.get_name())
+    if not hasattr(y_buf, "committed_stl"):
+        return None
+
+    x_prop = PropArg(x_dep, buf.get_layout(), [buf.committed_stl])
+    y_prop = PropArg(y_dep, y_buf.get_layout(), [y_buf.committed_stl])
+    out_host = out_buf.get_layout()
+    try:
+        reduction_var = find_reduction_var((x_dep,), out_dep)
+        m_size = get_matmul_m_size(op)
+        n_size = get_matmul_n_size(op)
+        flat_stl = flat_dense_projection_x_layout(
+            x_prop, y_prop, out_host, out_dep, reduction_var, m_size, n_size
+        )
+    except Unsupported:
+        return None
+
+    if flat_stl is None:
+        return None
+
+    logger.info(
+        "nonstick_dim_order: flat-M projection on %s — %s -> %s",
+        x_dep.name,
+        list(buf.committed_stl.device_size),
+        list(flat_stl.device_size),
+    )
+    return flat_stl
+
+
+def _reorder_for_matmul_perf(
+    buf: ComputedBuffer,
+    x_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """Reorder committed_stl to move the largest dim between the sticks.
+
+    Uses the buffer's own write dep (not the matmul's read dep) so the
+    coordinate expression reflects how the buffer itself writes its elements.
+    Returns None if the layout does not change.
+    """
     write_dep = next(iter(buf.get_read_writes().writes), None)
     if write_dep is None:
         return None
-    new_layouts = [_reorder_stl(stl, write_dep, x_dep.name) for stl in buf.layouts]
-    changed = any(
-        list(a.device_size) != list(b.device_size)
-        for a, b in zip(buf.layouts, new_layouts)
-    )
-    if not changed:
+    new_stl = _move_largest_dim_between_sticks(buf.committed_stl, write_dep, x_dep.name)
+    if list(new_stl.device_size) == list(buf.committed_stl.device_size):
         return None
-    for i, (old, new) in enumerate(zip(buf.layouts, new_layouts)):
-        if list(old.device_size) != list(new.device_size):
-            logger.debug(
-                "[NDO] %s[%d]  %s -> %s  stride_map %s -> %s",
-                x_dep.name,
-                i,
-                list(old.device_size),
-                list(new.device_size),
-                list(old.stride_map),
-                list(new.stride_map),
-            )
-    return new_layouts
+    logger.debug(
+        "[NDO] %s  %s -> %s  stride_map %s -> %s",
+        x_dep.name,
+        list(buf.committed_stl.device_size),
+        list(new_stl.device_size),
+        list(buf.committed_stl.stride_map),
+        list(new_stl.stride_map),
+    )
+    return new_stl
+
+
+def _compute_nonstick_layout(
+    buf: ComputedBuffer,
+    x_dep: MemoryDep,
+    op: "Operation",
+) -> SpyreTensorLayout | None:
+    """Return a replacement committed_stl for buf, or None if no change is needed.
+
+    Tries flat-M projection first; falls through to dim reorder if it does not
+    apply. Returns None if neither transform produces a change.
+    """
+    if not hasattr(buf, "committed_stl"):
+        return None
+    return _try_flat_m_projection(buf, x_dep, op) or _reorder_for_matmul_perf(
+        buf, x_dep
+    )
 
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:
-    """Reorder non-stick dims on op inputs for better work division.
+    """Reorder non-stick dims on matmul inputs for better work division.
 
-    Walks the graph backward. For each op that has opinions about its inputs'
-    non-stick layout, computes and writes replacement candidate STL sets onto
-    those input buffers. Graph inputs (weights, activations passed in directly)
-    are skipped — their layouts are fixed by the caller.
+    Walks the graph backward so that a buffer produced by one matmul and
+    consumed by another is visited in consumer-first order, letting each
+    consumer's preferred shape propagate toward its producer.
+
+    Graph inputs (weights, activations) are skipped — their layouts are owned
+    by the caller and cannot be changed here.
+
+    Writes the replacement STL into buf.committed_stl in place. This pass
+    runs after optimize_restickify, so stick choices are already committed and
+    these rewrites affect only non-stick dim ordering.
+
+    Results are saved to V.graph.nonstick_reorder_log for test inspection.
     """
-    log: dict[str, list] = {}
+    log: dict[str, SpyreTensorLayout] = {}
     graph_inputs = set(V.graph.graph_input_names)
 
     for op in reversed(graph.operations):
@@ -227,24 +279,19 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             if dep.name in graph_inputs:
                 continue
             buf = V.graph.get_buffer(dep.name)
-            if not isinstance(buf, ComputedBuffer) or not hasattr(buf, "layouts"):
+            if not isinstance(buf, ComputedBuffer):
                 logger.debug(
-                    "nonstick_dim_order: skipping %s — %s",
-                    dep.name,
-                    "not a ComputedBuffer"
-                    if not isinstance(buf, ComputedBuffer)
-                    else "no .layouts attribute",
+                    "nonstick_dim_order: skipping %s — not a ComputedBuffer", dep.name
                 )
                 continue
 
-            new_layouts = _compute_nonstick_layouts(buf, dep, op)
-            if new_layouts is not None:
-                buf.layouts[:] = new_layouts
-                log[dep.name] = list(new_layouts)
+            new_stl = _compute_nonstick_layout(buf, dep, op)
+            if new_stl is not None:
+                buf.committed_stl = new_stl
+                log[dep.name] = new_stl
                 logger.info(
-                    "nonstick_dim_order: reordered %s (%d candidates)",
+                    "nonstick_dim_order: reordered %s",
                     dep.name,
-                    len(new_layouts),
                 )
 
     V.graph.nonstick_reorder_log = log
