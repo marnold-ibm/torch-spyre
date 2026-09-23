@@ -16,6 +16,7 @@
 from collections import Counter
 import logging
 import math
+from typing import NamedTuple
 
 import sympy
 import torch
@@ -78,13 +79,11 @@ from .ir import (
     WaitWorkFallback,
 )
 from .pass_utils import (
-    PropArg,
     compute_restickify_target_layout,
     concretize_expr,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
-    flat_dense_projection_x_layout,
     get_matmul_m_size,
     get_matmul_n_size,
     identify_matmul_inputs,
@@ -112,6 +111,18 @@ logger = get_inductor_logger("propagate_layouts")
 prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
+
+
+class PropArg(NamedTuple):
+    """Input arg during layout propagation.
+
+    layout is the host FixedLayout (may not be FixedTiledLayout until finalize_layouts).
+    layouts is the set of candidate device layouts being propagated.
+    """
+
+    dep: MemoryDep
+    layout: FixedLayout
+    layouts: list[SpyreTensorLayout]
 
 
 def _get_prop_args(reads, strict: bool = True) -> list[PropArg]:
@@ -1275,12 +1286,13 @@ def _matmul_layouts(
         out_dims = len(output.size)
         out_stick_dim = _out_stick_dim
 
-    if data.reduction_type == BATCH_MATMUL_OP:
-        flat_x_stl = flat_dense_projection_x_layout(
-            x, y, output, output_dep, reduction_var, m_size, n_size
-        )
-        if flat_x_stl is not None:
-            x_req_stl = flat_x_stl
+    # TODO: remove — NDO handles flat-M reshaping post-beam; stick is unchanged
+    # if data.reduction_type == BATCH_MATMUL_OP:
+    #     flat_x_stl = flat_dense_projection_x_layout(
+    #         x, y, output, output_dep, reduction_var, m_size, n_size
+    #     )
+    #     if flat_x_stl is not None:
+    #         x_req_stl = flat_x_stl
 
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
