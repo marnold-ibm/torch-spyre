@@ -936,11 +936,6 @@ def test_fused_attention_projection_uses_exact_flat_m_layout():
     _orig_finalize = _passes.finalize_layouts
 
     def capturing_finalize(graph):
-        # Snapshot committed_stl for every op before finalize_layouts deletes it.
-        committed_before = {
-            op.get_name(): getattr(op, "committed_stl", None)
-            for op in graph.operations
-        }
         _orig_finalize(graph)
         # After finalize, op.layout is a FixedTiledLayout whose device_layout is
         # the committed STL (or op_layouts[0] for ops without a cost_fn).
@@ -950,7 +945,9 @@ def test_fused_attention_projection_uses_exact_flat_m_layout():
                 captured_layouts[op.get_name()] = layout.device_layout
 
     with patch.object(_passes, "finalize_layouts", capturing_finalize):
-        result = _compile_and_run(fn, (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), weight.to(DEVICE)), DEVICE)
+        result = _compile_and_run(
+            fn, (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), weight.to(DEVICE)), DEVICE
+        )
 
     # The SDPA output is committed to a flat-M layout with host shape [M, K]=[128,128].
     # After stickification that is device_size=[K//64, M, 64] = [2, 128, 64]
@@ -2848,5 +2845,13 @@ def test_nonstick_flat_dense_projection_collapses_outer_dims():
         f"got {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
     )
     compare_with_cpu(
-        fn, q, k, v, weight, target=spyre_result, run_eager=False, atol=0.2, rtol=0.2,
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=spyre_result,
+        run_eager=False,
+        atol=0.2,
+        rtol=0.2,
     )

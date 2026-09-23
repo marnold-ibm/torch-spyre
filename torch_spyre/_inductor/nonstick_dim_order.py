@@ -25,6 +25,7 @@ Currently handles MATMUL_REDUCTION_OPS with two transforms:
 """
 
 import math
+from typing import TYPE_CHECKING
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -32,6 +33,11 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Reduction
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+
+if TYPE_CHECKING:
+    from torch._inductor.ir import FixedLayout, Operation
+
+    from .propagate_layouts import PropArg
 
 from .constants import MATMUL_REDUCTION_OPS
 from .errors import Unsupported
@@ -238,7 +244,9 @@ def _compute_nonstick_layouts(
     does not apply, tries the generic dim reorder. Returns None if neither
     transform changes anything.
     """
-    from .propagate_layouts import PropArg  # local to avoid circular import at module level  # noqa: F401
+    from .propagate_layouts import (
+        PropArg,
+    )  # local to avoid circular import at module level  # noqa: F401
 
     if not buf.layouts:
         return None
