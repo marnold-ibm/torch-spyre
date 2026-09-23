@@ -33,13 +33,13 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    PropArg,
     compute_restickify_needed,
     device_coordinates,
+    flat_dense_projection_x_layout,
     try_device_coordinates,
 )
-from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
 from torch_spyre._inductor.propagate_layouts import (
-    PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
     find_stick_compatible_input_layout,
@@ -842,7 +842,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         x = PropArg(x_dep, x_host, [source])
         y = PropArg(y_dep, y_host, [weight])
 
-        result = _flat_dense_projection_x_layout(
+        result = flat_dense_projection_x_layout(
             x, y, output, out_dep, contraction, M, N
         )
         expected = SpyreTensorLayout([M, K], [K, 1], torch.float16, [0, 1])
@@ -873,7 +873,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [source],
         )
         self.assertIsNone(
-            _flat_dense_projection_x_layout(
+            flat_dense_projection_x_layout(
                 strided_x, y, output, out_dep, contraction, M, N
             )
         )
@@ -884,7 +884,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             get_device_dtype(torch.float32),
         )
         self.assertIsNone(
-            _flat_dense_projection_x_layout(
+            flat_dense_projection_x_layout(
                 PropArg(
                     x_dep,
                     FixedLayout(
@@ -949,7 +949,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             get_device_dtype(torch.float16),
         )
 
-        result = _flat_dense_projection_x_layout(
+        result = flat_dense_projection_x_layout(
             PropArg(x_dep, x_host, [source]),
             PropArg(y_dep, y_host, [weight]),
             output,
