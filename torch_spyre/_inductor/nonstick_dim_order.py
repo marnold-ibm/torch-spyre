@@ -42,7 +42,7 @@ that buffer, since the collapsed layout already has the right shape.
 """
 
 import math
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -64,20 +64,14 @@ from .pass_utils import (
     get_matmul_n_size,
     try_device_coordinates,
 )
-
-
-class _PropArg(NamedTuple):
-    dep: MemoryDep
-    layout: FixedLayout
-    layouts: list[SpyreTensorLayout]
-
+from .propagate_layouts import PropArg
 
 logger = get_inductor_logger("nonstick_dim_order")
 
 
 def _flat_dense_projection_x_layout(
-    x: _PropArg,
-    y: _PropArg,
+    x: PropArg,
+    y: PropArg,
     output: FixedLayout,
     output_dep: MemoryDep,
     reduction_var: sympy.Symbol,
@@ -168,6 +162,61 @@ def _flat_dense_projection_x_layout(
     )
 
 
+def _try_flat_m_projection(
+    buf: ComputedBuffer,
+    x_dep: MemoryDep,
+    op: "Operation",
+) -> SpyreTensorLayout | None:
+    """Return a flat-M committed_stl for buf, or None if not applicable.
+
+    Requires the full matmul context (both operands and the output dep) to
+    verify the access is a dense 2-D matrix. Returns None if the layout does
+    not qualify or if shape helpers raise Unsupported (e.g. dynamic shapes).
+    """
+    return None  # Temp: disabled for performance comparison
+    if op.data.reduction_type != BATCH_MATMUL_OP:
+        return None
+    if len(buf.get_layout().size) <= 2:
+        return None
+    reads = [r for r in op.get_read_writes().reads if isinstance(r, MemoryDep)]
+    y_deps = [r for r in reads if r.name != x_dep.name]
+    out_deps = list(op.get_read_writes().writes)
+
+    if len(y_deps) < 1 or len(out_deps) < 1:
+        return None
+
+    y_dep = y_deps[0]
+    out_dep = out_deps[0]
+    y_buf = V.graph.get_buffer(y_dep.name)
+    out_buf = V.graph.get_buffer(op.get_name())
+    if not hasattr(y_buf, "committed_stl"):
+        return None
+
+    x_prop = PropArg(x_dep, buf.get_layout(), [buf.committed_stl])
+    y_prop = PropArg(y_dep, y_buf.get_layout(), [y_buf.committed_stl])
+    out_host = out_buf.get_layout()
+    try:
+        reduction_var = find_reduction_var((x_dep,), out_dep)
+        m_size = get_matmul_m_size(op)
+        n_size = get_matmul_n_size(op)
+        flat_stl = _flat_dense_projection_x_layout(
+            x_prop, y_prop, out_host, out_dep, reduction_var, m_size, n_size
+        )
+    except Unsupported:
+        return None
+
+    if flat_stl is None:
+        return None
+
+    logger.info(
+        "nonstick_dim_order: flat-M projection on %s — %s -> %s",
+        x_dep.name,
+        list(buf.committed_stl.device_size),
+        list(flat_stl.device_size),
+    )
+    return flat_stl
+
+
 def _move_largest_dim_between_sticks(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
@@ -249,60 +298,6 @@ def _move_largest_dim_between_sticks(
         stride_map=new_stride_map,
         device_dtype=stl.device_dtype,
     )
-
-
-def _try_flat_m_projection(
-    buf: ComputedBuffer,
-    x_dep: MemoryDep,
-    op: "Operation",
-) -> SpyreTensorLayout | None:
-    """Return a flat-M committed_stl for buf, or None if not applicable.
-
-    Requires the full matmul context (both operands and the output dep) to
-    verify the access is a dense 2-D matrix. Returns None if the layout does
-    not qualify or if shape helpers raise Unsupported (e.g. dynamic shapes).
-    """
-    if op.data.reduction_type != BATCH_MATMUL_OP:
-        return None
-    if len(buf.get_layout().size) <= 2:
-        return None
-    reads = [r for r in op.get_read_writes().reads if isinstance(r, MemoryDep)]
-    y_deps = [r for r in reads if r.name != x_dep.name]
-    out_deps = list(op.get_read_writes().writes)
-
-    if len(y_deps) < 1 or len(out_deps) < 1:
-        return None
-
-    y_dep = y_deps[0]
-    out_dep = out_deps[0]
-    y_buf = V.graph.get_buffer(y_dep.name)
-    out_buf = V.graph.get_buffer(op.get_name())
-    if not hasattr(y_buf, "committed_stl"):
-        return None
-
-    x_prop = _PropArg(x_dep, buf.get_layout(), [buf.committed_stl])
-    y_prop = _PropArg(y_dep, y_buf.get_layout(), [y_buf.committed_stl])
-    out_host = out_buf.get_layout()
-    try:
-        reduction_var = find_reduction_var((x_dep,), out_dep)
-        m_size = get_matmul_m_size(op)
-        n_size = get_matmul_n_size(op)
-        flat_stl = _flat_dense_projection_x_layout(
-            x_prop, y_prop, out_host, out_dep, reduction_var, m_size, n_size
-        )
-    except Unsupported:
-        return None
-
-    if flat_stl is None:
-        return None
-
-    logger.info(
-        "nonstick_dim_order: flat-M projection on %s — %s -> %s",
-        x_dep.name,
-        list(buf.committed_stl.device_size),
-        list(flat_stl.device_size),
-    )
-    return flat_stl
 
 
 def _reorder_for_matmul_perf(
