@@ -930,22 +930,46 @@ def test_fused_attention_projection_uses_exact_flat_m_layout():
         flat = attention.transpose(1, 2).reshape(M, K)
         return F.linear(flat, weight)
 
-    result, _, nonstick_log = _compile_and_run_nonstick_capture(fn, q, k, v, weight)
+    import torch_spyre._inductor.passes as _passes
 
-    # NDO must have rewritten the SDPA output buffer to the flat-M layout.
-    # With the decoupled design, propagate_layouts sets x_req_stl=flat_x_stl so
-    # the stick optimizer commits the SDPA output directly to the flat-M layout
-    # (no restickify needed); NDO separately rewrites buf.layouts to log the
-    # flat-M layout for codegen.
-    assert nonstick_log, "expected NDO to rewrite at least one buffer"
-    flat_m_found = any(
-        list(stl.device_size) == [K // 64, M, 64]
-        for stl_list in nonstick_log.values()
-        for stl in stl_list
+    captured_layouts: dict[str, object] = {}
+    _orig_finalize = _passes.finalize_layouts
+
+    def capturing_finalize(graph):
+        # Snapshot committed_stl for every op before finalize_layouts deletes it.
+        committed_before = {
+            op.get_name(): getattr(op, "committed_stl", None)
+            for op in graph.operations
+        }
+        _orig_finalize(graph)
+        # After finalize, op.layout is a FixedTiledLayout whose device_layout is
+        # the committed STL (or op_layouts[0] for ops without a cost_fn).
+        for op in graph.operations:
+            layout = getattr(op, "layout", None)
+            if hasattr(layout, "device_layout"):
+                captured_layouts[op.get_name()] = layout.device_layout
+
+    with patch.object(_passes, "finalize_layouts", capturing_finalize):
+        result = _compile_and_run(fn, (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), weight.to(DEVICE)), DEVICE)
+
+    # The SDPA output is committed to a flat-M layout with host shape [M, K]=[128,128].
+    # After stickification that is device_size=[K//64, M, 64] = [2, 128, 64]
+    # with stride_map=[64, K, 1] = [64, 128, 1].
+    # This is the layout the projection matmul actually receives as its x input
+    # (either directly as the SDPA op's committed layout, or via a restickify).
+    flat_m_stl = next(
+        (
+            stl
+            for stl in captured_layouts.values()
+            if list(stl.device_size) == [K // 64, M, 64]
+            and list(stl.stride_map) == [64, K, 1]
+        ),
+        None,
     )
-    assert flat_m_found, (
-        f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
-        f"got {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+    assert flat_m_stl is not None, (
+        f"expected a committed flat-M layout device_size=[{K // 64}, {M}, 64] "
+        f"stride_map=[64, {K}, 1] in finalized ops, got "
+        f"{[(n, list(s.device_size), list(s.stride_map)) for n, s in captured_layouts.items()]}"
     )
     compare_with_cpu(
         fn,
