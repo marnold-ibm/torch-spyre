@@ -1020,8 +1020,11 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
     }
 )
 
-# Types for which _insert_combine_op in coarse_tile.py provides a valid
+# Types for which _insert_combine_op in wsr/coarse_tile.py provides a valid
 # cross-core accumulate. Single-axis K-splits are safe for these.
+# KEEP IN SYNC with the if-branches in _insert_combine_op (coarse_tile.py).
+# BATCH_MATMUL_OP is handled by _insert_combine_op's "sum" branch but is
+# excluded here because it is caught earlier by _STRUCTURED_REDUCTION_TYPES.
 _K_SPLIT_COMBINE_SUPPORTED: frozenset[str] = frozenset(
     {"sum", "prod", "max", "min", "xor_sum", "any"}
 )
@@ -1033,9 +1036,10 @@ def plain_reduction_k_split_domains(
     """Keep plain reductions without a combine path on one core per reduction axis.
 
     Single-axis K-splits are safe when _insert_combine_op has a combine path
-    for the reduction type (sum/prod/max/min). They are unsafe for exx2 and
-    mean: no cross-core combine exists, so splitting corrupts results in fused
-    graphs (validated: RoBERTa encoder exx2 regression, hf-adapters PR #661).
+    for the reduction type (sum/prod/max/min/xor_sum/any). They are unsafe for
+    exx2, mean, welford_reduce, and welford_combine: no cross-core combine
+    exists, so splitting corrupts results in fused graphs (validated: RoBERTa
+    encoder exx2/welford regression, hf-adapters PR #661).
 
     Multi-axis plain reductions are always pinned regardless of type: the
     backend rejects kernels with more than one reduction variable split across

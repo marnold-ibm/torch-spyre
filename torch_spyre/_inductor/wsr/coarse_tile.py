@@ -6287,6 +6287,10 @@ def _insert_combine_op(
     partial_loader = tiled_op.make_loader()
     accum_loader = accum_buf.make_loader()
 
+    # The set of types handled here is the authoritative list of reduction types
+    # with a valid cross-core combine path.  _K_SPLIT_COMBINE_SUPPORTED in
+    # work_division_constraints.py must mirror these branches (minus
+    # BATCH_MATMUL_OP, which is excluded upstream via _STRUCTURED_REDUCTION_TYPES).
     def combine_inner_fn(index):
         partial = partial_loader(index)
         accum = accum_loader(index)

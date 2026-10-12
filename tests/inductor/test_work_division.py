@@ -3232,10 +3232,14 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
                 self.assertNotIn(k, result.allowed_splits)
 
     def test_uncombineable_single_axis_reductions_are_pinned(self):
-        """exx2 and mean have no _insert_combine_op path; single-axis K-split is unsafe."""
+        """Types with no _insert_combine_op branch; single-axis K-split is unsafe.
+
+        Keep in sync with _K_SPLIT_COMBINE_SUPPORTED in work_division_constraints.py
+        and the if-branches in _insert_combine_op in wsr/coarse_tile.py.
+        """
         m, k = _isym("m"), _isym("k")
         output = _tensor_dep("plain_reduce", (128,), (m,))
-        for kind in ("exx2", "mean"):
+        for kind in ("exx2", "mean", "welford_reduce", "welford_combine"):
             with self.subTest(kind=kind):
                 op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
@@ -3247,7 +3251,7 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
         """With 2+ reduction vars, all plain reductions are pinned regardless of type."""
         m, k, r = (_isym(name) for name in ("m", "k", "r"))
         output = _tensor_dep("plain_reduce", (128,), (m,))
-        for kind in ("sum", "prod", "max", "min", "exx2", "mean"):
+        for kind in ("sum", "prod", "max", "min", "exx2", "mean", "welford_reduce"):
             with self.subTest(kind=kind):
                 op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
