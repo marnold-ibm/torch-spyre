@@ -2743,3 +2743,55 @@ def test_nonstick_reorder_pointwise_into_matmul():
         f"Expected at least one buffer with largest non-stick dim in slot n-2. "
         f"nonstick_log={[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
     )
+
+
+def test_nonstick_output_reorder_skips_graph_outputs():
+    """Matmul output reorder must not apply when the output is a graph output.
+
+    A graph output has no downstream consumer op inside the graph, so
+    finalize_layouts cannot insert a restickify to fix up the scrambled layout
+    before the caller reads it.  Reordering a graph-output matmul's committed_stl
+    delivers results in the wrong dim order on real hardware.
+
+    Uses the same shape as test_nonstick_reorder_pointwise_into_matmul (bmm with
+    x=[2,55,99], w=[2,99,128]) so the heuristic *would* fire if the guard were
+    absent.  With the guard, the bmm output must not appear in the nonstick_log.
+    """
+
+    def fn(x, w):
+        y = x * 2.0
+        return torch.bmm(y, w)  # bmm output is the graph output
+
+    x = torch.randn(2, 55, 99, dtype=torch.float16)
+    w = torch.randn(2, 99, 128, dtype=torch.float16)
+
+    with config.patch(ndo_matmul_output_reorder=True):
+        spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+            fn,
+            x.to(DEVICE),
+            w.to(DEVICE),
+        )
+    cpu_result = fn(x, w)
+    torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=0.1, rtol=0.1)
+
+    # The input buffer (pointwise feeding the bmm) may be reordered, but the
+    # bmm output itself must not appear in the log because it is a graph output.
+    # Any key in nonstick_log that matches the bmm output name would be a bug.
+    # We detect this by checking that no reordered buffer is the sole graph output:
+    # since fn returns only the bmm result, its name is graph output "buf0" or similar.
+    # The safe check: compile again with output_reorder=False and confirm the log
+    # entries are identical — the output buffer was not reordered either way.
+    with config.patch(ndo_matmul_output_reorder=False):
+        _, _, log_no_output_reorder = _compile_and_run_nonstick_capture(
+            fn,
+            x.to(DEVICE),
+            w.to(DEVICE),
+        )
+
+    reordered_in_full = set(nonstick_log.keys())
+    reordered_in_no_output = set(log_no_output_reorder.keys())
+    extra = reordered_in_full - reordered_in_no_output
+    assert not extra, (
+        f"ndo_matmul_output_reorder=True reordered extra buffers vs output_reorder=False: "
+        f"{extra}. A graph output must not be reordered."
+    )
