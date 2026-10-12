@@ -3217,6 +3217,54 @@ class TestIndirectAccessSplitDomains(unittest.TestCase):
         self.assertEqual(result.allowed_splits, {})
 
 
+class TestPlainReductionKSplitDomains(unittest.TestCase):
+    def test_combinable_single_axis_reductions_are_not_pinned(self):
+        """sum/prod/max/min have _insert_combine_op paths; single-axis K-split is safe."""
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in ("sum", "prod", "max", "min"):
+            with self.subTest(kind=kind):
+                op = _computed_buffer(
+                    (128,), name="plain_reduce", reduction_type=kind
+                )
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k,))
+                )
+                # A single combinable reduction axis must NOT be pinned to 1.
+                self.assertNotIn(k, result.allowed_splits)
+
+    def test_uncombineable_single_axis_reductions_are_pinned(self):
+        """exx2 and mean have no _insert_combine_op path; single-axis K-split is unsafe."""
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in ("exx2", "mean"):
+            with self.subTest(kind=kind):
+                op = _computed_buffer(
+                    (128,), name="plain_reduce", reduction_type=kind
+                )
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k,))
+                )
+                self.assertEqual(result.allowed_splits, {k: frozenset({1})})
+
+    def test_multi_axis_plain_reductions_always_pinned(self):
+        """With 2+ reduction vars, all plain reductions are pinned regardless of type."""
+        m, k, r = (_isym(name) for name in ("m", "k", "r"))
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in ("sum", "prod", "max", "min", "exx2", "mean"):
+            with self.subTest(kind=kind):
+                op = _computed_buffer(
+                    (128,), name="plain_reduce", reduction_type=kind
+                )
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k, r))
+                )
+                self.assertEqual(
+                    result.allowed_splits,
+                    {k: frozenset({1}), r: frozenset({1})},
+                )
+
+
 def _division_key(division):
     """A division as comparable literals -- symbols are unorderable."""
     return (

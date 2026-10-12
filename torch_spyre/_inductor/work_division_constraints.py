@@ -148,7 +148,7 @@ def collect_work_division_constraints(
         keep_by_index_pinned_search_space_vars,
         keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
-        multi_reduction_k_split_blocked,
+        plain_reduction_k_split_domains,
     ):
         result = constraint(ctx)
 
@@ -1020,42 +1020,46 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Types for which _insert_combine_op in coarse_tile.py provides a valid
+# cross-core accumulate. Single-axis K-splits are safe for these.
+_K_SPLIT_COMBINE_SUPPORTED: frozenset[str] = frozenset(
+    {"sum", "prod", "max", "min", "xor_sum", "any"}
+)
 
-def multi_reduction_k_split_blocked(
+
+def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Block K-splits for plain scalar reductions with more than one reduction variable.
+    """Keep plain reductions without a combine path on one core per reduction axis.
 
-    The backend rejects plain reduction kernels where more than one reduction
-    variable is present, even if only one is split across cores ("More than one
-    reduction dim is split across cores: not currently supported").  Example:
-    ``flatten(0,1)`` on ``(2,3,4)`` followed by ``sum(dim=0)`` produces an
-    iteration space where both ``d0`` and ``d1`` are reduction variables
-    (neither appears in the output coords).  ``work_distribution_pass`` splits
-    one of them across cores (satisfying ``_one_reduction_split_at_most``), but
-    the backend still rejects it.
+    Single-axis K-splits are safe when _insert_combine_op has a combine path
+    for the reduction type (sum/prod/max/min). They are unsafe for exx2 and
+    mean: no cross-core combine exists, so splitting corrupts results in fused
+    graphs (validated: RoBERTa encoder exx2 regression, hf-adapters PR #661).
 
-    Note: ``_one_reduction_split_at_most`` in ``WorkDivisionContext`` prevents
-    splitting *two* reduction vars simultaneously, but it still allows splitting
-    one.  This constraint is the load-bearing guard: when there are 2+
-    reduction vars, it blocks splitting *any* of them.
+    Multi-axis plain reductions are always pinned regardless of type: the
+    backend rejects kernels with more than one reduction variable split across
+    cores ("More than one reduction dim is split across cores: not currently
+    supported").
 
-    Single-dim plain reductions are left unconstrained because WSR's
-    ``_insert_combine_op`` already handles cross-core accumulation for them.
-
-    Structured ops (matmul, topk, pool, conv, depthwise conv) have dedicated
-    backend support for multi-dim iteration spaces; they are excluded via
-    ``_STRUCTURED_REDUCTION_TYPES``.
+    Structured reductions (matmul, conv, topk, pool) have their own blocking
+    or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
-    if len(ctx.reduction_vars) <= 1:
-        return ConstraintResult()
-    return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-    )
+    # Multi-axis: always pin all reduction vars.
+    if len(ctx.reduction_vars) > 1:
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    # Single-axis: only pin if there is no cross-core combine path.
+    if ctx.op.data.reduction_type not in _K_SPLIT_COMBINE_SUPPORTED:
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    return ConstraintResult()
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
