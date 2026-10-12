@@ -3224,9 +3224,7 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
         output = _tensor_dep("plain_reduce", (128,), (m,))
         for kind in ("sum", "prod", "max", "min"):
             with self.subTest(kind=kind):
-                op = _computed_buffer(
-                    (128,), name="plain_reduce", reduction_type=kind
-                )
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
                     _make_context(op, output, reduction_vars=(k,))
                 )
@@ -3239,9 +3237,7 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
         output = _tensor_dep("plain_reduce", (128,), (m,))
         for kind in ("exx2", "mean"):
             with self.subTest(kind=kind):
-                op = _computed_buffer(
-                    (128,), name="plain_reduce", reduction_type=kind
-                )
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
                     _make_context(op, output, reduction_vars=(k,))
                 )
@@ -3253,9 +3249,7 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
         output = _tensor_dep("plain_reduce", (128,), (m,))
         for kind in ("sum", "prod", "max", "min", "exx2", "mean"):
             with self.subTest(kind=kind):
-                op = _computed_buffer(
-                    (128,), name="plain_reduce", reduction_type=kind
-                )
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
                     _make_context(op, output, reduction_vars=(k, r))
                 )
