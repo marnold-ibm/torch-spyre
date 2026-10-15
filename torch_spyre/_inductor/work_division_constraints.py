@@ -61,6 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .wsr.coarse_tile import has_k_split_combine_path
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -1020,15 +1021,6 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
     }
 )
 
-# Types for which _insert_combine_op in wsr/coarse_tile.py provides a valid
-# cross-core accumulate. Single-axis K-splits are safe for these.
-# KEEP IN SYNC with the if-branches in _insert_combine_op (coarse_tile.py).
-# BATCH_MATMUL_OP is handled by _insert_combine_op's "sum" branch but is
-# excluded here because it is caught earlier by _STRUCTURED_REDUCTION_TYPES.
-_K_SPLIT_COMBINE_SUPPORTED: frozenset[str] = frozenset(
-    {"sum", "prod", "max", "min", "xor_sum", "any"}
-)
-
 
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
@@ -1059,7 +1051,7 @@ def plain_reduction_k_split_domains(
             allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
         )
     # Single-axis: only pin if there is no cross-core combine path.
-    if ctx.op.data.reduction_type not in _K_SPLIT_COMBINE_SUPPORTED:
+    if not has_k_split_combine_path(ctx.op.data.reduction_type):
         return ConstraintResult(
             allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
         )

@@ -3234,8 +3234,7 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
     def test_uncombineable_single_axis_reductions_are_pinned(self):
         """Types with no _insert_combine_op branch; single-axis K-split is unsafe.
 
-        Keep in sync with _K_SPLIT_COMBINE_SUPPORTED in work_division_constraints.py
-        and the if-branches in _insert_combine_op in wsr/coarse_tile.py.
+        Determined by has_k_split_combine_path in wsr/coarse_tile.py.
         """
         m, k = _isym("m"), _isym("k")
         output = _tensor_dep("plain_reduce", (128,), (m,))

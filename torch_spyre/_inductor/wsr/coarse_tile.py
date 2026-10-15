@@ -6245,6 +6245,17 @@ def _insert_all_read_copy_ops(
 # ---------------------------------------------------------------------------
 
 
+def has_k_split_combine_path(reduction_type: str) -> bool:
+    """Return True if _insert_combine_op can cross-core combine this reduction type.
+
+    BATCH_MATMUL_OP is handled by _insert_combine_op's "sum" branch but is
+    intentionally excluded here: it is caught earlier by
+    _STRUCTURED_REDUCTION_TYPES in work_division_constraints.py and never
+    reaches plain_reduction_k_split_domains.
+    """
+    return reduction_type in {"sum", "prod", "max", "min", "xor_sum", "any"}
+
+
 def _insert_combine_op(
     tiled_op: ComputedBuffer,
     accum_buf: ComputedBuffer,
@@ -6295,10 +6306,6 @@ def _insert_combine_op(
     partial_loader = tiled_op.make_loader()
     accum_loader = accum_buf.make_loader()
 
-    # The set of types handled here is the authoritative list of reduction types
-    # with a valid cross-core combine path.  _K_SPLIT_COMBINE_SUPPORTED in
-    # work_division_constraints.py must mirror these branches (minus
-    # BATCH_MATMUL_OP, which is excluded upstream via _STRUCTURED_REDUCTION_TYPES).
     def combine_inner_fn(index):
         partial = partial_loader(index)
         accum = accum_loader(index)
