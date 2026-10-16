@@ -650,11 +650,6 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
     # For each matmul op, reorder its non-graph-input input buffers so they
     # read a wider contiguous region.  Optionally (SPYRE_NDO_MATMUL_OUTPUT_REORDER)
     # also reorder the matmul's own output buffer with the same heuristic.
-    # Graph outputs are excluded from output reorder: finalize_layouts has no
-    # mechanism to insert a restickify on a graph output edge, so reordering a
-    # graph-output matmul's committed_stl would deliver results in the wrong
-    # dim order to the caller with no correction.
-    graph_outputs: set[str] = set(graph.get_output_names())
     already_reordered: set[str] = set()
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
@@ -674,7 +669,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             and isinstance(V.graph.get_buffer(dep.name), ComputedBuffer)
         ]
         bufs_to_reorder = list(input_bufs)
-        if config.ndo_matmul_output_reorder and op.get_name() not in graph_outputs:
+        if config.ndo_matmul_output_reorder:
             bufs_to_reorder.append(op)
         for buf in bufs_to_reorder:
             name = buf.get_name()
