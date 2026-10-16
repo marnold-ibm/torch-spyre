@@ -6165,15 +6165,17 @@ def _insert_all_read_copy_ops(
 # ---------------------------------------------------------------------------
 
 
-def has_k_split_combine_path(reduction_type: str) -> bool:
-    """Return True if _insert_combine_op can cross-core combine this reduction type.
+# Reduction types for which _insert_combine_op has a cross-core combine path.
+# BATCH_MATMUL_OP is excluded: it is caught by _STRUCTURED_REDUCTION_TYPES in
+# work_division_constraints.py and never reaches plain_reduction_k_split_domains.
+_COMBINE_OP_REDUCTION_TYPES: frozenset[str] = frozenset(
+    {"sum", "prod", "max", "min", "xor_sum", "any"}
+)
 
-    BATCH_MATMUL_OP is handled by _insert_combine_op's "sum" branch but is
-    intentionally excluded here: it is caught earlier by
-    _STRUCTURED_REDUCTION_TYPES in work_division_constraints.py and never
-    reaches plain_reduction_k_split_domains.
-    """
-    return reduction_type in {"sum", "prod", "max", "min", "xor_sum", "any"}
+
+def has_k_split_combine_path(reduction_type: str) -> bool:
+    """Return True if _insert_combine_op can cross-core combine this reduction type."""
+    return reduction_type in _COMBINE_OP_REDUCTION_TYPES
 
 
 def _insert_combine_op(
@@ -6223,6 +6225,13 @@ def _insert_combine_op(
     from torch._inductor.virtualized import ops as vops
 
     reduction_type = tiled_op.data.reduction_type
+    assert (
+        reduction_type in _COMBINE_OP_REDUCTION_TYPES
+        or reduction_type == BATCH_MATMUL_OP
+    ), (
+        f"_insert_combine_op: unsupported reduction_type {reduction_type!r} — "
+        f"add it to _COMBINE_OP_REDUCTION_TYPES"
+    )
     partial_loader = tiled_op.make_loader()
     accum_loader = accum_buf.make_loader()
 

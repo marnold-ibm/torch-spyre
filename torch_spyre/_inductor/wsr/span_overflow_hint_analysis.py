@@ -1100,8 +1100,8 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
 
     Without this check (and when not disabled) the span is silently dropped,
     ``span_reduction_pass`` cannot split the reduced axis either (plain
-    reductions without a cross-core combine path are pinned to split=1), and the op reaches the backend
-    over the limit.
+    reductions without a cross-core combine path are pinned to split=1), and
+    the op reaches the backend over the limit.
     """
     if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
         return False
