@@ -3442,7 +3442,7 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
         """sum/prod/max/min have _insert_combine_op paths; single-axis K-split is safe."""
         m, k = _isym("m"), _isym("k")
         output = _tensor_dep("plain_reduce", (128,), (m,))
-        for kind in ("sum", "prod", "max", "min"):
+        for kind in ("sum", "prod", "max", "min", "xor_sum"):
             with self.subTest(kind=kind):
                 op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
@@ -3455,22 +3455,61 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
         """Types with no _insert_combine_op branch; single-axis K-split is unsafe.
 
         Determined by has_k_split_combine_path in wsr/coarse_tile.py.
+        Also asserts that committing a split of k=2 raises Unsupported("memory-span"),
+        because the pin conflicts with the span-committed split.
         """
         m, k = _isym("m"), _isym("k")
         output = _tensor_dep("plain_reduce", (128,), (m,))
-        for kind in ("exx2", "mean", "welford_reduce", "welford_combine"):
+        for kind in ("exx2", "mean", "welford_reduce", "welford_combine", "any"):
             with self.subTest(kind=kind):
                 op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(
                     _make_context(op, output, reduction_vars=(k,))
                 )
                 self.assertEqual(result.allowed_splits, {k: frozenset({1})})
+            with self.subTest(kind=kind, committed=2):
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
+                with self.assertRaisesRegex(Unsupported, "memory-span"):
+                    collect_work_division_constraints(
+                        _make_context(
+                            op, output, reduction_vars=(k,), committed_splits={k: 2}
+                        )
+                    )
+
+    def test_structured_reductions_bypass_plain_reduction_constraint(self):
+        """Structured reduction types exit via the _STRUCTURED_REDUCTION_TYPES early-return.
+
+        plain_reduction_k_split_domains must return unconstrained for these types
+        so their own blocking rules apply elsewhere.
+        """
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("structured_reduce", (128,), (m,))
+        op = _computed_buffer(
+            (128,), name="structured_reduce", reduction_type=BATCH_MATMUL_OP
+        )
+        result = collect_work_division_constraints(
+            _make_context(op, output, reduction_vars=(k,))
+        )
+        self.assertEqual(result, ConstraintResult())
 
     def test_multi_axis_plain_reductions_always_pinned(self):
         """With 2+ reduction vars, all plain reductions are pinned regardless of type."""
         m, k, r = (_isym(name) for name in ("m", "k", "r"))
         output = _tensor_dep("plain_reduce", (128,), (m,))
-        for kind in ("sum", "prod", "max", "min", "exx2", "mean", "welford_reduce"):
+        for kind in (
+            "sum",
+            "prod",
+            "max",
+            "min",
+            "xor_sum",
+            "exx2",
+            "mean",
+            "welford_reduce",
+            "welford_combine",
+            "any",
+        ):
             with self.subTest(kind=kind):
                 op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
                 result = collect_work_division_constraints(

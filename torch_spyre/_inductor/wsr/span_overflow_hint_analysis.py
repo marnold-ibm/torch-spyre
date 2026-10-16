@@ -1066,12 +1066,12 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
       +/-inf, which cast wrong into an integer accumulator), but an integer
       max/min's reduction-only overflow is exactly as unfixable as a float
       one's -- ``plain_reduction_k_split_domains`` pins plain reduction vars
-      without a cross-core combine path to split=1 regardless of dtype -- so this check
-      must still fire for it, or that overflow is silently dropped instead.
-      Everything outside the family -- matmul (incl. fp8), conv, top-k,
-      welford -- is owned by another pass (work division cross-core splits
-      matmul/conv/pool/top-k K) or has no combine path here at all, and must
-      keep its historical silent-skip;
+      without a cross-core combine path to split=1 regardless of dtype -- so
+      this check must still fire for it, or that overflow is silently dropped
+      instead.  Everything outside the family -- matmul (incl. fp8), conv,
+      top-k, welford -- is owned by another pass (work division cross-core
+      splits matmul/conv/pool/top-k K) or has its own span accounting, and
+      must keep its historical silent-skip;
     * the overflowing coordinate itself is controlled only by reduction
       symbols, so no output-range tile touches it;
     * the span still exceeds the limit in the *best case* computed by

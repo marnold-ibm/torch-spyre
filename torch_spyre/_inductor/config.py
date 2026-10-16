@@ -97,7 +97,8 @@ def pool_allocated_by_frontend() -> bool:
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 
 # Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
-# buffer in addition to its input buffers.
+# buffer in addition to its input buffers. Off by default until more broadly
+# performance and stability tested.
 ndo_matmul_output_reorder: bool = (
     os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "0") == "1"
 )
