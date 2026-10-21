@@ -509,8 +509,6 @@ def _reduction_layout(
     dep: MemoryDep,
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
-    c_size: list[int],
-    c_stride: list[int],
 ) -> list[SpyreTensorLayout]:
     """Output STL candidates for a reduction op.
 
@@ -533,6 +531,9 @@ def _reduction_layout(
     reduction_var = next(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
+
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
 
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
@@ -597,8 +598,6 @@ def _convert_layout(
     output_dep: MemoryDep,
     fmt,
     input_ea,
-    c_size: list[int],
-    c_stride: list[int],
 ) -> list[SpyreTensorLayout]:
     """Output STL candidates for a dtype-converting op (staggered or plain).
 
@@ -660,11 +659,11 @@ def _convert_layout(
     # stick dim is unaligned, force a full input-stick depth so stick
     # padding is reflected in the device layout (see #1756 example above).
     in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
     if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
-        c_size = [concretize_expr(s) for s in output.size[:-1]] + [
-            in_elems_per_stick
-        ]
-        c_stride = [concretize_expr(s) for s in output.stride[:-1]] + [1]
+        c_size = c_size[:-1] + [in_elems_per_stick]
+        c_stride = c_stride[:-1] + [1]
     return [
         SpyreTensorLayout(
             c_size, c_stride, output.dtype, list(range(len(c_size))), fmt
@@ -672,20 +671,18 @@ def _convert_layout(
     ]
 
 
-def _general_pointwise_layout(
+def _default_pointwise_layout(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
     in_layout: FixedLayout,
     output: FixedLayout,
     output_dep: MemoryDep,
     aten_op,
-    c_size: list[int],
-    c_stride: list[int],
 ) -> list[SpyreTensorLayout]:
-    """Output STL candidates for the general single-arg pointwise fallthrough.
+    """Output STL candidates for the default single-arg pointwise case.
 
     Handles dtype-preserving data movement, identity accesses, and the
-    stick-expression scan for ops whose aten_op matched no special case.
+    stick-expression scan for pointwise ops that matched no special case.
     """
     # For a bool output this op is dtype-preserving data movement or a
     # same-width reinterpret (reshape/transpose/etc); reuse the input STL's
@@ -727,6 +724,8 @@ def _general_pointwise_layout(
             )
         ]
 
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
         return []
@@ -771,11 +770,9 @@ def _single_arg_op_layout(
     callers continue trying the other input STLs and fail only if none are usable.
     """
     data = op.data
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
 
     if isinstance(data, Reduction):
-        return _reduction_layout(op, output, output_dep, dep, in_layout, stl, c_size, c_stride)
+        return _reduction_layout(op, output, output_dep, dep, in_layout, stl)
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
@@ -812,9 +809,7 @@ def _single_arg_op_layout(
                 ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
 
             fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
-            return _convert_layout(
-                stl, dep, in_layout, output, output_dep, fmt, input_ea, c_size, c_stride
-            )
+            return _convert_layout(stl, dep, in_layout, output, output_dep, fmt, input_ea)
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
@@ -828,9 +823,7 @@ def _single_arg_op_layout(
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
             return [_qfp8wt_stl(output, in_layout)]
 
-    return _general_pointwise_layout(
-        stl, dep, in_layout, output, output_dep, aten_op, c_size, c_stride
-    )
+    return _default_pointwise_layout(stl, dep, in_layout, output, output_dep, aten_op)
 
 
 def _clone_layout(
