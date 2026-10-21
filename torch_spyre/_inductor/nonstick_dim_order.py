@@ -654,11 +654,11 @@ def _apply_gather_ia_constraints(
         key = (dep.name, op.get_name())
         if key in seen:
             continue
+        seen.add(key)
         buf = V.graph.get_buffer(dep.name)
         result = _compute_gather_ia_constraint(buf, dep, op, sizes, access_subs)
         if result is None:
             continue
-        seen.add(key)
         new_stl, pinned = result
         if not isinstance(buf, ComputedBuffer):
             # Graph input: cannot update committed_stl in place —
@@ -755,9 +755,9 @@ def _try_apply_flat_projection(
 ) -> bool:
     """Apply flat-M projection to buf as an activation input to op.
 
-    Precondition: buf is a read dependency of op.
     Returns True and updates buf.committed_stl and log[buf.get_name()] if the
     projection applies. Returns False and modifies nothing otherwise.
+    Returns False immediately if buf is not a read dependency of op.
     """
     if not hasattr(buf, "committed_stl"):
         return False
@@ -847,7 +847,7 @@ def _apply_perf_reorders(
         for buf in bufs_to_reorder:
             name = buf.get_name()
             # Process each buffer at most once; when a buffer feeds multiple
-            # matmuls, the deepest matmul in program order (encountered first
+            # matmuls, the last matmul in program order (encountered first
             # in this reversed traversal) determines the reorder.
             if name in already_reordered:
                 continue
