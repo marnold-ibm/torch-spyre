@@ -665,9 +665,7 @@ def _convert_layout(
         c_size = c_size[:-1] + [in_elems_per_stick]
         c_stride = c_stride[:-1] + [1]
     return [
-        SpyreTensorLayout(
-            c_size, c_stride, output.dtype, list(range(len(c_size))), fmt
-        )
+        SpyreTensorLayout(c_size, c_stride, output.dtype, list(range(len(c_size))), fmt)
     ]
 
 
@@ -809,7 +807,9 @@ def _single_arg_op_layout(
                 ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
 
             fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
-            return _convert_layout(stl, dep, in_layout, output, output_dep, fmt, input_ea)
+            return _convert_layout(
+                stl, dep, in_layout, output, output_dep, fmt, input_ea
+            )
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
