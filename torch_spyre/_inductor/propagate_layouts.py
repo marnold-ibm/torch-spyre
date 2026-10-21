@@ -596,8 +596,8 @@ def _convert_layout(
     in_layout: FixedLayout,
     output: FixedLayout,
     output_dep: MemoryDep,
-    fmt,
-    input_ea,
+    fmt: ElementArrangement,
+    input_ea: ElementArrangement,
 ) -> list[SpyreTensorLayout]:
     """Output STL candidates for a dtype-converting op (staggered or plain).
 
