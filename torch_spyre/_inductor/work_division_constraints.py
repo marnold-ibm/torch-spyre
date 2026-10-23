@@ -61,7 +61,6 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .wsr.coarse_tile import has_k_split_combine_path
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -989,20 +988,14 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Keep plain reductions without a combine path on one core per reduction axis.
+    """Apply backend constraints on plain reduction K-splits.
 
-    Single-axis K-splits are safe when _insert_combine_op has a combine path
-    for the reduction type (sum/prod/max/min/xor_sum). They are unsafe for
-    exx2, mean, welford_reduce, welford_combine, and any: no cross-core combine
-    is available, so splitting corrupts results in fused graphs (validated:
-    RoBERTa encoder exx2/welford regression, hf-adapters PR #661).
-    welford_combine is a genuine Reduction node type produced by Inductor
-    (torch/_inductor/ir.py) for layer-norm / var mean; it can arrive here.
+    Multi-axis plain reductions: only one reduction dimension may be split
+    across cores (backend enforces this in ddl_conversion.cpp). Pin all
+    reduction vars to split=1 to avoid the backend error.
 
-    Multi-axis plain reductions are always pinned regardless of type: the
-    backend rejects kernels with more than one reduction variable split across
-    cores ("More than one reduction dim is split across cores: not currently
-    supported").
+    Single-axis plain reductions: the backend handles cross-core combines
+    for all reduction types via its ring-combine mechanism. No frontend pin.
 
     Structured reductions (matmul, conv, topk, pool) have their own blocking
     or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
@@ -1011,13 +1004,8 @@ def plain_reduction_k_split_domains(
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
-    # Multi-axis: always pin all reduction vars.
+    # Multi-axis: backend supports at most one split reduction dim.
     if len(ctx.reduction_vars) > 1:
-        return ConstraintResult(
-            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-        )
-    # Single-axis: only pin if there is no cross-core combine path.
-    if not has_k_split_combine_path(ctx.op.data.reduction_type):
         return ConstraintResult(
             allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
         )
