@@ -49,7 +49,7 @@ namespace py = pybind11;
 namespace spyre {
 
 /*
- * CPU stride for a dimension.
+ * CPU stride for a dimension.   COMMENT ADDED FOR TESTING
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
