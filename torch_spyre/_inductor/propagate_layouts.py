@@ -128,7 +128,7 @@ class PropArg(NamedTuple):
 
 def _get_prop_args(reads, strict: bool = True) -> list[PropArg]:
     # Local to this pass — the FixedLayout/FixedTiledLayout ambiguity only exists
-    # during propagation and should not infect downstream passes.
+    # during propagation and should not infect downstream passes.  # test-trigger-abc
     res: list[PropArg] = []
     for arg in reads:
         if isinstance(arg, MemoryDep):
