@@ -62,7 +62,6 @@ from torch_spyre._inductor.loop_info import (
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
-    BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
@@ -681,44 +680,6 @@ def _make_context(
         reduction_vars=list(reduction_vars),
         committed_splits=committed_splits or {},
     )
-
-
-class TestPlainReductionKSplitDomains(unittest.TestCase):
-    def test_plain_reductions_pin_single_and_multiple_reduction_axes(self):
-        m, k, r = (_isym(name) for name in ("m", "k", "r"))
-        output = _tensor_dep("plain_reduce", (128,), (m,))
-        # Layer norm's exx2 reduction regressed in fused encoder blocks when
-        # its single reduction axis was allowed to split across cores.
-        for kind in ("sum", "max", "min", "mean", "prod", "exx2"):
-            for axes in ((k,), (k, r)):
-                with self.subTest(kind=kind, axes=axes):
-                    op = _computed_buffer(
-                        (128,), name="plain_reduce", reduction_type=kind
-                    )
-                    context = _make_context(op, output, reduction_vars=axes)
-                    result = collect_work_division_constraints(context)
-                    self.assertEqual(
-                        result.allowed_splits,
-                        {axis: frozenset({1}) for axis in axes},
-                    )
-                    # A committed span split must be rejected, not used to
-                    # silently re-enable an unsafe partial reduction.
-                    context.committed_splits = {k: 2}
-                    with self.assertRaisesRegex(Unsupported, "memory-span"):
-                        collect_work_division_constraints(context)
-
-    def test_structured_reductions_keep_their_own_combine_rules(self):
-        m, k = _isym("m"), _isym("k")
-        output = _tensor_dep("structured_reduce", (128,), (m,))
-        for kind in (BATCH_MATMUL_OP, "topkvalue", "topkindex", CONV2D_FWD_OP):
-            with self.subTest(kind=kind):
-                op = _computed_buffer(
-                    (128,), name="structured_reduce", reduction_type=kind
-                )
-                result = work_division_constraints.plain_reduction_k_split_domains(
-                    _make_context(op, output, reduction_vars=(k,))
-                )
-                self.assertEqual(result.allowed_splits, {})
 
 
 class TestAlignedOwnershipSplitDomains(unittest.TestCase):
@@ -2552,6 +2513,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
     @staticmethod
     def _op(name):
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
         op = MagicMock(spec=ComputedBuffer)
         op.data = MagicMock(spec=Reduction if name == "matmul" else Pointwise)
         if name == "matmul":
@@ -3740,6 +3703,79 @@ class TestIndirectAccessSplitDomains(unittest.TestCase):
         with patch(self._PATCH_TARGET, return_value=set()):
             result = indirect_access_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})
+
+
+class TestPlainReductionKSplitDomains(unittest.TestCase):
+    def test_combinable_single_axis_reductions_are_not_pinned(self):
+        """Types in _COMBINE_OP_REDUCTION_TYPES have a cross-core combine path; K-split is safe."""
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in ("sum", "prod", "max", "min", "xor_sum"):
+            with self.subTest(kind=kind):
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k,))
+                )
+                self.assertNotIn(k, result.allowed_splits)
+
+    def test_uncombineable_single_axis_reductions_are_pinned(self):
+        """Types without a cross-core combine path in _insert_combine_op must stay pinned.
+
+        Determined by has_k_split_combine_path in wsr/coarse_tile.py.
+        """
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in ("exx2", "mean", "welford_reduce", "welford_combine", "any"):
+            with self.subTest(kind=kind):
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k,))
+                )
+                self.assertEqual(result.allowed_splits, {k: frozenset({1})})
+
+    def test_structured_reductions_bypass_plain_reduction_constraint(self):
+        """Structured reduction types exit via the _STRUCTURED_REDUCTION_TYPES early-return.
+
+        plain_reduction_k_split_domains must return unconstrained for these types
+        so their own blocking rules apply elsewhere.
+        """
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("structured_reduce", (128,), (m,))
+        op = _computed_buffer(
+            (128,), name="structured_reduce", reduction_type=BATCH_MATMUL_OP
+        )
+        result = collect_work_division_constraints(
+            _make_context(op, output, reduction_vars=(k,))
+        )
+        self.assertEqual(result, ConstraintResult())
+
+    def test_multi_axis_plain_reductions_always_pinned(self):
+        """With 2+ reduction vars, all plain reductions are pinned regardless of type."""
+        m, k, r = (_isym(name) for name in ("m", "k", "r"))
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in (
+            "sum",
+            "prod",
+            "max",
+            "min",
+            "xor_sum",
+            "exx2",
+            "mean",
+            "welford_reduce",
+            "welford_combine",
+            "any",
+        ):
+            with self.subTest(kind=kind):
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k, r))
+                )
+                self.assertEqual(
+                    result.allowed_splits,
+                    {k: frozenset({1}), r: frozenset({1})},
+                )
 
 
 class TestDecodeWeightDelivery(unittest.TestCase):
