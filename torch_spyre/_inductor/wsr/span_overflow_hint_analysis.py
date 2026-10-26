@@ -1065,12 +1065,12 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
       restricts *tiling* ``max``/``min`` to floating point (their identity is
       +/-inf, which cast wrong into an integer accumulator), but an integer
       max/min's reduction-only overflow is exactly as unfixable as a float
-      one's -- ``plain_reduction_k_split_domains`` pins plain reduction vars
-      to split=1 regardless of dtype -- so this check
-      must still fire for it, or that overflow is silently dropped instead.
+      one's -- ``plain_reduction_k_split_domains`` pins multi-axis plain
+      reduction vars to split=1 regardless of dtype -- so this check must
+      still fire for it, or that overflow is silently dropped instead.
       Everything outside the family -- matmul (incl. fp8), conv, top-k,
       welford -- is owned by another pass (work division cross-core splits
-      matmul/conv/pool/top-k K) or has no combine path here at all, and must
+      matmul/conv/pool/top-k K) or has its own span accounting, and must
       keep its historical silent-skip;
     * the overflowing coordinate itself is controlled only by reduction
       symbols, so no output-range tile touches it;
@@ -1080,11 +1080,13 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
       even that leaves the span over the limit, no output mechanism can close
       it -- only a reduction-range split, which this op cannot do.
 
-    Reduction-range coarse tiling is distinct from a cross-core K-split.
-    Types supported by WSR (``sum``, ``prod``, float ``max``/``min``) exit via
-    ``_supports_reduction_range_tiling`` at the top of this function. The
-    types that do reach here (``mean``, integer ``max``/``min``) have no such
-    recovery path.
+    Note: ``plain_reduction_k_split_domains`` no longer pins single-axis
+    plain reductions; all plain reduction types can now K-split on a single
+    axis.  This abort remains correct: the K-splittable types (``sum``,
+    ``prod``, float ``max``/``min``) exit via
+    ``_supports_reduction_range_tiling`` at the top of this function and never
+    reach here.  The types that do reach here (``mean``, integer
+    ``max``/``min``) have no K-split recovery path regardless.
 
     ``max_cores`` is therefore not consulted: the best case already bounds
     every core-split outcome.
@@ -1097,7 +1099,7 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
     ``plan_span_overflow_tile``), unaffected by the config check here.
 
     Without this check (and when not disabled) the span is silently dropped,
-    ``span_reduction_pass`` cannot split the reduced axis either (multi-dim
+    ``span_reduction_pass`` cannot split the reduced axis either (multi-axis
     plain reductions are pinned to split=1), and the op reaches the backend
     over the limit.
     """
