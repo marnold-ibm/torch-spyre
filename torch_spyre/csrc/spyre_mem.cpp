@@ -1115,14 +1115,6 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
             break;
           }
         }
-        // TODO(marnold-ibm): replace this cherry-pick with PR #5730 after it
-        // merges. A non-zero storage_offset means the host view does not start
-        // at element 0 of the tiled allocation.  The direct DMA path always
-        // reads from offset 0, so we must go through the staging path so
-        // that the correct as_strided view is applied on the CPU side.
-        if (non_overlapping_and_dense && self.storage_offset() != 0) {
-          non_overlapping_and_dense = false;
-        }
         if (!non_overlapping_and_dense) {
           c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
           c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);

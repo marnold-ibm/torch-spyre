@@ -73,7 +73,7 @@ from .pass_utils import (
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
 from .views import align_tensors_pure
-from .wsr.coarse_tile import _raw_to_squeezed_pos, has_k_split_combine_path
+from .wsr.coarse_tile import _raw_to_squeezed_pos
 from . import config
 
 if typing.TYPE_CHECKING:
@@ -990,13 +990,12 @@ def plain_reduction_k_split_domains(
 ) -> ConstraintResult:
     """Apply backend constraints on plain reduction K-splits.
 
-    Multi-axis plain reductions: only one reduction dimension may be split
-    across cores (backend enforces this in ddl_conversion.cpp). Pin all
-    reduction vars to split=1 to avoid the backend error.
+    Multi-axis plain reductions: pin all reduction vars to split=1. The
+    backend supports at most one split reduction dimension per op, but
+    combining partial results across cores for arbitrary plain reduction
+    types is not validated, so the frontend blocks all of them.
 
-    Single-axis plain reductions: only types with a cross-core combine path
-    in _insert_combine_op (see has_k_split_combine_path in coarse_tile.py)
-    may be K-split. All other types are pinned to split=1.
+    Single-axis plain reductions: unconstrained — all types may K-split.
 
     Structured reductions (matmul, conv, topk, pool) have their own blocking
     or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
@@ -1007,11 +1006,6 @@ def plain_reduction_k_split_domains(
         return ConstraintResult()
     # Multi-axis: backend supports at most one split reduction dim.
     if len(ctx.reduction_vars) > 1:
-        return ConstraintResult(
-            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-        )
-    # Single-axis: only types with a cross-core combine path may K-split.
-    if not has_k_split_combine_path(ctx.op.data.reduction_type):
         return ConstraintResult(
             allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
         )
