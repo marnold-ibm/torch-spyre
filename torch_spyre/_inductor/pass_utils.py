@@ -2446,8 +2446,12 @@ def compute_size1_restickify_layout(
             and idc[j] == sympy.S.Zero
             and stl.device_size[j] == 1
         ),
-        old_sd_outer_dim,
+        None,
     )
+    if new_sd_outer_dim is None:
+        # No size-1 device dim available to move the stick onto; return None so
+        # callers treat this as infeasible rather than using a wrong layout.
+        return None
     # A size-1 dim has one element and maps to no host stride, as in
     # dim_map_to_stride_map in spyre_tensor_impl.cpp.
     device_size = restickify_device_size(
