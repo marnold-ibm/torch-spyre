@@ -103,7 +103,7 @@ from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
-# concretize_expr calls in this file can be removed.
+# concretize_expr calls in this file can be removed. (test-main worktree edit)
 # ---------------------------------------------------------------------------
 
 logger = get_inductor_logger("propagate_layouts")
