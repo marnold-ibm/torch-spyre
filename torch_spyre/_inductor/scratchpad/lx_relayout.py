@@ -686,6 +686,17 @@ def _movement_supported(
 
     source_splits = dict(source.work_slice_dims)
     destination_splits = dict(destination.work_slice_dims)
+    # Reject cross-axis relayouts: source and destination must split the same
+    # set of physical device axes.  transfer_edges treats a missing axis as
+    # split=1 (always-overlapping), which produces a valid bijection on paper
+    # but not in hardware — the shuffle emitter addresses slices by axis index,
+    # so a source split on axis A that the destination ignores causes each
+    # destination owner to receive data from the wrong physical address.  NDO
+    # (ndo_matmul_output_reorder) makes this observable by swapping which axis
+    # carries the larger split on matmul outputs, turning previously valid
+    # cross-axis plans into incorrect ones.
+    if source_splits.keys() != destination_splits.keys():
+        return False
     edges = transfer_edges(
         source_splits, destination_splits, source_map, destination_map
     )
