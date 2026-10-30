@@ -2510,17 +2510,19 @@ def compute_size1_restickify_layout(
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
     old_stick_expr = idc[-1]
-    if not old_stick_expr.free_symbols:
-        return None
-    if arg is not None:
+    old_sd = matching_dim(ic, old_stick_expr)
+    if old_sd is not None:
+        old_sd_size_stride: "tuple[int, int] | None" = (
+            host_size[old_sd],
+            host_stride[old_sd],
+        )
+    elif arg is not None:
+        # matching_dim cannot handle factorized layouts; try _host_size_stride_for_expr.
         old_sd_size_stride = _host_size_stride_for_expr(
             old_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
         )
     else:
-        old_sd = matching_dim(ic, old_stick_expr)
-        old_sd_size_stride = (
-            (host_size[old_sd], host_stride[old_sd]) if old_sd is not None else None
-        )
+        old_sd_size_stride = None
     if old_sd_size_stride is None:
         return None
     old_sd_host_size, old_sd_host_stride = old_sd_size_stride
