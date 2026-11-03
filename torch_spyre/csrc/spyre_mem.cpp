@@ -420,11 +420,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.dataformat_dst_ = host2device ? stl.device_dtype : cpu_format_host;
   // deeptools reads/writes the host buffer as storage_bytes /
   // hostFormatBytes(cpu_format_host). When that width disagrees with PyTorch's
-  // element size the access is out of bounds (uint8: host format SENUINT32
-  // claims 4 bytes for a 1-byte buffer), and the resulting ConvertData throw
-  // lands on the stream worker and shuts the stream down. Refuse up front.
-  // Allocation is untouched: torch.distributed allocates uint8 internally.
-  // TODO(#5493): the uint8 half of this gate goes away with the SENUINT8 remap.
+  // element size the access is out of bounds, and the resulting ConvertData
+  // throw lands on the stream worker and shuts the stream down. Refuse up
+  // front. quint8 still trips this: SENUINT32 claims 4 bytes for a 1-byte
+  // buffer. Allocation is untouched: torch.distributed allocates uint8.
   const size_t host_bytes = hostFormatBytes(cpu_format_host);
   const size_t torch_bytes = c10::elementSize(cpu_tensor->scalar_type());
   TORCH_CHECK(host_bytes == 0 || host_bytes == torch_bytes,
@@ -983,7 +982,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                         << ", Stride: " << stride << ", dtype: " << dtype
                         << ") to be mapped onto device " << device;
   auto device_layout = SpyreTensorLayout(size.vec(), stride.vec(), scalar_type,
-                                         generic_stick_dim_order(size.size()));
+                                         generic_stick_dim_order(size));
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
   int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
                                       std::multiplies<int64_t>());
